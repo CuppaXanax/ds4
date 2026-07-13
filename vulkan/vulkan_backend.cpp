@@ -413,10 +413,11 @@ static int begin_cmd(void) {
     VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
     c.command_count = 0;
     c.first_cmd = true;
-    /* Reset all per-ctx descriptor sets */
+    /* Reset all per-ctx descriptor sets and the global descriptor pool */
     c.ds_q8s = VK_NULL_HANDLE;
     c.ds_q8c = VK_NULL_HANDLE;
     c.ds_f16 = VK_NULL_HANDLE;
+    vkResetDescriptorPool(g_vk.device, g_vk.desc_pool, 0);
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -428,9 +429,6 @@ static int end_and_submit(void) {
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
     VK_CHECK_RAW(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
     c.submitted = true;
-    /* Wait for GPU to finish and ensure full idle state */
-    VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK_RAW(vkDeviceWaitIdle(g_vk.device));
     return 1;  /* DS4: non-zero = success */
 }
 

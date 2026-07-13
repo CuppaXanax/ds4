@@ -269,6 +269,7 @@ static int create_logical_device(void) {
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = 65536; dpci.poolSizeCount = 1; dpci.pPoolSizes = ps;
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     VK_CHECK_RAW(vkCreateDescriptorPool(g_vk.device, &dpci, nullptr, &g_vk.desc_pool));
     return 0;
 }
@@ -427,6 +428,9 @@ static int end_and_submit(void) {
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
     VK_CHECK_RAW(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
     c.submitted = true;
+    /* Wait for GPU to finish and ensure full idle state */
+    VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+    VK_CHECK_RAW(vkDeviceWaitIdle(g_vk.device));
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -926,10 +930,8 @@ int ds4_gpu_matmul_q8_0_tensor(
     /* Skip dispatch for very large out_dim (e.g. output head) */
     if (out_dim > 100000) return 1;
 
-    /* Select shader based on batch size: simple for decode (n_tok==1), complex for prefill */
-    const bool is_decode = (n_tok == 1);
-    const char *shader_name = is_decode ? "matmul_q8_0_simple" : "matmul_q8_0";
-    auto si = g_vk.shader_map.find(shader_name);
+    /* Use same shader for both decode and prefill */
+    auto si = g_vk.shader_map.find("matmul_q8_0");
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
@@ -983,15 +985,17 @@ int ds4_gpu_matmul_q8_0_tensor(
     vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
 
-    if (is_decode) {
-        /* Simple shader: no y_scale, 1D dispatch */
-        struct { uint32_t in_dim, out_dim, blocks; } pc_simple = {
-            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_blocks
+    if (n_tok == 1) {
+        /* For decode: 1 token, use 2D grid like prefill */
+        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
+        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
+        struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
+            (uint32_t)in_dim, (uint32_t)out_dim, 1u, (uint32_t)n_blocks, y_scale
         };
-        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_simple), &pc_simple);
-        vkCmdDispatch(c.cmd, ((uint32_t)out_dim + 255) / 256, 1, 1);
+        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(c.cmd, y_scale, y_cnt, 1);
     } else {
-        /* Complex shader: 2D grid with y_scale for out_dim up to 4G */
+        /* Prefill: 2D grid with n_tok in Z */
         const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
         const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
         struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
@@ -1001,6 +1005,17 @@ int ds4_gpu_matmul_q8_0_tensor(
         vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
     }
     c.command_count++;
+
+    /* Memory barrier: visibility for subsequent dispatches */
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(c.cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+
     return 1;
 }
 
@@ -1041,7 +1056,7 @@ int ds4_gpu_matmul_f16_tensor(
     uint64_t wbuf_off = weight_offset - wit->first;
     const bool is_decode = (n_tok == 1);
     /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSet &ds = is_decode ? c.ds_q8s : c.ds_q8c;
+    VkDescriptorSet &ds = c.ds_f16;
     if (ds == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo dai{};
         dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;

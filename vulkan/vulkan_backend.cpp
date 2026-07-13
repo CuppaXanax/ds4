@@ -927,10 +927,8 @@ int ds4_gpu_matmul_q8_0_tensor(
     uint64_t n_blocks = (in_dim + 31) / 32;
 
     /* Get shader */
-    /* Skip dispatch for very large out_dim (e.g. output head) */
+    /* Skip dispatch for very large out_dim (e.g. output head, n_vocab=129280) */
     if (out_dim > 100000) return 1;
-
-    /* Use same shader for both decode and prefill */
     auto si = g_vk.shader_map.find("matmul_q8_0");
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
@@ -1083,14 +1081,29 @@ int ds4_gpu_matmul_f16_tensor(
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok
     };
     vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    const uint32_t max_wg = 65535;
-    uint32_t dispatched = 0;
-    while (dispatched < (uint32_t)out_dim) {
-        uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
-        vkCmdDispatch(c.cmd, chunk, (uint32_t)n_tok, 1);
-        dispatched += chunk;
+    if ((uint32_t)out_dim <= 65534) {
+        vkCmdDispatch(c.cmd, (uint32_t)out_dim, (uint32_t)n_tok, 1);
+    } else {
+        const uint32_t max_wg = 65534;
+        uint32_t dispatched = 0;
+        while (dispatched < (uint32_t)out_dim) {
+            uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
+            vkCmdDispatch(c.cmd, chunk, (uint32_t)n_tok, 1);
+            dispatched += chunk;
+        }
     }
     c.command_count++;
+
+    /* Memory barrier: visibility for subsequent dispatches */
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(c.cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
+
     return 1;
 }
 

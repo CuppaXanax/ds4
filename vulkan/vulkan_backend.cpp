@@ -46,6 +46,9 @@ struct VulkanCommandCtx {
     VkDescriptorSet ds_q8s = VK_NULL_HANDLE;  /* simple shader DS */
     VkDescriptorSet ds_q8c = VK_NULL_HANDLE;  /* complex shader DS */
     VkDescriptorSet ds_f16 = VK_NULL_HANDLE;
+    VkCommandBuffer cmd_rots[4] = {};
+    uint32_t cmd_rot_idx = 0;
+    uint32_t cmd_buf_count = 0;
 };
 
 struct ShaderEntry {
@@ -379,7 +382,7 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     VkCommandPoolCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpci.queueFamilyIndex = g_vk.queue_family;
-    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     if (vkCreateCommandPool(g_vk.device, &cpci, nullptr, &ctx.pool) != VK_SUCCESS) {
         fprintf(stderr, "ds4: VULKAN failed to create command pool\n");
         abort();
@@ -403,22 +406,31 @@ static int begin_cmd(void) {
     if (c.submitted) {
         VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
         VK_CHECK_RAW(vkResetFences(g_vk.device, 1, &c.fence));
-    } else {
-        /* Fence is in initial signaled state or was never submitted — still signaled */
-        VK_CHECK_RAW(vkResetFences(g_vk.device, 1, &c.fence));
+        /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
+        c.cmd_buf_count++;
+        if (c.cmd_buf_count >= 4) {
+            vkResetCommandPool(g_vk.device, c.pool, 0);
+            c.cmd_buf_count = 0;
+            c.cmd_rot_idx = 0;
+        } else {
+            c.cmd_rot_idx = (c.cmd_rot_idx + 1) % 4;
+        }
     }
-    VK_CHECK_RAW(vkResetCommandPool(g_vk.device, c.pool, 0));
+    /* Allocate or reuse CB */
+    VkCommandBuffer &cb = c.cmd_rots[c.cmd_rot_idx];
+    if (cb == VK_NULL_HANDLE || c.cmd_buf_count == 0) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VK_CHECK_RAW(vkAllocateCommandBuffers(g_vk.device, &cbai, &cb));
+    }
+    c.cmd = cb;
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
     c.command_count = 0;
-    c.first_cmd = true;
-    /* Reset all per-ctx descriptor sets and the global descriptor pool */
-    c.ds_q8s = VK_NULL_HANDLE;
-    c.ds_q8c = VK_NULL_HANDLE;
-    c.ds_f16 = VK_NULL_HANDLE;
-    vkResetDescriptorPool(g_vk.device, g_vk.desc_pool, 0);
-    return 1;  /* DS4: non-zero = success */
+    return 1;
 }
 
 static int end_and_submit(void) {
@@ -731,7 +743,7 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
         VkCommandPoolCreateInfo cpci{};
         cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cpci.queueFamilyIndex = g_vk.queue_family;
-        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         vkCreateCommandPool(g_vk.device, &cpci, nullptr, &load_pool);
     }
 
@@ -965,7 +977,9 @@ int ds4_gpu_matmul_q8_0_tensor(
     if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
 
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off);
+    VkDeviceSize w_size = std::min<VkDeviceSize>(
+        wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
+        (uint64_t)out_dim * n_blocks * 36u);
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size},
@@ -1061,7 +1075,9 @@ int ds4_gpu_matmul_f16_tensor(
         if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
     }
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off);
+    VkDeviceSize w_size = std::min<VkDeviceSize>(
+        wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
+        (uint64_t)out_dim * in_dim * sizeof(float));  /* f16 = 2 bytes per element but buffer holds floats */
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size}, {wbuf, wbuf_off, w_size}, {obuf, ooff, o_size},

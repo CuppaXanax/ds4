@@ -42,6 +42,9 @@ struct VulkanCommandCtx {
     uint64_t        event_counter = 0;
     uint32_t        command_count = 0;
     bool            submitted = false;
+    bool            first_cmd = true;
+    VkDescriptorSet ds_q8  = VK_NULL_HANDLE;  /* Per-ctx descriptor sets */
+    VkDescriptorSet ds_f16 = VK_NULL_HANDLE;
 };
 
 struct ShaderEntry {
@@ -406,6 +409,10 @@ static int begin_cmd(void) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
     c.command_count = 0;
+    c.first_cmd = true;
+    /* Reset all per-ctx descriptor sets */
+    c.ds_q8 = VK_NULL_HANDLE;
+    c.ds_f16 = VK_NULL_HANDLE;
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -417,8 +424,6 @@ static int end_and_submit(void) {
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
     VK_CHECK_RAW(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
     c.submitted = true;
-    VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
-    VK_CHECK_RAW(vkDeviceWaitIdle(g_vk.device));
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -969,19 +974,13 @@ int ds4_gpu_matmul_q8_0_tensor(
     vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
 
-    struct { uint32_t in_dim, out_dim, n_tok, blocks; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks
+    const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
+    const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
+    struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks, y_scale
     };
     vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    /* Tile dispatch if out_dim exceeds max workgroup count */
-    const uint32_t max_wg = 65534;
-    uint32_t dispatched = 0;
-    while (dispatched < (uint32_t)out_dim) {
-        uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
-        if (n_tok == 1) { /* skip decode dispatch - RADV workaround */ }
-    else { vkCmdDispatch(c.cmd, chunk, (uint32_t)n_tok, 1); }
-        dispatched += chunk;
-    }
+    vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
     c.command_count++;
     return 1;
 }
@@ -1022,12 +1021,14 @@ int ds4_gpu_matmul_f16_tensor(
     VkBuffer wbuf = wit->second.buffer;
     uint64_t wbuf_off = weight_offset - wit->first;
     /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &sh.desc_layout;
-    VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+    VkDescriptorSet &ds = c.ds_q8;
+    if (ds == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &sh.desc_layout;
+        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+    }
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     VkDeviceSize w_size = wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off);
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);

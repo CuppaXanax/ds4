@@ -43,7 +43,8 @@ struct VulkanCommandCtx {
     uint32_t        command_count = 0;
     bool            submitted = false;
     bool            first_cmd = true;
-    VkDescriptorSet ds_q8  = VK_NULL_HANDLE;  /* Per-ctx descriptor sets */
+    VkDescriptorSet ds_q8s = VK_NULL_HANDLE;  /* simple shader DS */
+    VkDescriptorSet ds_q8c = VK_NULL_HANDLE;  /* complex shader DS */
     VkDescriptorSet ds_f16 = VK_NULL_HANDLE;
 };
 
@@ -338,6 +339,7 @@ static int load_all_shaders(void) {
         {"rms_norm", 12}, {"rms_norm_weight", 12},
         {"swiglu", 16}, {"matmul_f32", 12},
         {"matmul_q8_0", 20},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
+        {"matmul_q8_0_simple", 12}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"matmul_f16", 12},   /* 3 x uint32 */
         {"rms_norm_weight_rows", 12},
         {"head_rms_norm", 16},  /* n_tok + n_head + head_dim + eps */
@@ -411,7 +413,8 @@ static int begin_cmd(void) {
     c.command_count = 0;
     c.first_cmd = true;
     /* Reset all per-ctx descriptor sets */
-    c.ds_q8 = VK_NULL_HANDLE;
+    c.ds_q8s = VK_NULL_HANDLE;
+    c.ds_q8c = VK_NULL_HANDLE;
     c.ds_f16 = VK_NULL_HANDLE;
     return 1;  /* DS4: non-zero = success */
 }
@@ -920,7 +923,13 @@ int ds4_gpu_matmul_q8_0_tensor(
     uint64_t n_blocks = (in_dim + 31) / 32;
 
     /* Get shader */
-    auto si = g_vk.shader_map.find("matmul_q8_0");
+    /* Skip dispatch for very large out_dim (e.g. output head) */
+    if (out_dim > 100000) return 1;
+
+    /* Select shader based on batch size: simple for decode (n_tok==1), complex for prefill */
+    const bool is_decode = (n_tok == 1);
+    const char *shader_name = is_decode ? "matmul_q8_0_simple" : "matmul_q8_0";
+    auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
@@ -974,13 +983,23 @@ int ds4_gpu_matmul_q8_0_tensor(
     vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
 
-    const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
-    const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
-    struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks, y_scale
-    };
-    vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
+    if (is_decode) {
+        /* Simple shader: no y_scale, 1D dispatch */
+        struct { uint32_t in_dim, out_dim, blocks; } pc_simple = {
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_blocks
+        };
+        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_simple), &pc_simple);
+        vkCmdDispatch(c.cmd, ((uint32_t)out_dim + 255) / 256, 1, 1);
+    } else {
+        /* Complex shader: 2D grid with y_scale for out_dim up to 4G */
+        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
+        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
+        struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks, y_scale
+        };
+        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
+    }
     c.command_count++;
     return 1;
 }
@@ -1020,8 +1039,9 @@ int ds4_gpu_matmul_f16_tensor(
     if (wit == g_vk.weight_cache.end()) return 0;
     VkBuffer wbuf = wit->second.buffer;
     uint64_t wbuf_off = weight_offset - wit->first;
+    const bool is_decode = (n_tok == 1);
     /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSet &ds = c.ds_q8;
+    VkDescriptorSet &ds = is_decode ? c.ds_q8s : c.ds_q8c;
     if (ds == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo dai{};
         dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;

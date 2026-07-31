@@ -6,7 +6,7 @@ int ds4_gpu_add3_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
         const ds4_gpu_tensor *b,
         const ds4_gpu_tensor *c,
-        uint32_t                n) { return 1; }
+        uint32_t                n) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_add3_tensor\n"); return 1; }
 int ds4_gpu_add_rms_norm_weight_tensor(ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *sum_out,
         const ds4_gpu_tensor *a,
@@ -15,10 +15,10 @@ int ds4_gpu_add_rms_norm_weight_tensor(ds4_gpu_tensor       *norm_out,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                n,
-        float                   eps) { return 1; }
+        float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_add_rms_norm_weight_tensor\n"); return 1; }
 int ds4_gpu_argmax_tensor(ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
-        uint32_t                n_vocab) { return 1; }
+        uint32_t                n_vocab) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_argmax_tensor\n"); return 1; }
 int ds4_gpu_attention_decode_heads_rope_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -44,7 +44,7 @@ int ds4_gpu_attention_decode_heads_rope_tensor(ds4_gpu_tensor       *heads,
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        int                    *fused_inv_rope) { return 1; }
+        int                    *fused_inv_rope) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_decode_heads_rope_tensor\n"); return 1; }
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -64,7 +64,7 @@ int ds4_gpu_attention_decode_mixed_batch_heads_tensor(ds4_gpu_tensor       *head
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_decode_mixed_batch_heads_tensor\n"); return 1; }
 int ds4_gpu_attention_decode_rows_rope_tensor(ds4_gpu_tensor                       *heads,
         const void                           *model_map,
         uint64_t                              model_size,
@@ -81,7 +81,7 @@ int ds4_gpu_attention_decode_rows_rope_tensor(ds4_gpu_tensor                    
         float                                 ext_factor,
         float                                 attn_factor,
         float                                 beta_fast,
-        float                                 beta_slow) { return 1; }
+        float                                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_decode_rows_rope_tensor\n"); return 1; }
 int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -101,7 +101,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(ds4_gpu_tensor       *hea
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_indexed_mixed_batch_heads_tensor\n"); return 1; }
 int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -113,7 +113,7 @@ int ds4_gpu_attention_noncausal_raw_batch_heads_tensor(ds4_gpu_tensor       *hea
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_noncausal_raw_batch_heads_tensor\n"); return 1; }
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -122,7 +122,7 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(ds4_gpu_tensor       *low,
         uint64_t                rank,
         uint32_t                group0,
         uint32_t                group_cnt,
-        const ds4_gpu_tensor *heads) { return 1; }
+        const ds4_gpu_tensor *heads) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_output_low_q4_K_slice_tensor\n"); return 1; }
 int ds4_gpu_attention_output_low_q8_rows_exact_tensor(ds4_gpu_tensor       *low,
         const void             *model_map,
         uint64_t                model_size,
@@ -133,7 +133,7 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(ds4_gpu_tensor       *low,
         uint32_t                group0,
         uint32_t                group_cnt,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_rows) { return 1; }
+        uint32_t                n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_output_low_q8_rows_exact_tensor\n"); return 1; }
 int ds4_gpu_attention_output_q4_K_batch_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -148,7 +148,7 @@ int ds4_gpu_attention_output_q4_K_batch_tensor(ds4_gpu_tensor       *out,
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) { return 1; }
+        uint32_t                n_tokens) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_output_q4_K_batch_tensor\n"); return 1; }
 int ds4_gpu_attention_output_q8_batch_f16_tensor(ds4_gpu_tensor       *out_h,
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -160,7 +160,7 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(ds4_gpu_tensor       *out_h,
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) { return 1; }
+        uint32_t                n_tokens) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_output_q8_batch_f16_tensor\n"); return 1; }
 int ds4_gpu_attention_output_q8_tp_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -173,7 +173,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(ds4_gpu_tensor       *out,
         uint32_t                group0,
         uint32_t                group_cnt,
         uint64_t                out_dim,
-        const ds4_gpu_tensor *heads) { return 1; }
+        const ds4_gpu_tensor *heads) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_output_q8_tp_tensor\n"); return 1; }
 int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -188,7 +188,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(ds4_gpu_tensor       *he
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_masked_mixed_heads_tensor\n"); return 1; }
 int ds4_gpu_attention_prefill_raw_heads_range_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -200,7 +200,7 @@ int ds4_gpu_attention_prefill_raw_heads_range_tensor(ds4_gpu_tensor       *heads
         uint32_t                n_kv,
         uint32_t                window,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_raw_heads_range_tensor\n"); return 1; }
 int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -216,7 +216,7 @@ int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(ds4_gpu_tensor    
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_static_mixed_heads_range_tensor\n"); return 1; }
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -230,8 +230,8 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(ds4_gpu_tensor       *he
         uint32_t                window,
         uint32_t                ratio,
         uint32_t                n_head,
-        uint32_t                head_dim) { return 1; }
-int ds4_gpu_commands_active(void) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_static_mixed_heads_tensor\n"); return 1; }
+int ds4_gpu_commands_active(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_commands_active\n"); return 1; }
 int ds4_gpu_compressor_prefill_ratio4_replay_tensor(ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
@@ -255,7 +255,7 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(ds4_gpu_tensor       *comp_c
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) { return 1; }
+        float                   rms_eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_compressor_prefill_ratio4_replay_tensor\n"); return 1; }
 int ds4_gpu_compressor_prefill_state_ratio4_tensor(ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,
         const ds4_gpu_tensor *kv_tail,
@@ -265,13 +265,13 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(ds4_gpu_tensor       *state_k
         uint64_t                ape_offset,
         uint32_t                ape_type,
         uint32_t                head_dim,
-        uint32_t                pos0) { return 1; }
+        uint32_t                pos0) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_compressor_prefill_state_ratio4_tensor\n"); return 1; }
 int ds4_gpu_directional_steering_project_tensor(ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
         uint32_t                layer,
         uint32_t                width,
         uint32_t                rows,
-        float                   scale) { return 1; }
+        float                   scale) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_directional_steering_project_tensor\n"); return 1; }
 int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         const ds4_gpu_tensor *logits_row,
                                         const void *model_map,
@@ -280,10 +280,10 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint64_t w2_offset,
                                         uint32_t prev_token,
                                         uint32_t vocab,
-                                        uint32_t rank) { return 1; }
+                                        uint32_t rank) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_dspark_markov_argmax_tensor\n"); return 1; }
 int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x,
         uint32_t          n_rows,
-        uint32_t          head_dim) { return 1; }
+        uint32_t          head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_dsv4_indexer_qat_tensor\n"); return 1; }
 int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
         const void             *model_map,
@@ -307,12 +307,12 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(ds4_gpu_tensor       *q_out,
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   eps) { return 1; }
+        float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor\n"); return 1; }
 int ds4_gpu_dsv4_topk_mask_tensor(ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,
         uint32_t                n_comp,
         uint32_t                n_tokens,
-        uint32_t                top_k) { return 1; }
+        uint32_t                top_k) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_dsv4_topk_mask_tensor\n"); return 1; }
 int ds4_gpu_flash_kv_stage_f16_tensor(ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *raw,
         uint32_t                raw_cap,
@@ -321,8 +321,8 @@ int ds4_gpu_flash_kv_stage_f16_tensor(ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *comp,
         uint32_t                comp_is_f16,
         uint32_t                n_comp,
-        uint32_t                head_dim) { return 1; }
-int ds4_gpu_flush_encoder(void) { return 1; }
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_flash_kv_stage_f16_tensor\n"); return 1; }
+int ds4_gpu_flush_encoder(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_flush_encoder\n"); return 1; }
 int ds4_gpu_glm_attention_flash_staged_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *key_cache,
@@ -334,7 +334,7 @@ int ds4_gpu_glm_attention_flash_staged_tensor(ds4_gpu_tensor       *heads,
         uint32_t              n_head,
         uint32_t              qk_dim,
         uint32_t              value_dim,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_flash_staged_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_flash_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *key_cache,
@@ -346,7 +346,7 @@ int ds4_gpu_glm_attention_flash_tensor(ds4_gpu_tensor       *heads,
         uint32_t              n_head,
         uint32_t              qk_dim,
         uint32_t              value_dim,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_flash_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_full_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *key_cache,
@@ -358,7 +358,7 @@ int ds4_gpu_glm_attention_full_tensor(ds4_gpu_tensor       *heads,
         uint32_t              n_head,
         uint32_t              qk_dim,
         uint32_t              value_dim,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_full_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -379,7 +379,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(ds4_gpu_tensor       
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_batch_lora_tensor(ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -400,7 +400,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_tensor(ds4_gpu_tensor       *lora_o
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_batch_lora_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -421,7 +421,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(ds4_gpu_tensor       *
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_batch_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -446,7 +446,7 @@ int ds4_gpu_glm_attention_indexed_batch_tensor(ds4_gpu_tensor       *heads,
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_batch_typed_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -472,7 +472,7 @@ int ds4_gpu_glm_attention_indexed_batch_typed_tensor(ds4_gpu_tensor       *heads
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_batch_typed_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *partial_lora,
         ds4_gpu_tensor       *partial_ms,
@@ -501,7 +501,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(ds4_gpu_tensor     
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_decode_split_group8_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *partial_lora,
         ds4_gpu_tensor       *partial_ms,
@@ -531,7 +531,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(ds4_gpu_tenso
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_decode_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -555,7 +555,7 @@ int ds4_gpu_glm_attention_indexed_decode_tensor(ds4_gpu_tensor       *heads,
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_decode_tensor\n"); return 1; }
 int ds4_gpu_glm_attention_indexed_decode_typed_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -580,7 +580,7 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(ds4_gpu_tensor       *head
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) { return 1; }
+        float                 beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_attention_indexed_decode_typed_tensor\n"); return 1; }
 int ds4_gpu_glm_build_kv_cache_flash_tensor(ds4_gpu_tensor       *key_cache,
         ds4_gpu_tensor       *value_cache,
         const ds4_gpu_tensor *kv_raw,
@@ -602,7 +602,7 @@ int ds4_gpu_glm_build_kv_cache_flash_tensor(ds4_gpu_tensor       *key_cache,
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_build_kv_cache_flash_tensor\n"); return 1; }
 int ds4_gpu_glm_build_kv_cache_tensor(ds4_gpu_tensor       *key_cache,
         ds4_gpu_tensor       *value_cache,
         const ds4_gpu_tensor *kv_raw,
@@ -624,14 +624,14 @@ int ds4_gpu_glm_build_kv_cache_tensor(ds4_gpu_tensor       *key_cache,
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_build_kv_cache_tensor\n"); return 1; }
 int ds4_gpu_glm_fill_selected_range_batch_tensor(ds4_gpu_tensor *selected,
         uint32_t        n_tokens,
         uint32_t        pos0,
         uint32_t        n_selected,
-        uint32_t        pad_row) { return 1; }
+        uint32_t        pad_row) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_fill_selected_range_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_fill_selected_range_tensor(ds4_gpu_tensor *selected,
-        uint32_t        n_selected) { return 1; }
+        uint32_t        n_selected) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_fill_selected_range_tensor\n"); return 1; }
 int ds4_gpu_glm_indexer_rope_tail_tensor(ds4_gpu_tensor *x,
         uint32_t        n_tokens,
         uint32_t        n_head,
@@ -644,7 +644,7 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(ds4_gpu_tensor *x,
         float           ext_factor,
         float           attn_factor,
         float           beta_fast,
-        float           beta_slow) { return 1; }
+        float           beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_indexer_rope_tail_tensor\n"); return 1; }
 int ds4_gpu_glm_indexer_score_one_tensor(ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -653,7 +653,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(ds4_gpu_tensor       *scores,
         uint32_t              n_head,
         uint32_t              head_dim,
         float                 scale,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_indexer_score_one_tensor\n"); return 1; }
 int ds4_gpu_glm_indexer_scores_batch_tensor(ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -664,7 +664,7 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(ds4_gpu_tensor       *scores,
         uint32_t              n_head,
         uint32_t              head_dim,
         float                 scale,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_indexer_scores_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_k_b_project_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *kv_norm,
         const void           *model_map,
@@ -673,7 +673,7 @@ int ds4_gpu_glm_k_b_project_tensor(ds4_gpu_tensor       *out,
         uint32_t              n_tokens,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              n_head) { return 1; }
+        uint32_t              n_head) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_k_b_project_tensor\n"); return 1; }
 int ds4_gpu_glm_k_b_project_typed_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *kv_norm,
         const void           *model_map,
@@ -683,7 +683,7 @@ int ds4_gpu_glm_k_b_project_typed_tensor(ds4_gpu_tensor       *out,
         uint32_t              n_tokens,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              n_head) { return 1; }
+        uint32_t              n_head) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_k_b_project_typed_tensor\n"); return 1; }
 int ds4_gpu_glm_kv_lora_rms_norm_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *kv_raw,
         const void           *model_map,
@@ -692,7 +692,7 @@ int ds4_gpu_glm_kv_lora_rms_norm_tensor(ds4_gpu_tensor       *out,
         uint32_t              n_tokens,
         uint32_t              kv_raw_dim,
         uint32_t              kv_lora_dim,
-        float                 eps) { return 1; }
+        float                 eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_kv_lora_rms_norm_tensor\n"); return 1; }
 int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
         const void           *model_map,
@@ -702,7 +702,7 @@ int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(ds4_gpu_tensor       *qk_low,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              qk_dim) { return 1; }
+        uint32_t              qk_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_qk_lowrank_q8_0_tensor(ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
         const void           *model_map,
@@ -711,7 +711,7 @@ int ds4_gpu_glm_qk_lowrank_q8_0_tensor(ds4_gpu_tensor       *qk_low,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              qk_dim) { return 1; }
+        uint32_t              qk_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_qk_lowrank_q8_0_tensor\n"); return 1; }
 int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
         const void           *model_map,
@@ -722,7 +722,7 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(ds4_gpu_tensor       *qk_low,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              qk_dim) { return 1; }
+        uint32_t              qk_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_qk_lowrank_typed_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_qk_lowrank_typed_tensor(ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
         const void           *model_map,
@@ -732,7 +732,7 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(ds4_gpu_tensor       *qk_low,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              qk_nope,
-        uint32_t              qk_dim) { return 1; }
+        uint32_t              qk_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_qk_lowrank_typed_tensor\n"); return 1; }
 int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
         const void           *model_map,
@@ -750,7 +750,7 @@ int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(ds4_gpu_tensor       *q_out,
         uint32_t              kv_lora_dim,
         uint32_t              qk_rope,
         bool                  cache_f16,
-        float                 eps) { return 1; }
+        float                 eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_qkv_norm_store_compact_kv_tensor\n"); return 1; }
 int ds4_gpu_glm_rope_tail_tensor(ds4_gpu_tensor *x,
         uint32_t        n_tokens,
         uint32_t        n_head,
@@ -763,7 +763,7 @@ int ds4_gpu_glm_rope_tail_tensor(ds4_gpu_tensor *x,
         float           ext_factor,
         float           attn_factor,
         float           beta_fast,
-        float           beta_slow) { return 1; }
+        float           beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_rope_tail_tensor\n"); return 1; }
 int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -790,7 +790,7 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(ds4_gpu_tensor       *o
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
-        uint32_t                mid_token_stride) { return 1; }
+        uint32_t                mid_token_stride) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor\n"); return 1; }
 int ds4_gpu_glm_routed_moe_batch_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -818,7 +818,7 @@ int ds4_gpu_glm_routed_moe_batch_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride,
-        bool                    force_resident) { return 1; }
+        bool                    force_resident) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_routed_moe_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_routed_moe_one_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -844,7 +844,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(ds4_gpu_tensor       *out,
         uint32_t                n_expert,
         uint32_t                layer_index,
         const ds4_gpu_tensor *x,
-        bool                    force_resident) { return 1; }
+        bool                    force_resident) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_routed_moe_one_tensor\n"); return 1; }
 int ds4_gpu_glm_router_select_batch_tensor(ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
         ds4_gpu_tensor       *probs,
@@ -855,7 +855,7 @@ int ds4_gpu_glm_router_select_batch_tensor(ds4_gpu_tensor       *selected,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
-        uint32_t                n_tokens) { return 1; }
+        uint32_t                n_tokens) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_router_select_batch_tensor\n"); return 1; }
 int ds4_gpu_glm_router_select_tensor(ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
         ds4_gpu_tensor       *probs,
@@ -865,7 +865,7 @@ int ds4_gpu_glm_router_select_tensor(ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *logits,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
-        float                   expert_weight_scale) { return 1; }
+        float                   expert_weight_scale) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_router_select_tensor\n"); return 1; }
 int ds4_gpu_glm_store_compact_kv_tensor(ds4_gpu_tensor       *kv_lora_cache,
         ds4_gpu_tensor       *k_rope_cache,
         const ds4_gpu_tensor *kv_norm,
@@ -876,7 +876,7 @@ int ds4_gpu_glm_store_compact_kv_tensor(ds4_gpu_tensor       *kv_lora_cache,
         uint32_t              kv_raw_dim,
         uint32_t              kv_lora_dim,
         uint32_t              qk_rope,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_store_compact_kv_tensor\n"); return 1; }
 int ds4_gpu_glm_store_indexer_k_tensor(ds4_gpu_tensor       *indexer_key_cache,
         const ds4_gpu_tensor *raw_k,
         const void           *model_map,
@@ -896,10 +896,10 @@ int ds4_gpu_glm_store_indexer_k_tensor(ds4_gpu_tensor       *indexer_key_cache,
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        bool                  cache_f16) { return 1; }
+        bool                  cache_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_store_indexer_k_tensor\n"); return 1; }
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
-        uint32_t                           n_selected) { return 1; }
+        uint32_t                           n_selected) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor\n"); return 1; }
 int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *lora,
         const void           *model_map,
@@ -908,7 +908,7 @@ int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(ds4_gpu_tensor       *head
         uint32_t              n_tokens,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
-        uint32_t              value_dim) { return 1; }
+        uint32_t              value_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_value_project_q8_0_batch_heads_tensor\n"); return 1; }
 int ds4_gpu_glm_value_project_typed_batch_heads_tensor(ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *lora,
         const void           *model_map,
@@ -918,27 +918,27 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(ds4_gpu_tensor       *hea
         uint32_t              n_tokens,
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
-        uint32_t              value_dim) { return 1; }
+        uint32_t              value_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_value_project_typed_batch_heads_tensor\n"); return 1; }
 int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *block_add_h,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_expand_add_split_half_add_tensor\n"); return 1; }
 int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *block_add,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_expand_add_split_tensor\n"); return 1; }
 int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out_h,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_expand_split_half_tensor\n"); return 1; }
 int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *scale_scratch,
         const void             *model_map,
@@ -948,7 +948,7 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor       *out,
         uint32_t                out_dim,
         const ds4_gpu_tensor *x,
         uint32_t                n_rows,
-        float                   eps) { return 1; }
+        float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_rms_scale_project_f16_tensor\n"); return 1; }
 int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *mix,
         const void             *model_map,
@@ -957,7 +957,7 @@ int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor       *out,
         uint64_t                base_offset,
         uint32_t                n_hc,
         uint32_t                sinkhorn_iters,
-        float                   eps) { return 1; }
+        float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_split_sinkhorn_tensor\n"); return 1; }
 int ds4_gpu_hc_weighted_sum_norm_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
         const ds4_gpu_tensor *residual_hc,
@@ -967,7 +967,7 @@ int ds4_gpu_hc_weighted_sum_norm_tensor(ds4_gpu_tensor       *out,
         uint64_t                norm_weight_offset,
         uint32_t                n_embd,
         uint32_t                n_hc,
-        float                   norm_eps) { return 1; }
+        float                   norm_eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_weighted_sum_norm_tensor\n"); return 1; }
 int ds4_gpu_indexer_scores_prefill_tensor(ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -977,26 +977,26 @@ int ds4_gpu_indexer_scores_prefill_tensor(ds4_gpu_tensor       *scores,
         uint32_t                n_head,
         uint32_t                head_dim,
         uint32_t                ratio,
-        float                   scale) { return 1; }
+        float                   scale) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_indexer_scores_prefill_tensor\n"); return 1; }
 int ds4_gpu_indexer_top1_value_tensor(ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
         const ds4_gpu_tensor *scores,
         uint32_t              n_comp,
         uint32_t              n_tokens,
-        uint32_t              index_offset) { return 1; }
+        uint32_t              index_offset) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_indexer_top1_value_tensor\n"); return 1; }
 int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(ds4_gpu_tensor        *kv,
         ds4_gpu_tensor *const *raw_caches,
         const uint32_t        *raw_caps,
         const uint32_t        *raw_rows,
         uint32_t               n_rows,
         uint32_t               head_dim,
-        uint32_t               n_rot) { return 1; }
+        uint32_t               n_rot) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_kv_fp8_store_raw_decode_rows_tensor\n"); return 1; }
 int ds4_gpu_kv_fp8_store_raw_tensor(ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
         uint32_t          raw_cap,
         uint32_t          row,
         uint32_t          head_dim,
-        uint32_t          n_rot) { return 1; }
+        uint32_t          n_rot) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_kv_fp8_store_raw_tensor\n"); return 1; }
 int ds4_gpu_matmul_f16_pair_compressor_store_tensor(ds4_gpu_tensor       *out_kv,
         ds4_gpu_tensor       *out_score,
         ds4_gpu_tensor       *state_kv,
@@ -1011,7 +1011,7 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(ds4_gpu_tensor       *out_kv
         uint32_t                width,
         const ds4_gpu_tensor *x,
         uint32_t                ratio,
-        uint32_t                pos) { return 1; }
+        uint32_t                pos) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_f16_pair_compressor_store_tensor\n"); return 1; }
 int ds4_gpu_matmul_f16_pair_tensor(ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
         const void             *model_map,
@@ -1021,13 +1021,13 @@ int ds4_gpu_matmul_f16_pair_tensor(ds4_gpu_tensor       *out_a,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_f16_pair_tensor\n"); return 1; }
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         const ds4_gpu_tensor *x,
-        uint32_t                n_rows) { return 1; }
+        uint32_t                n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_f16_router_rows_exact_tensor\n"); return 1; }
 int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1035,7 +1035,7 @@ int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_f32_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1043,7 +1043,7 @@ int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1051,7 +1051,7 @@ int ds4_gpu_matmul_q8_0_decode_mpp_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_decode_mpp_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -1059,7 +1059,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ds4_gpu_tensor       *out,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              n_rows) { return 1; }
+        uint32_t              n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_decode_rows_exact_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_f16_out_tensor(ds4_gpu_tensor       *out_h,
         const void             *model_map,
         uint64_t                model_size,
@@ -1067,7 +1067,7 @@ int ds4_gpu_matmul_q8_0_f16_out_tensor(ds4_gpu_tensor       *out_h,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_f16_out_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void             *model_map,
@@ -1079,7 +1079,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_hc_expand_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
         const void           *model_map,
@@ -1094,7 +1094,7 @@ int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(ds4_gpu_tensor       *out_hc
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t              n_embd,
-        uint32_t              n_hc) { return 1; }
+        uint32_t              n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_kslice_rows_tensor(ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -1104,7 +1104,7 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(ds4_gpu_tensor       *out,
         uint64_t              k_off,
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
-        uint64_t              n_rows) { return 1; }
+        uint64_t              n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_kslice_rows_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_kslice_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1114,7 +1114,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(ds4_gpu_tensor       *out,
         uint64_t                k_cnt,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off) { return 1; }
+        uint64_t                x_elem_off) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_kslice_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
         const void           *model_map,
@@ -1125,7 +1125,7 @@ int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(ds4_gpu_tensor       *out0
         uint64_t              out0_dim,
         uint64_t              out1_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              n_rows) { return 1; }
+        uint32_t              n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_pair_tensor(ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
         const void             *model_map,
@@ -1136,7 +1136,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(ds4_gpu_tensor       *out0,
         uint64_t                out0_dim,
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_pair_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_rows_scalar_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1144,7 +1144,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_rows_scalar_tensor\n"); return 1; }
 int ds4_gpu_matmul_q8_0_top1_tensor(ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
         const void           *model_map,
@@ -1153,7 +1153,7 @@ int ds4_gpu_matmul_q8_0_top1_tensor(ds4_gpu_tensor       *selected,
         uint64_t              in_dim,
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
-        uint32_t              index_offset) { return 1; }
+        uint32_t              index_offset) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_q8_0_top1_tensor\n"); return 1; }
 int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1162,7 +1162,7 @@ int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_quant_decode_mpp_model_view_tensor\n"); return 1; }
 int ds4_gpu_matmul_quant_kslice_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1173,7 +1173,7 @@ int ds4_gpu_matmul_quant_kslice_tensor(ds4_gpu_tensor       *out,
         uint64_t                k_cnt,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off) { return 1; }
+        uint64_t                x_elem_off) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_quant_kslice_tensor\n"); return 1; }
 int ds4_gpu_matmul_quant_rows_scalar_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1182,7 +1182,7 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_quant_rows_scalar_tensor\n"); return 1; }
 int ds4_gpu_matmul_quant_tensor(ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -1191,30 +1191,30 @@ int ds4_gpu_matmul_quant_tensor(ds4_gpu_tensor       *out,
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok) { return 1; }
-void ds4_gpu_model_residency_skip(int skip) {}
+        uint64_t                n_tok) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_matmul_quant_tensor\n"); return 1; }
+void ds4_gpu_model_residency_skip(int skip) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_model_residency_skip\n"); }
 int ds4_gpu_moe_handoff_pack_tensor(ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
         uint32_t              n_embd,
-        uint32_t              n_expert) { return 1; }
+        uint32_t              n_expert) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_moe_handoff_pack_tensor\n"); return 1; }
 int ds4_gpu_pack_slot_rows_f32_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *slots,
         uint32_t                n_rows,
         uint32_t                width,
         uint32_t                n_slots,
-        uint32_t                slot_cap) { return 1; }
-void ds4_gpu_release_zero_prefix_prefill_mask_cache(void) {}
+        uint32_t                slot_cap) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_pack_slot_rows_f32_tensor\n"); return 1; }
+void ds4_gpu_release_zero_prefix_prefill_mask_cache(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_release_zero_prefix_prefill_mask_cache\n"); }
 int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *rows,
         uint32_t                n_tokens,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_repeat_hc_rows_tensor\n"); return 1; }
 int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_repeat_hc_tensor\n"); return 1; }
 int ds4_gpu_rope_tail_decode_rows_tensor(ds4_gpu_tensor                     *x,
         const ds4_gpu_attention_decode_row *rows,
         uint32_t                            n_rows,
@@ -1228,7 +1228,7 @@ int ds4_gpu_rope_tail_decode_rows_tensor(ds4_gpu_tensor                     *x,
         float                               ext_factor,
         float                               attn_factor,
         float                               beta_fast,
-        float                               beta_slow) { return 1; }
+        float                               beta_slow) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_rope_tail_decode_rows_tensor\n"); return 1; }
 int ds4_gpu_routed_moe_batch_owned_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -1258,7 +1258,7 @@ int ds4_gpu_routed_moe_batch_owned_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         uint32_t              layer_index,
         uint32_t              n_tokens,
-        bool                 *mid_is_f16) { return 1; }
+        bool                 *mid_is_f16) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_batch_owned_tensor\n"); return 1; }
 int ds4_gpu_routed_moe_one_owned_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -1288,30 +1288,30 @@ int ds4_gpu_routed_moe_one_owned_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         ds4_gpu_tensor       *down_output,
         bool                  pack_fixed3,
-        ds4_gpu_tensor       *shared_prequant) { return 1; }
+        ds4_gpu_tensor       *shared_prequant) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_one_owned_tensor\n"); return 1; }
 int ds4_gpu_routed_moe_owned_packed_combine_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *home_slots,
         const ds4_gpu_tensor *peer_packed,
         const ds4_gpu_tensor *selected,
         uint32_t              out_dim,
-        uint32_t              expert_split) { return 1; }
+        uint32_t              expert_split) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_owned_packed_combine_tensor\n"); return 1; }
 int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *home_slots,
         const ds4_gpu_tensor *peer_slots,
         const ds4_gpu_tensor *selected,
         uint32_t              out_dim,
         uint32_t              expert_split,
-        uint32_t              rows) { return 1; }
+        uint32_t              rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_owned_slots_combine_rows_tensor\n"); return 1; }
 int ds4_gpu_routed_moe_owned_slots_combine_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *home_slots,
         const ds4_gpu_tensor *peer_slots,
         const ds4_gpu_tensor *selected,
         uint32_t              out_dim,
-        uint32_t              expert_split) { return 1; }
-int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) { return 1; }
-void ds4_gpu_set_glm_model(bool enabled) {}
-void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {}
-void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {}
+        uint32_t              expert_split) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_owned_slots_combine_tensor\n"); return 1; }
+int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_routed_moe_set_selected_override\n"); return 1; }
+void ds4_gpu_set_glm_model(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_model\n"); }
+void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_mtp_verify_mode\n"); }
+void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_streaming_prefill_full_layer\n"); }
 int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -1325,7 +1325,7 @@ int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_down_hc_expand_add_q8_0_tensor\n"); return 1; }
 int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,
@@ -1341,7 +1341,7 @@ int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(ds4_gpu_tensor       *out_hc
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) { return 1; }
+        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor\n"); return 1; }
 int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -1352,7 +1352,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(ds4_gpu_tensor       *g
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        float                   clamp) { return 1; }
+        float                   clamp) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor\n"); return 1; }
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -1364,7 +1364,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(ds4_gpu_tensor       *
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
-        float                   clamp) { return 1; }
+        float                   clamp) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor\n"); return 1; }
 int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -1376,7 +1376,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(ds4_gpu_tensor       *gate,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
-        float                   clamp) { return 1; }
+        float                   clamp) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor\n"); return 1; }
 int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(ds4_gpu_tensor       *mid,
         const void             *model_map,
         uint64_t                model_size,
@@ -1389,42 +1389,42 @@ int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(ds4_gpu_tensor       *mid
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *prequant,
         uint32_t                expert_split,
-        bool                    home_rank) { return 1; }
+        bool                    home_rank) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor\n"); return 1; }
 int ds4_gpu_sort_i32_rows_asc_tensor(ds4_gpu_tensor       *dst,
         const ds4_gpu_tensor *src,
         uint32_t              row_width,
-        uint32_t              n_rows) { return 1; }
+        uint32_t              n_rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_sort_i32_rows_asc_tensor\n"); return 1; }
 int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor       *raw_cache,
         const ds4_gpu_tensor *kv,
         uint32_t                raw_cap,
         uint32_t                row,
-        uint32_t                head_dim) { return 1; }
-void ds4_gpu_stream_expert_cache_note_service_thread(void) {}
+        uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_store_raw_kv_tensor\n"); return 1; }
+void ds4_gpu_stream_expert_cache_note_service_thread(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_stream_expert_cache_note_service_thread\n"); }
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
                                              uint64_t bytes,
                                              uint64_t event_value,
-                                             const char *label) { return 1; }
-int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) { return 1; }
+                                             const char *label) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tensor_read_after_selected_event\n"); return 1; }
+int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_batch_gate_encode\n"); return 1; }
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
-                               uint64_t bytes) { return 1; }
+                               uint64_t bytes) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_big_gate_encode\n"); return 1; }
 uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
-                                  uint64_t bytes) { return 0; }
-int ds4_gpu_tp_big_gate_wait(uint64_t seq) { return 1; }
-int ds4_gpu_tp_failed(void) { return 1; }
-int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) { return 1; }
+                                  uint64_t bytes) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_big_gate_kick\n"); return 0; }
+int ds4_gpu_tp_big_gate_wait(uint64_t seq) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_big_gate_wait\n"); return 1; }
+int ds4_gpu_tp_failed(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_failed\n"); return 1; }
+int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_gate_encode\n"); return 1; }
 int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
-                    ds4_gpu_tp_exchange_fn fn, void *ud) { return 1; }
-void ds4_gpu_tp_keepalive_pause(int paused) {}
-void ds4_gpu_tp_set_attn_head_split(int enabled) {}
-void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {}
-void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {}
-void ds4_gpu_tp_set_session_batch_mode(int enabled) {}
-void ds4_gpu_tp_shutdown(void) {}
-void ds4_gpu_tp_suspend_expert_sharding(int suspend) {}
+                    ds4_gpu_tp_exchange_fn fn, void *ud) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_init\n"); return 1; }
+void ds4_gpu_tp_keepalive_pause(int paused) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_keepalive_pause\n"); }
+void ds4_gpu_tp_set_attn_head_split(int enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_set_attn_head_split\n"); }
+void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_set_batch_exchange\n"); }
+void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_set_big_exchange\n"); }
+void ds4_gpu_tp_set_session_batch_mode(int enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_set_session_batch_mode\n"); }
+void ds4_gpu_tp_shutdown(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_shutdown\n"); }
+void ds4_gpu_tp_suspend_expert_sharding(int suspend) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_tp_suspend_expert_sharding\n"); }

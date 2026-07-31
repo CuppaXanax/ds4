@@ -1064,8 +1064,6 @@ int ds4_gpu_matmul_q8_0_tensor(
     uint64_t n_blocks = (in_dim + 31) / 32;
 
     /* Get shader */
-    /* Skip dispatch for very large out_dim (e.g. output head, n_vocab=129280) */
-    if (out_dim > 100000) return 1;
     auto si = g_vk.shader_map.find("matmul_q8_0");
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];

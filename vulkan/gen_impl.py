@@ -126,16 +126,17 @@ def main():
     ]
     for name in missing:
         ret, params = funcs[name]
+        log = f'if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB {name}\\n");'
         if ret == "void":
-            body = "{}"
+            body = f"{{ {log} }}"
         elif ret.endswith("*"):
-            body = "{ return NULL; }"
+            body = f"{{ {log} return NULL; }}"
         elif "bool" in ret:
-            body = "{ return false; }"
+            body = f"{{ {log} return false; }}"
         elif "uint" in ret or ret == "size_t":
-            body = "{ return 0; }"
+            body = f"{{ {log} return 0; }}"
         else:
-            body = "{ return 1; }"
+            body = f"{{ {log} return 1; }}"
         lines.append(f"{ret} {name}({params}) {body}")
     OUT.write_text("\n".join(lines) + "\n")
     print(f"generated {len(missing)} placeholders -> {OUT}")

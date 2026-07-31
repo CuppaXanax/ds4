@@ -141,21 +141,21 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_embed_tokens_q8_0_tensor` | VERIFIED |
 | `ds4_gpu_embed_tokens_quant_tensor` | VERIFIED |
 
-## hc (3 real / 10 stub)
+## hc (7 real / 6 stub)
 
 | function | status |
 |---|---|
 | `ds4_gpu_hc_expand_add_split_half_add_tensor` | STUB |
 | `ds4_gpu_hc_expand_add_split_tensor` | STUB |
-| `ds4_gpu_hc_expand_add_tensor` | STUB |
+| `ds4_gpu_hc_expand_add_tensor` | REAL |
 | `ds4_gpu_hc_expand_split_half_tensor` | STUB |
 | `ds4_gpu_hc_expand_split_tensor` | REAL |
-| `ds4_gpu_hc_expand_tensor` | STUB |
+| `ds4_gpu_hc_expand_tensor` | REAL |
 | `ds4_gpu_hc_rms_scale_project_f16_tensor` | STUB |
 | `ds4_gpu_hc_split_weighted_sum_tensor` | REAL |
 | `ds4_gpu_hc_weighted_sum_split_tensor` | REAL |
-| `ds4_gpu_hc_weighted_sum_tensor` | STUB |
-| `ds4_gpu_output_hc_weights_tensor` | STUB |
+| `ds4_gpu_hc_weighted_sum_tensor` | REAL |
+| `ds4_gpu_output_hc_weights_tensor` | REAL |
 | `ds4_gpu_repeat_hc_rows_tensor` | STUB |
 | `ds4_gpu_repeat_hc_tensor` | STUB |
 
@@ -176,54 +176,54 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_indexer_top1_value_tensor` | STUB |
 | `ds4_gpu_indexer_topk_tensor` | VERIFIED |
 
-## kv (1 real / 12 stub)
+## kv (4 real / 8 stub)
 
 | function | status |
 |---|---|
 | `ds4_gpu_compressor_prefill_ratio4_replay_tensor` | STUB |
 | `ds4_gpu_compressor_prefill_state_ratio4_tensor` | STUB |
-| `ds4_gpu_compressor_prefill_tensor` | STUB |
-| `ds4_gpu_compressor_store_batch_tensor` | STUB |
-| `ds4_gpu_compressor_update_tensor` | STUB |
+| `ds4_gpu_compressor_prefill_tensor` | REAL |
+| `ds4_gpu_compressor_store_batch_tensor` | REAL |
+| `ds4_gpu_compressor_update_tensor` | REAL |
 | `ds4_gpu_dsv4_fp8_kv_quantize_tensor` | VERIFIED |
 | `ds4_gpu_flash_kv_stage_f16_tensor` | STUB |
 | `ds4_gpu_glm_build_kv_cache_flash_tensor` | STUB |
 | `ds4_gpu_glm_build_kv_cache_tensor` | STUB |
 | `ds4_gpu_glm_store_compact_kv_tensor` | STUB |
 | `ds4_gpu_kv_fp8_store_raw_decode_rows_tensor` | STUB |
-| `ds4_gpu_kv_fp8_store_raw_tensor` | STUB |
+| `ds4_gpu_kv_fp8_store_raw_tensor` | VERIFIED |
 | `ds4_gpu_should_use_managed_kv_cache` | REAL |
 | `ds4_gpu_store_raw_kv_batch_tensor` | VERIFIED |
 | `ds4_gpu_store_raw_kv_tensor` | STUB |
 
-## matmul (1 real / 21 stub)
+## matmul (1 real / 16 stub)
 
 | function | status |
 |---|---|
 | `ds4_gpu_add3_tensor` | STUB |
 | `ds4_gpu_add_tensor` | REAL |
-| `ds4_gpu_matmul_f16_pair_compressor_store_tensor` | STUB |
+| `ds4_gpu_matmul_f16_pair_compressor_store_tensor` | VERIFIED |
 | `ds4_gpu_matmul_f16_pair_tensor` | STUB |
 | `ds4_gpu_matmul_f16_router_rows_exact_tensor` | STUB |
 | `ds4_gpu_matmul_f16_tensor` | VERIFIED |
-| `ds4_gpu_matmul_f32_tensor` | STUB |
+| `ds4_gpu_matmul_f32_tensor` | VERIFIED |
 | `ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_decode_mpp_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_decode_rows_exact_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_f16_out_tensor` | STUB |
-| `ds4_gpu_matmul_q8_0_hc_expand_tensor` | STUB |
+| `ds4_gpu_matmul_q8_0_hc_expand_tensor` | VERIFIED |
 | `ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_kslice_rows_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_kslice_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor` | STUB |
-| `ds4_gpu_matmul_q8_0_pair_tensor` | STUB |
+| `ds4_gpu_matmul_q8_0_pair_tensor` | VERIFIED |
 | `ds4_gpu_matmul_q8_0_rows_scalar_tensor` | STUB |
 | `ds4_gpu_matmul_q8_0_tensor` | VERIFIED |
 | `ds4_gpu_matmul_q8_0_top1_tensor` | STUB |
 | `ds4_gpu_matmul_quant_decode_mpp_model_view_tensor` | STUB |
 | `ds4_gpu_matmul_quant_kslice_tensor` | STUB |
 | `ds4_gpu_matmul_quant_rows_scalar_tensor` | STUB |
-| `ds4_gpu_matmul_quant_tensor` | STUB |
+| `ds4_gpu_matmul_quant_tensor` | VERIFIED |
 
 ## mgpu (5 real / 0 stub)
 
@@ -277,7 +277,7 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_set_model_map_spans` | REAL |
 | `ds4_gpu_set_q8_cache_suppressed` | REAL |
 
-## moe (2 real / 22 stub)
+## moe (5 real / 19 stub)
 
 | function | status |
 |---|---|
@@ -300,25 +300,25 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_router_select_tensor` | VERIFIED |
 | `ds4_gpu_shared_down_hc_expand_add_q8_0_tensor` | STUB |
 | `ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor` | STUB |
-| `ds4_gpu_shared_down_hc_expand_q8_0_tensor` | STUB |
+| `ds4_gpu_shared_down_hc_expand_q8_0_tensor` | REAL |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor` | STUB |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor` | STUB |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor` | STUB |
-| `ds4_gpu_shared_gate_up_swiglu_q8_0_tensor` | STUB |
+| `ds4_gpu_shared_gate_up_swiglu_q8_0_tensor` | REAL |
 | `ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor` | STUB |
-| `ds4_gpu_shared_mid_swiglu_q8_0_tensor` | STUB |
+| `ds4_gpu_shared_mid_swiglu_q8_0_tensor` | REAL |
 | `ds4_gpu_swiglu_tensor` | REAL |
 
-## norm (2 real / 6 stub)
+## norm (3 real / 4 stub)
 
 | function | status |
 |---|---|
 | `ds4_gpu_add_rms_norm_weight_tensor` | STUB |
-| `ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor` | STUB |
+| `ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor` | VERIFIED |
 | `ds4_gpu_dsv4_qkv_rms_norm_rows_tensor` | VERIFIED |
 | `ds4_gpu_glm_kv_lora_rms_norm_tensor` | STUB |
 | `ds4_gpu_glm_qkv_norm_store_compact_kv_tensor` | STUB |
-| `ds4_gpu_hc_split_weighted_sum_norm_tensor` | STUB |
+| `ds4_gpu_hc_split_weighted_sum_norm_tensor` | REAL |
 | `ds4_gpu_hc_weighted_sum_norm_tensor` | STUB |
 | `ds4_gpu_head_rms_norm_rope_tail_tensor` | VERIFIED |
 | `ds4_gpu_head_rms_norm_tensor` | VERIFIED |
@@ -420,4 +420,4 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_tp_shutdown` | STUB |
 | `ds4_gpu_tp_suspend_expert_sharding` | STUB |
 
-TOTAL: 261 functions, 91 real, 146 stub
+TOTAL: 261 functions, 102 real, 128 stub

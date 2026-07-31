@@ -60,6 +60,13 @@ VERIFIED = {
     "ds4_gpu_dsv4_fp8_kv_quantize_tensor",
     "ds4_gpu_store_raw_kv_batch_tensor",
     "ds4_gpu_attention_prefill_raw_heads_tensor",
+    "ds4_gpu_matmul_quant_tensor",
+    "ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor",
+    "ds4_gpu_kv_fp8_store_raw_tensor",
+    "ds4_gpu_matmul_q8_0_pair_tensor",
+    "ds4_gpu_matmul_q8_0_hc_expand_tensor",
+    "ds4_gpu_matmul_f16_pair_compressor_store_tensor",
+    "ds4_gpu_matmul_f32_tensor",
 }
 
 

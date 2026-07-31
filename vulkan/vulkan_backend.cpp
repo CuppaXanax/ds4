@@ -1166,6 +1166,30 @@ int ds4_gpu_matmul_q8_0_tensor(
     return 1;
 }
 
+/* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */
+int ds4_gpu_matmul_f32_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x, uint64_t n_tok)
+{
+    (void)model_map; (void)model_size;
+    if (!out || !out->ptr || !x || !x->ptr || !model_map) return 0;
+    if (out->bytes < n_tok * out_dim * sizeof(float) ||
+        x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    const float *xp = (const float *)x->ptr;
+    const float *wp = (const float *)((const char *)model_map + weight_offset);
+    float *op = (float *)out->ptr;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t o = 0; o < out_dim; o++) {
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++)
+                acc += (double)xp[t * in_dim + i] * (double)wp[o * in_dim + i];
+            op[t * out_dim + o] = (float)acc;
+        }
+    }
+    return 1;
+}
+
 /* ---- matmul_f16_tensor dispatch ---- */
 int ds4_gpu_matmul_f16_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -1848,6 +1872,87 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
     return 1;
 }
 
+/* Decode fused Q/KV RMSNorm + KV RoPE tail.  Composes the two verified
+ * kernels exactly (CUDA dsv4_qkv_rms_norm_rows_kv_rope_kernel): first the
+ * fused Q+KV per-row RMSNorm with learned weights, then the RoPE tail over
+ * the kv_out tensor laid out as [rows][kv_n_head][kv_head_dim], rotating
+ * the last n_rot channels of every head.  The engine calls this with
+ * rows=1 per decode step (ds4.c metal_graph_encode_decode_layer), so the
+ * RoPE position is pos0 for that single token. */
+int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+    ds4_gpu_tensor *q_out, const ds4_gpu_tensor *q,
+    const void *mm, uint64_t ms, uint64_t qwo, uint32_t qn,
+    ds4_gpu_tensor *kv_out, const ds4_gpu_tensor *kv,
+    uint64_t kvwo, uint32_t kvn, uint32_t rows,
+    uint32_t kv_n_head, uint32_t kv_head_dim, uint32_t n_rot,
+    uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+    float freq_base, float freq_scale, float ext_factor,
+    float attn_factor, float beta_fast, float beta_slow, float eps)
+{
+    if (!q_out || !q || !kv_out || !kv || !mm) return 0;
+    if (qn == 0 || kvn == 0 || rows == 0) return 0;
+    if (kv_n_head == 0 || kv_head_dim == 0 ||
+        n_rot > kv_head_dim || (n_rot & 1u) ||
+        kvn != kv_n_head * kv_head_dim)
+        return 0;
+
+    if (!ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+            q_out, q, mm, ms, qwo, qn, kv_out, kv, kvwo, kvn, rows, eps))
+        return 0;
+    return ds4_gpu_rope_tail_tensor(
+        kv_out, rows, kv_n_head, kv_head_dim, n_rot,
+        pos0, n_ctx_orig, inverse, freq_base, freq_scale,
+        ext_factor, attn_factor, beta_fast, beta_slow);
+}
+
+/* Release decode fused KV finalizer: after the standalone RoPE kernel this
+ * performs DS4's FP8 non-RoPE KV round trip in place and writes the
+ * F16-rounded row into the raw attention ring cache (CUDA
+ * fp8_kv_quantize_store_rows_kernel, ds4.c dsv4_fp8_kv_quantize_row_inplace_cpu
+ * + kv_cache_push_raw).  Ring position is row % raw_cap. */
+int ds4_gpu_kv_fp8_store_raw_tensor(
+    ds4_gpu_tensor *kv,
+    ds4_gpu_tensor *raw_cache,
+    uint32_t          raw_cap,
+    uint32_t          row,
+    uint32_t          head_dim,
+    uint32_t          n_rot)
+{
+    if (!kv || !kv->ptr || !raw_cache || !raw_cache->ptr) return 0;
+    if (raw_cap == 0 || head_dim == 0 || n_rot > head_dim) return 0;
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    if (kv->bytes < row_bytes ||
+        raw_cache->bytes < (uint64_t)raw_cap * row_bytes)
+        return 0;
+
+    /* In-place E4M3FN round trip on the non-RoPE part (64-wide blocks,
+     * per-block amax, power-of-two scale from amax/448). */
+    const uint32_t n_nope = head_dim - n_rot;
+    float *xp = (float *)kv->ptr;
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 64; i++) {
+            const float av = fabsf(xp[off + i]);
+            if (av > amax) amax = av;
+        }
+        if (amax < 1.0e-4f) amax = 1.0e-4f;
+        const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+        for (uint32_t i = 0; i < 64; i++) {
+            float v = xp[off + i] / scale;
+            if (v > 448.0f) v = 448.0f;
+            if (v < -448.0f) v = -448.0f;
+            xp[off + i] = ds4_e4m3fn_dequant(v) * scale;
+        }
+    }
+
+    /* F16 round trip into the ring row (ds4.c kv_cache_push_raw). */
+    const uint32_t dst_row = row % raw_cap;
+    float *dst = (float *)raw_cache->ptr + (uint64_t)dst_row * head_dim;
+    for (uint32_t d = 0; d < head_dim; d++)
+        dst[d] = ds4_half_to_float(ds4_float_to_half(xp[d]));
+    return 1;
+}
+
 } /* extern "C" DSV4 implementations */
 
 /* ---- CPU fallbacks for remaining critical functions ---- */
@@ -2429,6 +2534,142 @@ int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc,
             for (uint32_t src = 0; src < n_hc; src++)
                 acc += co[(size_t)dst + (size_t)src * n_hc] * rh[(uint64_t)src * n_embd + d];
             o[(uint64_t)dst * n_embd + d] = acc;
+        }
+    }
+    return 1;
+}
+
+/* ---- Fused Q8_0 matmul + HC expand (host-side) ----
+ *
+ * ds4_gpu_matmul_q8_0_pair_tensor: two Q8_0 projections with separate
+ * weight matrices in one call (engine: q+kv or gate+up paired projections).
+ *   out0[t][o] = sum_i x[t][i] * W0[o][i]
+ *   out1[t][o] = sum_i x[t][i] * W1[o][i]
+ * with the same Q8_0 dequant math as the verified matmul_q8_0 shader
+ * (f16 block scale, int8 quants, raw f32 activations, double accumulation).
+ *
+ * ds4_gpu_matmul_q8_0_hc_expand_tensor: fused attention-output projection +
+ * hc_post_one (single token, decode): block_out = W @ x, then
+ *   out_hc[dst*n_embd + d] = block_out[d] * post[dst]
+ *                            + sum_src comb[dst + src*n_hc] * residual_hc[src*n_embd + d]
+ * with post = split[n_hc .. 2*n_hc), comb = split[2*n_hc .. 2*n_hc + n_hc*n_hc)
+ * (the engine's hc_split sinkhorn layout, matching the Metal fused kernel).
+ *
+ * Both are host-side like the rest of the HC family: the tensors are
+ * host-mapped and the small decode matvecs would only add submit latency
+ * without a compute win.  Host writes are visible to later GPU dispatches
+ * that consume these outputs.
+ */
+
+/* Q8_0 row (34 B/block: f16 scale + 32 x int8) dot raw f32 vector.
+ * Matches the verified matmul_q8_0 kernel: double accumulation, partial
+ * last block when in_dim % 32 != 0. */
+static float ds4_q8_0_row_dot_f32(const uint8_t *row, const float *xp,
+                                  uint64_t in_dim, uint64_t blocks) {
+    double acc = 0.0;
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+        const float scale = ds4_half_to_float(scale_bits);
+        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+        const uint64_t i0 = b * 32u;
+        const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        for (uint64_t i = 0; i < n; i++)
+            acc += (double)scale * (double)qs[i] * (double)xp[i0 + i];
+    }
+    return (float)acc;
+}
+
+int ds4_gpu_matmul_q8_0_pair_tensor(
+    ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+    const void *model_map, uint64_t model_size,
+    uint64_t weight0_offset, uint64_t weight1_offset,
+    uint64_t in_dim, uint64_t out0_dim, uint64_t out1_dim,
+    const ds4_gpu_tensor *x, uint64_t n_tok)
+{
+    if (!out0 || !out1 || !model_map || !x || in_dim == 0 || n_tok == 0 ||
+        out0_dim == 0 || out1_dim == 0) return 0;
+    if (!out0->ptr || !out1->ptr || !x->ptr) return 0;
+
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    /* Never read past the model mmap (SIGBUS guard), never write past
+     * tensor bytes. */
+    if (weight0_offset > model_size ||
+        out0_dim > (model_size - weight0_offset) / row_bytes) return 0;
+    if (weight1_offset > model_size ||
+        out1_dim > (model_size - weight1_offset) / row_bytes) return 0;
+    if (n_tok > UINT64_MAX / in_dim ||
+        (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes) return 0;
+    if (n_tok > UINT64_MAX / out0_dim ||
+        (uint64_t)out0_dim * n_tok * sizeof(float) > out0->bytes) return 0;
+    if (n_tok > UINT64_MAX / out1_dim ||
+        (uint64_t)out1_dim * n_tok * sizeof(float) > out1->bytes) return 0;
+
+    const uint8_t *base = (const uint8_t *)model_map;
+    const float *xp = (const float *)x->ptr;
+    float *o0 = (float *)out0->ptr;
+    float *o1 = (float *)out1->ptr;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        const float *xt = xp + t * in_dim;
+        for (uint64_t o = 0; o < out0_dim; o++)
+            o0[t * out0_dim + o] =
+                ds4_q8_0_row_dot_f32(base + weight0_offset + o * row_bytes,
+                                     xt, in_dim, blocks);
+        for (uint64_t o = 0; o < out1_dim; o++)
+            o1[t * out1_dim + o] =
+                ds4_q8_0_row_dot_f32(base + weight1_offset + o * row_bytes,
+                                     xt, in_dim, blocks);
+    }
+    return 1;
+}
+
+int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+    ds4_gpu_tensor *out_hc, ds4_gpu_tensor *block_out,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+    const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+    uint32_t n_embd, uint32_t n_hc)
+{
+    if (!out_hc || !block_out || !model_map || !x || !residual_hc || !split ||
+        n_embd == 0 || n_hc == 0 || in_dim == 0 || out_dim != n_embd) return 0;
+    if (!out_hc->ptr || !block_out->ptr || !x->ptr ||
+        !residual_hc->ptr || !split->ptr) return 0;
+
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    if (weight_offset > model_size ||
+        out_dim > (model_size - weight_offset) / row_bytes) return 0;
+
+    const uint64_t embd_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if ((uint64_t)in_dim * sizeof(float) > x->bytes ||
+        embd_bytes > block_out->bytes ||
+        hc_bytes > residual_hc->bytes ||
+        hc_bytes > out_hc->bytes ||
+        mix_hc * sizeof(float) > split->bytes) return 0;
+
+    const uint8_t *base = (const uint8_t *)model_map;
+    const float *xp = (const float *)x->ptr;
+    const float *resp = (const float *)residual_hc->ptr;
+    const float *splitp = (const float *)split->ptr;
+    const float *postp = splitp + n_hc;             /* split: [pre|post|comb] */
+    const float *combp = splitp + 2ull * n_hc;
+    float *bp = (float *)block_out->ptr;
+    float *op = (float *)out_hc->ptr;
+
+    for (uint64_t d = 0; d < out_dim; d++) {
+        const float block_v =
+            ds4_q8_0_row_dot_f32(base + weight_offset + d * row_bytes,
+                                 xp, in_dim, blocks);
+        bp[d] = block_v;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            float acc = block_v * postp[dst];
+            for (uint32_t src = 0; src < n_hc; src++)
+                acc += combp[(size_t)dst + (size_t)src * n_hc] *
+                       resp[(uint64_t)src * n_embd + d];
+            op[(uint64_t)dst * n_embd + d] = acc;
         }
     }
     return 1;
@@ -3565,6 +3806,96 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(
 }
 
 /* =========================================================================
+ * Dense quantized matmul: ds4_gpu_matmul_quant_tensor
+ *
+ * out[t][o] = sum_i x[t][i] * W[o][i] for the dense row-major quantized
+ * weight matrix W (DS4_TENSOR_* weight_type ids, ds4.c:2040).  This is the
+ * dispatch used for the dense quantized weights (Q2_K / IQ2_XXS / Q4_K and
+ * the plain F16/F32/Q8_0 forms).  The plain forms delegate to the existing
+ * matmul_*_tensor entries; Q2_K and IQ2_XXS are host-side ports of the
+ * ds4.c matvec helpers (ds4_vec_dot_q2_K_q8_K / ds4_vec_dot_iq2_xxs_q8_K)
+ * with the activation quantized to Q8_K, exactly like the routed-MoE paths.
+ * The GGUF block layouts and the dot helpers are the ds4gk_* ones shared
+ * with ds4_gpu_routed_moe_*_tensor above.
+ * ========================================================================= */
+extern "C" int ds4_gpu_matmul_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok)
+{
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) {
+        return 0;
+    }
+    switch (weight_type) {
+        case 0:  /* DS4_TENSOR_F32 */
+            return ds4_gpu_matmul_f32_tensor(out, model_map, model_size,
+                                             weight_offset, in_dim, out_dim, x, n_tok);
+        case 1:  /* DS4_TENSOR_F16 */
+            return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
+                                             weight_offset, in_dim, out_dim, x, n_tok);
+        case 8:  /* DS4_TENSOR_Q8_0 */
+            return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                              weight_offset, in_dim, out_dim, x, n_tok);
+        case 10: /* DS4_TENSOR_Q2_K */
+        case 16: /* DS4_TENSOR_IQ2_XXS */
+            break;
+        default:
+            fprintf(stderr, "ds4: matmul_quant: unsupported weight_type %u\n",
+                    weight_type);
+            return 0;
+    }
+
+    /* Host-side Q2_K / IQ2_XXS rows: QK_K(256)-element GGUF blocks. */
+    if (in_dim % DS4GK_QK_K != 0) {
+        fprintf(stderr, "ds4: matmul_quant: QK_K-aligned in_dim required for type %u\n",
+                weight_type);
+        return 0;
+    }
+    const uint64_t row_bytes = (weight_type == 10)
+                                   ? sizeof(ds4gk_block_q2_K)
+                                   : sizeof(ds4gk_block_iq2_xxs);
+    if (weight_offset > model_size || row_bytes == 0 ||
+        out_dim > (model_size - weight_offset) / row_bytes) {
+        fprintf(stderr, "ds4: matmul_quant: weights out of model map range\n");
+        return 0;
+    }
+    const uint64_t x_bytes   = n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+    if (ds4_gpu_tensor_bytes(x) < x_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes) {
+        fprintf(stderr, "ds4: matmul_quant: tensor bytes too small\n");
+        return 0;
+    }
+
+    const uint8_t *base = (const uint8_t *)model_map + weight_offset;
+    const float *xp = (const float *)x->ptr;
+    float *op = (float *)out->ptr;
+    const uint64_t n_qk = in_dim / DS4GK_QK_K;
+    std::vector<ds4gk_block_q8_K> xqk(n_qk);
+
+    for (uint64_t t = 0; t < n_tok; t++) {
+        const float *xt = xp + t * in_dim;
+        float *ot = op + t * out_dim;
+        ds4gk_quantize_row_q8_K(xt, xqk.data(), (int64_t)in_dim);
+        for (uint64_t o = 0; o < out_dim; o++) {
+            const uint8_t *row = base + o * row_bytes;
+            ot[o] = (weight_type == 10)
+                        ? ds4gk_vec_dot_q2_K_q8_K((int)in_dim,
+                                                  (const ds4gk_block_q2_K *)row, xqk.data())
+                        : ds4gk_vec_dot_iq2_xxs_q8_K((int)in_dim,
+                                                     (const ds4gk_block_iq2_xxs *)row, xqk.data());
+        }
+    }
+    return 1;
+}
+
+/* =========================================================================
  * Shared expert (the DS4 layer-FFN half that runs for every token).
  *
  * Host-side ports of ds4.c layer_shared_ffn_one / matvec_q8_0_pair_prequant /
@@ -4219,6 +4550,102 @@ int ds4_gpu_compressor_prefill_tensor(
             !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) {
             return 0;
         }
+    }
+    return 1;
+}
+
+/* ---- matmul_f16_pair_compressor_store_tensor (host-side fused path) ----
+ *
+ * Fuses the paired F16 compressor projections with the rolling compressor
+ * state store for one decode token:
+ *
+ *   out_kv[o]    = sum_i W_kv[o][i] * x[i]        (o < width, i < in_dim)
+ *   out_score[o] = sum_i W_score[o][i] * x[i]
+ *   state_kv / state_score row = out_kv / out_score + APE(phase = pos % ratio)
+ *
+ * The weights are IEEE-half matrices (2 bytes/element, row-major
+ * [width][in_dim]) at weight_kv_offset / weight_score_offset; the APE
+ * tensor is laid out [ratio][width] (ape_type 0 = f32, 1 = f16), exactly
+ * like the CUDA compressor_store_kernel.  Row mapping matches
+ * ds4_gpu_compressor_store_batch_tensor: ratio-4 layers keep the current
+ * window in the second lane (rows [ratio, 2*ratio)).
+ *
+ * This is host-side (tensor->ptr is host-mapped in this backend), so no
+ * command buffer is involved.  Returns 1 when the fused store was
+ * performed (the engine then skips the re-store in compressor_update),
+ * -1 on an attempted-path error, 0 when the optimized path is
+ * unavailable. */
+int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+        ds4_gpu_tensor       *out_kv,
+        ds4_gpu_tensor       *out_score,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_kv_offset,
+        uint64_t                weight_score_offset,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                in_dim,
+        uint32_t                width,
+        const ds4_gpu_tensor *x,
+        uint32_t                ratio,
+        uint32_t                pos) {
+    if (!out_kv || !out_score || !state_kv || !state_score ||
+        !model_map || !x ||
+        in_dim == 0 || width == 0 || ratio == 0 ||
+        (ape_type != 0u && ape_type != 1u)) {
+        return -1;
+    }
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t state_rows = coff * ratio;
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t weight_bytes = in_dim * (uint64_t)width * 2u; /* f16 */
+    const uint64_t out_bytes = (uint64_t)width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
+    if (weight_kv_offset > model_size ||
+        weight_bytes > model_size - weight_kv_offset ||
+        weight_score_offset > model_size ||
+        weight_bytes > model_size - weight_score_offset ||
+        ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        x->bytes < in_dim * sizeof(float) ||
+        out_kv->bytes < out_bytes || out_score->bytes < out_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        return -1;
+    }
+
+    const uint16_t *wkv = (const uint16_t *)((const char *)model_map + weight_kv_offset);
+    const uint16_t *wsc = (const uint16_t *)((const char *)model_map + weight_score_offset);
+    const float *xp = (const float *)x->ptr;
+    float *okv = (float *)out_kv->ptr;
+    float *osc = (float *)out_score->ptr;
+    float *skv = (float *)state_kv->ptr;
+    float *ssc = (float *)state_score->ptr;
+
+    /* Paired F16 matvec: out[o] = sum_i W[o][i] * x[i], decoded as IEEE
+     * halves (same storage/order as the matmul_f16 shader). */
+    for (uint32_t o = 0; o < width; o++) {
+        const uint16_t *rk = wkv + (uint64_t)o * in_dim;
+        const uint16_t *rs = wsc + (uint64_t)o * in_dim;
+        double akv = 0.0, asc = 0.0;
+        for (uint64_t i = 0; i < in_dim; i++) {
+            akv += (double)ds4_half_to_float(rk[i]) * (double)xp[i];
+            asc += (double)ds4_half_to_float(rs[i]) * (double)xp[i];
+        }
+        okv[o] = (float)akv;
+        osc[o] = (float)asc;
+    }
+
+    /* Rolling state store (compressor_store_batch semantics, one token). */
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
+    const uint64_t doff = (uint64_t)dst_row * width;
+    for (uint32_t j = 0; j < width; j++) {
+        skv[doff + j] = okv[j];
+        ssc[doff + j] = osc[j] +
+            compressor_ape_scalar(model_map, ape_offset, ape_type,
+                                  (uint64_t)pos_mod * width + j);
     }
     return 1;
 }

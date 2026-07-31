@@ -68,12 +68,10 @@ struct TensorHeader {
     bool           is_managed = false;
 };
 
-/* ds4_gpu_tensor struct definition (forward-declared in ds4_gpu.h) */
-struct ds4_gpu_tensor {
-    void     *ptr;
-    uint64_t  bytes;
-    int       owner;
-};
+/* ds4_gpu_tensor struct definition comes from ds4_gpu_mgpu.h (the header
+ * forward-declares it in ds4_gpu.h).  The full layout
+ * (ptr/bytes/owner/device_id) must match the shared multi-GPU plumbing. */
+#include "../ds4_gpu_mgpu.h"
 
 /* Forward declarations for VK_CHECK_RAW macro */
 #define VK_CHECK_RAW(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
@@ -100,22 +98,34 @@ static struct {
     
     std::unordered_map<void*, TensorHeader*> tensor_headers;
     
-    /* Weight cache: maps model file offset → VkBuffer with Q8_0 weights copied to GPU */
+    /* Weight cache: maps model file offset -> VkBuffer with weights copied to
+     * GPU.  Ranges are uploaded lazily on first kernel use (see ensure_weight)
+     * and evicted LRU-style against g_vk.weight_budget, so models larger than
+     * the device heap stream layer-by-layer (llama.cpp-style). */
     struct WeightCacheEntry {
         VkBuffer       buffer = VK_NULL_HANDLE;
         VmaAllocation  allocation = VK_NULL_HANDLE;
         uint64_t       size = 0;
+        uint64_t       last_used = 0;
+        uint64_t       last_gen = 0;   /* command-buffer generation of last use */
         VkDescriptorBufferInfo desc_info{};
     };
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
+    /* Model tensor ranges registered by cache_model_range (metadata only). */
+    std::unordered_map<uint64_t, uint64_t> range_registry; /* offset -> bytes */
+    uint64_t weight_budget = 40ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
+    uint64_t weight_used = 0;
+    uint64_t lru_counter = 0;
+    uint64_t cmd_gen = 0;   /* incremented each begin_cmd; guards in-flight eviction */
 
     /* Single model buffer covering the entire mmap'd model */
     VkBuffer            model_buffer     = VK_NULL_HANDLE;
-    VmaAllocation       model_alloc      = VK_NULL_HANDLE;
+    VkDeviceMemory      model_mem        = VK_NULL_HANDLE;
     uint8_t            *model_data       = nullptr;
 
     const void         *model_map      = nullptr;
     uint64_t            model_size     = 0;
+    PFN_vkGetMemoryHostPointerPropertiesEXT pfnGetMemoryHostPointerProperties = nullptr;
     bool                quality        = false;
     bool                ssd_streaming  = false;
     uint32_t            expert_cache_budget = 0;
@@ -254,9 +264,11 @@ static int create_logical_device(void) {
     a64.shaderBufferInt64Atomics = VK_TRUE; a64.shaderSharedInt64Atomics = VK_TRUE;
     f13.pNext = &a64;
 
+    const char *dext[] = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = dext;
     dci.pEnabledFeatures = &feat; dci.pNext = &f11;
     VK_CHECK_RAW(vkCreateDevice(g_vk.phys_device, &dci, nullptr, &g_vk.device));
     vkGetDeviceQueue(g_vk.device, qf, 0, &g_vk.queue);
@@ -409,7 +421,10 @@ static int begin_cmd(void) {
         /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
         c.cmd_buf_count++;
         if (c.cmd_buf_count >= 4) {
-            vkResetCommandPool(g_vk.device, c.pool, 0);
+            /* llama.cpp-style cleanup.  RELEASE_RESOURCES also frees the
+             * driver's internal command-stream buffers, which avoids a RADV
+             * radv_amdgpu_cs_finalize crash after large prefill+decode. */
+            vkResetCommandPool(g_vk.device, c.pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
             c.cmd_buf_count = 0;
             c.cmd_rot_idx = 0;
         } else {
@@ -430,12 +445,19 @@ static int begin_cmd(void) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
     c.command_count = 0;
+    g_vk.cmd_gen++;
+    if (getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr, "ds4: [dbg] begin_cmd rot=%u gen=%llu\n",
+                c.cmd_rot_idx, (unsigned long long)g_vk.cmd_gen);
     return 1;
 }
 
 static int end_and_submit(void) {
     auto &c = get_cmd_ctx();
     if (c.command_count == 0) return 1;
+    if (getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
+                (unsigned)c.command_count, c.cmd_rot_idx, (unsigned long long)g_vk.cmd_gen);
     VK_CHECK_RAW(vkEndCommandBuffer(c.cmd));
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
@@ -454,6 +476,19 @@ static int wait_cmd(void) {
 static int submit_and_wait(void) {
     int r = end_and_submit(); if (!r) return 0;
     return wait_cmd();
+}
+
+/* Split long command buffers into multiple submissions (llama.cpp-style):
+ * RADV can crash finalizing a huge CS right after a large prefill, and
+ * in-flight weight eviction is bounded by keeping command buffers short. */
+static void maybe_submit(void) {
+    auto &c = get_cmd_ctx();
+    if (c.command_count >= 64) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] maybe_submit cc=%u\n", (unsigned)c.command_count);
+        end_and_submit();
+        begin_cmd();
+    }
 }
 
 /* ---- Compute Dispatch ---- */
@@ -499,6 +534,7 @@ static int dispatch_shader(const char *name,
 
     /* Reset descriptor pool periodically (simplified: reset each time) */
     /* In production, use multiple pools or recycle sets */
+    maybe_submit();
     return 0;
 }
 
@@ -508,24 +544,32 @@ static int dispatch_shader(const char *name,
 
 /* ---- Initialization ---- */
 int ds4_gpu_init(void) {
-    if (g_vk.initialized) return 0;
+    if (g_vk.initialized) return 1;
 
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "DS4"; app.applicationVersion = VK_MAKE_API_VERSION(0,1,0,0);
     app.pEngineName = "DS4 Vulkan"; app.engineVersion = VK_MAKE_API_VERSION(0,1,0,0);
     app.apiVersion = VK_API_VERSION_1_3;
-    const char *ext = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+    const char *ext[] = {
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+    };
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 1; ici.ppEnabledExtensionNames = &ext;
+    ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = ext;
 
     VkResult res = vkCreateInstance(&ici, nullptr, &g_vk.instance);
-    if (res != VK_SUCCESS) { fprintf(stderr, "ds4: VULKAN instance failed (%d)\n", res); return -1; }
-    if (select_physical_device() != 0) return -1;
-    if (create_logical_device() != 0) return -1;
+    if (res != VK_SUCCESS) { fprintf(stderr, "ds4: VULKAN instance failed (%d)\n", res); return 0; }
+    g_vk.pfnGetMemoryHostPointerProperties =
+        (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetInstanceProcAddr(
+            g_vk.instance, "vkGetMemoryHostPointerPropertiesEXT");
+    if (select_physical_device() != 0) return 0;
+    if (create_logical_device() != 0) return 0;
     load_all_shaders();
+    const char *bg = getenv("DS4_VULKAN_WEIGHT_BUDGET_GB");
+    if (bg && *bg) g_vk.weight_budget = (uint64_t)atoll(bg) * 1024ull * 1024ull * 1024ull;
     g_vk.initialized = true;
     fprintf(stderr, "ds4: VULKAN backend ready\n");
     return 1;  /* DS4 convention: 1 = success, 0 = failure */
@@ -553,6 +597,15 @@ void ds4_gpu_cleanup(void) {
         free(h);
     }
     g_vk.tensor_headers.clear();
+    for (auto &[_, e] : g_vk.weight_cache)
+        if (e.buffer) vmaDestroyBuffer(g_vk.allocator, e.buffer, e.allocation);
+    g_vk.weight_cache.clear();
+    g_vk.range_registry.clear();
+    /* Destroy the external-host-memory model buffer (no heap budget) */
+    if (g_vk.model_buffer) vkDestroyBuffer(g_vk.device, g_vk.model_buffer, nullptr);
+    if (g_vk.model_mem) vkFreeMemory(g_vk.device, g_vk.model_mem, nullptr);
+    g_vk.model_buffer = VK_NULL_HANDLE;
+    g_vk.model_mem = VK_NULL_HANDLE;
     /* Destroy descriptor pool */
     if (g_vk.desc_pool) vkDestroyDescriptorPool(g_vk.device, g_vk.desc_pool, nullptr);
     /* Destroy VMA allocator - skip if any leaks remain (the VkDevice teardown
@@ -684,7 +737,13 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t doff,
 /* ---- Commands ---- */
 
 int ds4_gpu_begin_commands(void) { return begin_cmd(); }
-int ds4_gpu_flush_commands(void) { return end_and_submit(); }
+int ds4_gpu_flush_commands(void) {
+    /* The engine keeps recording after a flush (e.g. SSD streaming async
+     * loads), so start a fresh command buffer like Metal's next encoder. */
+    int ok = end_and_submit();
+    if (ok) ok = begin_cmd();
+    return ok;
+}
 int ds4_gpu_end_commands(void) { return submit_and_wait(); }
 int ds4_gpu_synchronize(void) { VK_CHECK_RAW(vkDeviceWaitIdle(g_vk.device)); return 1; }
 
@@ -693,7 +752,13 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
 }
 
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t ev, const char *label) {
-    (void)ev; (void)label; return end_and_submit();
+    (void)ev; (void)label;
+    /* End + wait + re-begin: the engine reads the selected ids on the CPU and
+     * then keeps encoding GPU kernels (routed MoE) without a begin_commands. */
+    int ok = end_and_submit();
+    if (ok) ok = wait_cmd();
+    if (ok) ok = begin_cmd();
+    return ok;
 }
 
 int ds4_gpu_wait_selected_readback_ready(uint64_t ev, const char *label) {
@@ -702,7 +767,11 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t ev, const char *label) {
 
 /* ---- Model Loading ---- */
 
-int ds4_gpu_set_model_map(const void *m, uint64_t s) { if (!m) return 0; g_vk.model_map = m; g_vk.model_size = s; return 1; }
+int ds4_gpu_set_model_map(const void *m, uint64_t s) {
+    if (!m) return 0;
+    g_vk.model_map = m; g_vk.model_size = s;
+    return 1;
+}
 int ds4_gpu_set_model_fd(int fd) { (void)fd; return 1; }
 int ds4_gpu_set_model_fd_for_map(int fd, const void *m) { (void)fd; if (!m) return 0; g_vk.model_map = m; return 1; }
 
@@ -723,20 +792,58 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
     return 1;  /* DS4 convention: 1 = success */
 }
 
+/* Model ranges are only registered here (metadata).  The actual GPU upload
+ * happens lazily in the kernels via ensure_weight(), so models larger than
+ * the device heap stream layer-by-layer (llama.cpp-style) instead of failing
+ * during startup. */
 int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes, const char *label) {
-    (void)s; (void)label;
-    if (!m || bytes == 0) return 0;
-    if (g_vk.weight_cache.count(off)) return 1;
+    (void)m; (void)s; (void)label;
+    if (bytes == 0) return 0;
+    g_vk.range_registry[off] = bytes;
+    return 1;
+}
+
+/* Ensure the weight range covering `offset` (at least `needed` bytes) is
+ * resident in a GPU buffer, uploading it from the model mmap on first use.
+ * Evicts least-recently-used ranges when g_vk.weight_budget is exceeded. */
+static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
+    for (auto &[base, e] : g_vk.weight_cache) {
+        if (offset >= base && offset < base + e.size) {
+            e.last_used = ++g_vk.lru_counter;
+            e.last_gen = g_vk.cmd_gen;
+            return 1;
+        }
+    }
+    if (!g_vk.model_map || needed_bytes == 0) return 0;
+
+    uint64_t size = needed_bytes;
+    for (auto &[rb, rs] : g_vk.range_registry) {
+        if (offset >= rb && offset < rb + rs) { size = rs > needed_bytes ? rs : needed_bytes; break; }
+    }
+    /* Never read past the end of the file-backed mmap (SIGBUS otherwise). */
+    if (offset >= g_vk.model_size) return 0;
+    if (size > g_vk.model_size - offset) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] ensure_weight clamp %llu -> %llu bytes @ %llu\n",
+                    (unsigned long long)size,
+                    (unsigned long long)(g_vk.model_size - offset),
+                    (unsigned long long)offset);
+        size = g_vk.model_size - offset;
+    }
+    if (size == 0) return 0;
 
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bytes;
+    bci.size = size;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VmaAllocationCreateInfo aci{};
     aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    VmaAllocationInfo ai;
-    VkBuffer buf; VmaAllocation alloc;
-    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buf, &alloc, &ai) != VK_SUCCESS) { return 1; }
+    VkBuffer buf; VmaAllocation alloc; VmaAllocationInfo ai;
+    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buf, &alloc, &ai) != VK_SUCCESS) {
+        fprintf(stderr, "ds4: VULKAN ensure_weight: alloc failed (%llu bytes @ %llu); try DS4_VULKAN_WEIGHT_BUDGET_GB\n",
+                (unsigned long long)size, (unsigned long long)offset);
+        return 0;
+    }
 
     static VkCommandPool load_pool = VK_NULL_HANDLE;
     if (load_pool == VK_NULL_HANDLE) {
@@ -747,9 +854,11 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
         vkCreateCommandPool(g_vk.device, &cpci, nullptr, &load_pool);
     }
 
+    /* Staging buffer: the destination is device-local even on iGPUs, so the
+     * copy goes host -> staging -> vkCmdCopyBuffer -> device. */
     VkBufferCreateInfo sbci{};
     sbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    sbci.size = bytes;
+    sbci.size = size;
     sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo saci{};
     saci.usage = VMA_MEMORY_USAGE_AUTO;
@@ -758,8 +867,8 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
     VkBuffer sbuf; VmaAllocation salloc;
     bool staged = false;
     if (vmaCreateBuffer(g_vk.allocator, &sbci, &saci, &sbuf, &salloc, &sai) == VK_SUCCESS
-        && sai.pMappedData && g_vk.model_map) {
-        memcpy(sai.pMappedData, (const char*)g_vk.model_map + off, (size_t)bytes);
+        && sai.pMappedData) {
+        memcpy(sai.pMappedData, (const char*)g_vk.model_map + offset, (size_t)size);
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = load_pool;
@@ -771,7 +880,7 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
             bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             if (vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS) {
-                VkBufferCopy copy{}; copy.size = bytes;
+                VkBufferCopy copy{}; copy.size = size;
                 vkCmdCopyBuffer(cb, sbuf, buf, 1, &copy);
                 if (vkEndCommandBuffer(cb) == VK_SUCCESS) {
                     VkFenceCreateInfo fci{}; fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -791,8 +900,26 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
         }
         vmaDestroyBuffer(g_vk.allocator, sbuf, salloc);
     }
-    if (!staged) { vmaDestroyBuffer(g_vk.allocator, buf, alloc); return 1; }
-    g_vk.weight_cache[off] = {buf, alloc, bytes, {}};
+    if (!staged) { vmaDestroyBuffer(g_vk.allocator, buf, alloc); return 0; }
+
+    g_vk.weight_cache[offset] = {buf, alloc, size, ++g_vk.lru_counter, g_vk.cmd_gen, {}};
+    g_vk.weight_used += size;
+
+    /* LRU eviction (never evict the range just uploaded, nor any range still
+     * referenced by the command buffer currently being recorded). */
+    while (g_vk.weight_used > g_vk.weight_budget) {
+        uint64_t lru_base = UINT64_MAX, lru_time = UINT64_MAX;
+        for (auto &[b, e] : g_vk.weight_cache) {
+            if (b == offset) continue;
+            if (e.last_gen == g_vk.cmd_gen) continue;
+            if (e.last_used < lru_time) { lru_time = e.last_used; lru_base = b; }
+        }
+        if (lru_base == UINT64_MAX) break;
+        auto it = g_vk.weight_cache.find(lru_base);
+        vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
+        g_vk.weight_used -= it->second.size;
+        g_vk.weight_cache.erase(it);
+    }
     return 1;
 }
 
@@ -957,16 +1084,27 @@ int ds4_gpu_matmul_q8_0_tensor(
     VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
     if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
 
-    /* Find weight buffer in cache - search by offset range, not exact match */
+    /* Lazy weight upload with LRU eviction: find the range in the cache or
+     * upload it from the model mmap on first use. */
+    VkBuffer wbuf; uint64_t wbuf_off;
     auto wit = g_vk.weight_cache.end();
     for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
         if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
             wit = it; break;
         }
     }
-    if (wit == g_vk.weight_cache.end()) return 0;
-    VkBuffer wbuf = wit->second.buffer;
-    uint64_t wbuf_off = weight_offset - wit->first;
+    if (wit != g_vk.weight_cache.end()) {
+        wit->second.last_used = ++g_vk.lru_counter;
+        wbuf = wit->second.buffer;
+        wbuf_off = weight_offset - wit->first;
+    } else {
+        /* Q8_0 (GGUF) block = 34 bytes: f16 scale + 32 x int8, same as ds4.c. */
+        if (!ensure_weight(weight_offset, (uint64_t)out_dim * n_blocks * 34u)) return 0;
+        wit = g_vk.weight_cache.find(weight_offset);
+        if (wit == g_vk.weight_cache.end()) return 0;
+        wbuf = wit->second.buffer;
+        wbuf_off = 0;
+    }
 
     /* Per-dispatch descriptor set (fresh each call) */
     VkDescriptorSetAllocateInfo dai{};
@@ -977,9 +1115,9 @@ int ds4_gpu_matmul_q8_0_tensor(
     if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
 
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = std::min<VkDeviceSize>(
+    const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * n_blocks * 36u);
+        (uint64_t)out_dim * n_blocks * 34u);
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size},
@@ -1015,6 +1153,7 @@ int ds4_gpu_matmul_q8_0_tensor(
         vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
     }
     c.command_count++;
+    maybe_submit();
 
     /* Memory barrier: visibility for subsequent dispatches */
     VkMemoryBarrier mb{};
@@ -1054,16 +1193,27 @@ int ds4_gpu_matmul_f16_tensor(
     };
     VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
     if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
-    /* Find weight buffer - search by offset range */
+    /* Lazy weight upload with LRU eviction: find the range in the cache or
+     * upload it from the model mmap on first use. */
+    VkBuffer wbuf; uint64_t wbuf_off;
     auto wit = g_vk.weight_cache.end();
     for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
         if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
             wit = it; break;
         }
     }
-    if (wit == g_vk.weight_cache.end()) return 0;
-    VkBuffer wbuf = wit->second.buffer;
-    uint64_t wbuf_off = weight_offset - wit->first;
+    if (wit != g_vk.weight_cache.end()) {
+        wit->second.last_used = ++g_vk.lru_counter;
+        wbuf = wit->second.buffer;
+        wbuf_off = weight_offset - wit->first;
+    } else {
+        /* W_f16 is a half-precision matrix: 2 bytes per element. */
+        if (!ensure_weight(weight_offset, (uint64_t)out_dim * in_dim * 2u)) return 0;
+        wit = g_vk.weight_cache.find(weight_offset);
+        if (wit == g_vk.weight_cache.end()) return 0;
+        wbuf = wit->second.buffer;
+        wbuf_off = 0;
+    }
     const bool is_decode = (n_tok == 1);
     /* Per-dispatch descriptor set (fresh each call) */
     VkDescriptorSet &ds = c.ds_f16;
@@ -1075,9 +1225,9 @@ int ds4_gpu_matmul_f16_tensor(
         if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
     }
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
-    VkDeviceSize w_size = std::min<VkDeviceSize>(
+    const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * in_dim * sizeof(float));  /* f16 = 2 bytes per element but buffer holds floats */
+        (uint64_t)out_dim * in_dim * 2u);  /* f16 weights: 2 bytes per element */
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size}, {wbuf, wbuf_off, w_size}, {obuf, ooff, o_size},
@@ -1107,6 +1257,7 @@ int ds4_gpu_matmul_f16_tensor(
         }
     }
     c.command_count++;
+    maybe_submit();
 
     /* Memory barrier: visibility for subsequent dispatches */
     VkMemoryBarrier mb{};
@@ -1173,31 +1324,64 @@ int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
 }
 
 /* ---- rope_tail_tensor dispatch ---- */
+/* Matches ds4.c rope_tail_ext_inplace exactly:
+ *   - RoPE touches only the tail of each head: the last n_rot of head_dim
+ *     channels; the first head_dim - n_rot channels stay untouched.
+ *   - Angles are built by accumulating theta_extrap *= theta_scale with
+ *     theta_scale = freq_base^(-2/n_rot) (NOT head_dim), so the frequency
+ *     of the i-th pair is freq_base^(-2*i/n_rot) * pos.
+ *   - YaRN (corr_dims + ramp mix + magnitude scaling) is applied when
+ *     ext_factor != 0.
+ *   - The rotation is scaled by attn_factor, and inverse mode flips the
+ *     sign of the sine term (conjugate rotation). */
 int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
                               uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
                               uint32_t n_ctx_orig, bool inverse, float freq_base,
                               float freq_scale, float ext_factor, float attn_factor,
                               float beta_fast, float beta_slow)
 {
-    (void)n_ctx_orig; (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
     if (!x || !x->ptr) return 0;
-    /* CPU fallback */
+    const uint32_t n_nope = head_dim - n_rot;
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const float sin_sign = inverse ? -1.0f : 1.0f;
+    const float k_pi = 3.14159265358979323846f;
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (ext_factor != 0.0f) {
+        /* ds4.c rope_yarn_corr_dims(n_rot, n_ctx_orig, freq_base, ...). */
+        const float start = floorf((float)n_rot *
+            logf((float)n_ctx_orig / (beta_fast * 2.0f * k_pi)) /
+            (2.0f * logf(freq_base)));
+        const float end = ceilf((float)n_rot *
+            logf((float)n_ctx_orig / (beta_slow * 2.0f * k_pi)) /
+            (2.0f * logf(freq_base)));
+        corr_dims[0] = fmaxf(0.0f, start);
+        corr_dims[1] = fminf((float)(n_rot - 1), end);
+    }
     float *d = (float*)x->ptr;
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t h = 0; h < n_head; h++) {
-            uint32_t off = (t * n_head + h) * head_dim;
+            float *tail = d + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+            float theta_extrap = (float)pos0;
             for (uint32_t i = 0; i < n_rot; i += 2) {
-                float theta = powf(freq_base, -2.0f * (float)i / (float)head_dim);
-                float cs = cosf(pos0 * theta * freq_scale);
-                float sn = sinf(pos0 * theta * freq_scale);
-                float v0 = d[off + i], v1 = d[off + i + 1];
-                if (!inverse) {
-                    d[off + i] = v0 * cs - v1 * sn;
-                    d[off + i + 1] = v0 * sn + v1 * cs;
-                } else {
-                    d[off + i] = v0 * cs + v1 * sn;
-                    d[off + i + 1] = -v0 * sn + v1 * cs;
+                const float theta_interp = freq_scale * theta_extrap;
+                float theta = theta_interp;
+                float mscale = attn_factor;
+                if (ext_factor != 0.0f) {
+                    /* ds4.c rope_yarn_ramp(corr_dims[0], corr_dims[1], i). */
+                    const float y = ((float)(i / 2) - corr_dims[0]) /
+                        fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                    const float ramp_mix =
+                        (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                    theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                    mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
                 }
+                const float c = cosf(theta) * mscale;
+                const float s = sin_sign * sinf(theta) * mscale;
+                const float x0 = tail[i];
+                const float x1 = tail[i + 1];
+                tail[i] = x0 * c - x1 * s;
+                tail[i + 1] = x0 * s + x1 * c;
+                theta_extrap *= theta_scale;
             }
         }
     }
@@ -1238,6 +1422,163 @@ int ds4_gpu_embed_tokens_hc_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     return 1;
 }
 
+/* ---- Q8_0 / F16 token embeddings (host-side dequant) ----
+ *
+ * Same pattern as the *_hc_tensor embedders above, but the model table is
+ * quantized: Q8_0 rows are blocks of {scale f16, 32 x int8} (34 bytes per
+ * block, GGUF layout), F16 rows are plain IEEE halves.  Every row is
+ * dequantized to f32 directly into the output tensor; tokens outside
+ * [0, n_vocab) clamp to row 0 (matches the HC embedders).  Rows are never
+ * read past model_size (mmap SIGBUS guard).
+ */
+static float ds4_half_to_float(uint16_t h); /* defined below in this TU */
+
+/* Dequantize one Q8_0 embedding row into out[0..n_embd).  The last block
+ * may be partial when n_embd % 32 != 0; its tail int8s are ignored
+ * (matches ds4.c embed_token_q8_0). */
+static void ds4_embed_q8_0_row(float *out, const uint8_t *row, uint64_t n_embd) {
+    const uint64_t blocks = (n_embd + 31u) / 32u;
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+        const float scale = ds4_half_to_float(scale_bits);
+        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = n_embd - i0 < 32u ? n_embd - i0 : 32u;
+        for (uint64_t i = 0; i < bn; i++) out[i0 + i] = scale * (float)qs[i];
+    }
+}
+
+/* Decode one F16 embedding row into out[0..n_embd). */
+static void ds4_embed_f16_row(float *out, const uint8_t *row, uint64_t n_embd) {
+    for (uint64_t i = 0; i < n_embd; i++) {
+        uint16_t bits;
+        memcpy(&bits, row + i * 2u, sizeof(bits));
+        out[i] = ds4_half_to_float(bits);
+    }
+}
+
+/* True when the row [weight_offset + id*row_bytes,
+ * weight_offset + (id+1)*row_bytes) is fully inside the model map. */
+static int ds4_embed_row_ok(const void *model_map, uint64_t model_size,
+                            uint64_t weight_offset, uint64_t id, uint64_t row_bytes) {
+    if (!model_map || weight_offset >= model_size) return 0;
+    const uint64_t avail = model_size - weight_offset;
+    if (id > avail / row_bytes) return 0;
+    return row_bytes <= avail - id * row_bytes;
+}
+
+/* ---- embed_token_q8_0_tensor ---- */
+int ds4_gpu_embed_token_q8_0_tensor(ds4_gpu_tensor *out,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint32_t n_vocab, uint32_t token, uint32_t n_embd)
+{
+    if (!out) return 0;
+    int32_t id = (int32_t)token;
+    if (id < 0 || (uint32_t)id >= n_vocab) id = 0;
+    const uint64_t row_bytes = ((uint64_t)n_embd + 31u) / 32u * 34u;
+    if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
+        return 0;
+    ds4_embed_q8_0_row((float *)out->ptr,
+                       (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
+                       n_embd);
+    return 1;
+}
+
+/* ---- embed_tokens_q8_0_tensor ---- */
+int ds4_gpu_embed_tokens_q8_0_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd)
+{
+    if (!out || !tokens) return 0;
+    const int32_t *tok = (const int32_t *)tokens->ptr;
+    float *outf = (float *)out->ptr;
+    const uint64_t row_bytes = ((uint64_t)n_embd + 31u) / 32u * 34u;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t id = tok[t];
+        if (id < 0 || (uint32_t)id >= n_vocab) id = 0;
+        if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
+            return 0;
+        ds4_embed_q8_0_row(outf + (uint64_t)t * n_embd,
+                           (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
+                           n_embd);
+    }
+    return 1;
+}
+
+/* ---- embed_token_f16_tensor (static; dispatch target) ---- */
+static int ds4_embed_token_f16_tensor(ds4_gpu_tensor *out,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint32_t n_vocab, uint32_t token, uint32_t n_embd)
+{
+    if (!out) return 0;
+    int32_t id = (int32_t)token;
+    if (id < 0 || (uint32_t)id >= n_vocab) id = 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * 2u;
+    if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
+        return 0;
+    ds4_embed_f16_row((float *)out->ptr,
+                      (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
+                      n_embd);
+    return 1;
+}
+
+/* ---- embed_tokens_f16_tensor (static; dispatch target) ---- */
+static int ds4_embed_tokens_f16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd)
+{
+    if (!out || !tokens) return 0;
+    const int32_t *tok = (const int32_t *)tokens->ptr;
+    float *outf = (float *)out->ptr;
+    const uint64_t row_bytes = (uint64_t)n_embd * 2u;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t id = tok[t];
+        if (id < 0 || (uint32_t)id >= n_vocab) id = 0;
+        if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
+            return 0;
+        ds4_embed_f16_row(outf + (uint64_t)t * n_embd,
+                          (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
+                          n_embd);
+    }
+    return 1;
+}
+
+/* ---- embed_token_quant_tensor (dispatch on weight_type) ---- */
+int ds4_gpu_embed_token_quant_tensor(ds4_gpu_tensor *out,
+    const void *model_map, uint64_t model_size, uint64_t weight_offset,
+    uint32_t weight_type, uint32_t n_vocab, uint32_t token, uint32_t n_embd)
+{
+    switch (weight_type) {
+    case 8:  /* DS4_TENSOR_Q8_0 */
+        return ds4_gpu_embed_token_q8_0_tensor(out, model_map, model_size,
+                                               weight_offset, n_vocab, token, n_embd);
+    case 1:  /* DS4_TENSOR_F16 */
+        return ds4_embed_token_f16_tensor(out, model_map, model_size,
+                                          weight_offset, n_vocab, token, n_embd);
+    default:
+        return 0;  /* unsupported weight type */
+    }
+}
+
+/* ---- embed_tokens_quant_tensor (dispatch on weight_type) ---- */
+int ds4_gpu_embed_tokens_quant_tensor(ds4_gpu_tensor *out,
+    const ds4_gpu_tensor *tokens, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint32_t weight_type, uint32_t n_vocab,
+    uint32_t n_tokens, uint32_t n_embd)
+{
+    switch (weight_type) {
+    case 8:  /* DS4_TENSOR_Q8_0 */
+        return ds4_gpu_embed_tokens_q8_0_tensor(out, tokens, model_map, model_size,
+                                                weight_offset, n_vocab, n_tokens, n_embd);
+    case 1:  /* DS4_TENSOR_F16 */
+        return ds4_embed_tokens_f16_tensor(out, tokens, model_map, model_size,
+                                           weight_offset, n_vocab, n_tokens, n_embd);
+    default:
+        return 0;  /* unsupported weight type */
+    }
+}
+
 /* ---- attn_q_b_f16_head_rms_rope_tail_tensor ---- */
 int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     ds4_gpu_tensor *q, ds4_gpu_tensor *q_half,
@@ -1260,6 +1601,111 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
 
 } /* extern "C" */
 
+/* ---- IEEE-754 half helpers (ds4.c f32_to_f16 / f16_to_f32) ----
+ * The engine's raw KV cache stores rows through an f16 round trip
+ * (kv_cache_push_raw, CUDA store_raw_kv_batch_kernel), so the Vulkan
+ * store path must reproduce the same rounding to keep decode attention
+ * bit-compatible with the other backends.
+ */
+static uint16_t ds4_float_to_half(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = bits & 0x7fffffu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        const uint32_t round_bit = (mant >> (shift - 1)) & 1u;
+        const uint32_t sticky = mant & ((1u << (shift - 1)) - 1u);
+        if (round_bit && (sticky || (half_mant & 1u))) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+
+    if (exp >= 31) {
+        if (((bits >> 23) & 0xffu) == 0xffu && mant != 0) {
+            return (uint16_t)(sign | 0x7e00u);
+        }
+        return (uint16_t)(sign | 0x7c00u);
+    }
+
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    const uint32_t round = mant & 0x1fffu;
+    if (round > 0x1000u || (round == 0x1000u && (half & 1u))) half++;
+    return (uint16_t)half;
+}
+
+static float ds4_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t expo = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (expo == 0) {
+        if (mant == 0) {
+            bits = sign;                              /* +/- zero */
+        } else {                                      /* subnormal */
+            int e = -14;
+            uint32_t m = mant;
+            while ((m & 0x400u) == 0) { m <<= 1; e--; }
+            bits = sign | (uint32_t)(e + 127) << 23 | (m & 0x3ffu) << 13;
+        }
+    } else if (expo == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);     /* inf / nan */
+    } else {
+        bits = sign | (expo + 112u) << 23 | mant << 13;
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* ---- E4M3FN (fp8) table helpers (ds4.c dsv4_e4m3fn_value/dequant_cpu) ---- */
+static float ds4_e4m3fn_value(int i) {
+    static const float exp_scale[16] = {
+        0.0f, 0.015625f, 0.03125f, 0.0625f,
+        0.125f, 0.25f, 0.5f, 1.0f,
+        2.0f, 4.0f, 8.0f, 16.0f,
+        32.0f, 64.0f, 128.0f, 256.0f,
+    };
+
+    const int exp = (i >> 3) & 0x0f;
+    const int mant = i & 0x07;
+    return exp == 0
+        ? (float)mant * 0.001953125f
+        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+}
+
+static float ds4_e4m3fn_dequant(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 448.0f);
+
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (ds4_e4m3fn_value(mid) <= ax) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(ax - ds4_e4m3fn_value(best));
+        const float next_diff = fabsf(ax - ds4_e4m3fn_value(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best++;
+        }
+    }
+
+    return sign * ds4_e4m3fn_value(best);
+}
+
 /* ---- DSV4-specific extern C implementations ---- */
 extern "C" {
 
@@ -1269,8 +1715,35 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     uint32_t head_dim,
     uint32_t n_rot)
 {
-    (void)x; (void)n_tok; (void)head_dim; (void)n_rot;
-    return 1;  /* No-op: KV cache stays in float on Vulkan backend */
+    if (!x || !x->ptr || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
+    if (x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
+
+    /* Host-side in-place E4M3FN round trip on the non-RoPE part of every
+     * row, replicating ds4.c dsv4_fp8_kv_quantize_row_inplace_cpu and the
+     * CUDA fp8_kv_quantize_kernel exactly: 64-wide blocks, per-block amax,
+     * power-of-two scale from amax/448, then quantize/dequantize back. */
+    const uint32_t n_nope = head_dim - n_rot;
+    float *xp = (float *)x->ptr;
+    for (uint32_t t = 0; t < n_tok; t++) {
+        float *row = xp + (uint64_t)t * head_dim;
+        for (uint32_t off = 0; off < n_nope; off += 64) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 64; i++) {
+                const float av = fabsf(row[off + i]);
+                if (av > amax) amax = av;
+            }
+
+            if (amax < 1.0e-4f) amax = 1.0e-4f;
+            const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+            for (uint32_t i = 0; i < 64; i++) {
+                float v = row[off + i] / scale;
+                if (v > 448.0f) v = 448.0f;
+                if (v < -448.0f) v = -448.0f;
+                row[off + i] = ds4_e4m3fn_dequant(v) * scale;
+            }
+        }
+    }
+    return 1;
 }
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
@@ -1285,11 +1758,61 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
     uint32_t n_head,
     uint32_t head_dim)
 {
-    (void)model_map; (void)model_size; (void)sinks_offset; (void)q; (void)window;
-    if (!heads || !raw_kv) return 0;
-    /* Simple pass-through: copy KV to output */
-    uint64_t row_size = (uint64_t)n_head * head_dim;
-    memcpy(heads->ptr, raw_kv->ptr, (uint64_t)n_tokens * row_size * sizeof(float));
+    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
+        !model_map || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        window == 0 || window > 256)
+        return 0;
+    const uint64_t head_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < kv_bytes)
+        return 0;
+
+    /* Causal windowed attention over the contiguous batch KV (the chunk
+     * rows, not the ring): token t sees rows [t+1-window, t], the sink
+     * prior joins the softmax.  Replicates ds4.c
+     * layer_attention_prefix_batch_worker and the CUDA
+     * attention_prefill_raw_kernel math exactly.
+     *   raw_count = min(t+1, window); raw_start = t+1-raw_count
+     *   scale = rsqrtf(head_dim); max starts at sinks[h]
+     *   score[r] = dot(qh, kv[raw_start+r]) * scale
+     *   heads = sum exp(score - max) * kv / (exp(sinks-max) + sum exp(...)) */
+    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
+    const float *qp = (const float *)q->ptr;
+    const float *rawp = (const float *)raw_kv->ptr;
+    float *hp = (float *)heads->ptr;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    float score[256];
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_count = (t + 1u < window) ? (t + 1u) : window;
+        const uint32_t raw_start = t + 1u - raw_count;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = qp + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                score[r] = dot * scale;
+                if (score[r] > max_score) max_score = score[r];
+            }
+
+            float *oh = hp + ((uint64_t)t * n_head + h) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] = 0.0f;
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(score[r] - max_score);
+                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            const float inv = 1.0f / denom;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
+        }
+    }
     return 1;
 }
 
@@ -1299,8 +1822,18 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
     ds4_gpu_tensor *kv_out, const ds4_gpu_tensor *kv,
     uint64_t kvwo, uint32_t kvn, uint32_t rows, float eps)
 {
-    (void)ms;
     if (!q_out || !q || !kv_out || !kv || !mm) return 0;
+    if (qn == 0 || kvn == 0 || rows == 0) return 0;
+    const uint64_t q_bytes = (uint64_t)rows * qn * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)rows * kvn * sizeof(float);
+    if (qwo > ms || (uint64_t)qn * sizeof(float) > ms - qwo ||
+        kvwo > ms || (uint64_t)kvn * sizeof(float) > ms - kvwo ||
+        q_out->bytes < q_bytes || q->bytes < q_bytes ||
+        kv_out->bytes < kv_bytes || kv->bytes < kv_bytes)
+        return 0;
+
+    /* Fused Q/KV RMSNorm with learned per-channel scale (ds4.c
+     * rms_norm_weight per row, CUDA dsv4_qkv_rms_norm_rows_kernel). */
     float *qop = (float*)q_out->ptr; const float *qp = (const float*)q->ptr;
     const float *qw = (const float*)((const char*)mm + qwo);
     float *kvop = (float*)kv_out->ptr; const float *kvp = (const float*)kv->ptr;
@@ -1325,16 +1858,161 @@ extern "C" {
 int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv,
     uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim)
 {
-    if (!raw_cache || !kv) return 0;
-    float *cache = (float*)raw_cache->ptr;
-    const float *kvp = (const float*)kv->ptr;
-    /* Row size = n_head * head_dim per token. Compute from total size. */
-    uint64_t kv_rows = raw_cache->bytes / ((uint64_t)raw_cap * sizeof(float));
-    uint64_t row_size = kv_rows;
-    uint64_t tok_row = row_size;
+    if (!raw_cache || !raw_cache->ptr || !kv || !kv->ptr) return 0;
+    if (raw_cap == 0 || n_tokens == 0 || head_dim == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    if (raw_cache->bytes < (uint64_t)raw_cap * row_bytes ||
+        kv->bytes < (uint64_t)n_tokens * row_bytes)
+        return 0;
+
+    /* Ring-store batch rows at (pos0+t) % raw_cap, with the engine's f16
+     * round trip per element (ds4.c kv_cache_push_raw, CUDA
+     * store_raw_kv_batch_kernel). */
+    float *cache = (float *)raw_cache->ptr;
+    const float *kvp = (const float *)kv->ptr;
     for (uint32_t t = 0; t < n_tokens; t++) {
-        uint32_t row = (pos0 + t) % raw_cap;
-        memcpy(cache + (uint64_t)row * row_size, kvp + (uint64_t)t * row_size, row_size * sizeof(float));
+        const uint32_t row = (pos0 + t) % raw_cap;
+        float *dst = cache + (uint64_t)row * head_dim;
+        const float *src = kvp + (uint64_t)t * head_dim;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            dst[d] = ds4_half_to_float(ds4_float_to_half(src[d]));
+        }
+    }
+    return 1;
+}
+
+/* ---- ds4_gpu_attention_decode_heads_tensor (CPU-hosted) ----
+ *
+ * Single-token causal decode attention over the raw ring cache plus the
+ * compressed (MLA) cache.  Host-side over the host-mapped tensor memory
+ * (same pattern as ds4_gpu_add_tensor / ds4_gpu_router_select_tensor).
+ *
+ * Replicates the engine's CPU reference (ds4.c layer_attention_mixed_one)
+ * and the CUDA attention_decode_mixed_kernel math exactly:
+ *   scale = 1/sqrtf(head_dim)
+ *   per head h: qh = q[h*head_dim ..] (f32); sink prior sinks[h]
+ *     (f32 at model_map + sinks_offset, n_head values) joins the softmax
+ *     denominator only.
+ *   raw rows are the n_raw newest chronological rows of the ring:
+ *     row r (r = 0..n_raw-1) lives at (raw_start + r) % raw_cap and holds
+ *     head_dim f32 values.  K and V share the row (MLA-style single KV per
+ *     token); every q head attends to the same rows.
+ *   compressed rows c = 0..n_comp-1 live at comp_kv[c*head_dim ..]; the
+ *     storage is f32 or IEEE f16 (comp_kv_f16, 2 bytes/element) and the
+ *     comp_mask (used when use_mask != 0) is an additive float bias per
+ *     row: 0.0 = allowed, -inf = masked (rows with bias <= -1e20 are
+  *     excluded, matching the CUDA kernel).
+  *     score = dot(qh, kv) * scale (+ comp mask bias); softmax with the sink
+  *     prior; heads[h*head_dim ..] = sum(exp(score - max) * v) / denom.
+  */
+int ds4_gpu_attention_decode_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_comp,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t                use_mask,
+        uint32_t                n_head,
+        uint32_t                head_dim)
+{
+    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
+        !model_map || n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap ||
+        (n_comp != 0 && (!comp_kv || !comp_kv->ptr)) ||
+        (use_mask != 0 && (!comp_mask || !comp_mask->ptr))) {
+        return 0;
+    }
+    const uint64_t head_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t comp_elem = comp_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        (n_comp != 0 && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem) ||
+        (use_mask != 0 && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
+        return 0;
+    }
+
+    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
+    const float *qp = (const float *)q->ptr;
+    const float *rawp = (const float *)raw_kv->ptr;
+    const uint8_t *compp = comp_kv ? (const uint8_t *)comp_kv->ptr : nullptr;
+    const float *maskp = (use_mask && comp_mask) ? (const float *)comp_mask->ptr : nullptr;
+    float *hp = (float *)heads->ptr;
+
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t n_total = n_raw + n_comp;
+    std::vector<float> score(n_total);
+
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = qp + (uint64_t)h * head_dim;
+        const float sink = sinks[h];
+        float max_score = sink;
+
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            const float *kv = rawp + (uint64_t)row * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            score[r] = dot * scale;
+            if (score[r] > max_score) max_score = score[r];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            const float add = maskp ? maskp[c] : 0.0f;
+            const uint32_t idx = n_raw + c;
+            if (add <= -1.0e20f) {
+                score[idx] = -INFINITY;               /* masked comp row */
+                continue;
+            }
+            const float *kv = (const float *)(compp + (uint64_t)c * head_dim * comp_elem);
+            float dot = 0.0f;
+            if (comp_kv_f16) {
+                const uint16_t *kvh = (const uint16_t *)kv;
+                for (uint32_t d = 0; d < head_dim; d++)
+                    dot += qh[d] * ds4_half_to_float(kvh[d]);
+            } else {
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+            }
+            score[idx] = dot * scale + add;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+
+        float *oh = hp + (uint64_t)h * head_dim;
+        std::memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
+
+        float denom = expf(sink - max_score);
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = (raw_start + r) % raw_cap;
+            const float *kv = rawp + (uint64_t)row * head_dim;
+            const float weight = expf(score[r] - max_score);
+            denom += weight;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] += weight * kv[d];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            const uint32_t idx = n_raw + c;
+            if (score[idx] <= -1.0e20f) continue;
+            const float *kv = (const float *)(compp + (uint64_t)c * head_dim * comp_elem);
+            const float weight = expf(score[idx] - max_score);
+            denom += weight;
+            if (comp_kv_f16) {
+                const uint16_t *kvh = (const uint16_t *)kv;
+                for (uint32_t d = 0; d < head_dim; d++)
+                    oh[d] += weight * ds4_half_to_float(kvh[d]);
+            } else {
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += weight * kv[d];
+            }
+        }
+
+        const float inv = 1.0f / denom;
+        for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
     }
     return 1;
 }
@@ -1376,15 +2054,188 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(ds4_gpu_tensor *heads,
     return 1;
 }
 
+/* ---- attention output projections (host-side Q8_0) ----
+ *
+ * Grouped attention output (DeepSeek V4 Flash).  The n_groups attention
+ * groups each own group_dim inputs (the concatenated heads of the group)
+ * and are projected to a rank-dimensional low vector by the Q8_0 matrix
+ * out_a; the concatenated low vector (n_groups*rank) is then projected to
+ * out_dim by the Q8_0 matrix out_b.
+ *
+ * Exact math replicated from ds4.c layer_grouped_out_batch /
+ * matvec_q8_0_grouped_rows / matmul_q8_0_batch:
+ *   1. Quantize every group slice of the input activation to Q8_0
+ *      (scale = amax/127, q = clamp(lrintf(x*127/amax)), tail lanes 0).
+ *   2. low[g*rank + r] = dot_q8_0_row(out_a row g*rank + r, xq_g, scale_g)
+ *   3. Quantize the whole low vector, then
+ *      out[o] = dot_q8_0_row(out_b row o, xq_low, scale_low)
+ * Q8_0 rows are GGUF blocks of {f16 scale, 32 x int8} = 34 bytes per block.
+ * The activation-side quantization is mandatory: the reference dot kernels
+ * consume pre-quantized Q8_0 activations, not raw floats.
+ */
+
+/* Q8_0 activation quantization (identical to ds4.c quantize_q8_0_activation). */
+static void ds4_attn_out_quant_q8_0(const float *x, int8_t *xq, float *scale, uint64_t n) {
+    const uint64_t blocks = (n + 31u) / 32u;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t bn = n - i0 < 32u ? n - i0 : 32u;
+        float amax = 0.0f;
+        for (uint64_t i = 0; i < bn; i++) {
+            const float ax = fabsf(x[i0 + i]);
+            if (ax > amax) amax = ax;
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        scale[b] = d;
+        for (uint64_t i = 0; i < bn; i++) {
+            int v = (int)lrintf(x[i0 + i] * id);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            xq[i0 + i] = (int8_t)v;
+        }
+        for (uint64_t i = bn; i < 32u && i0 + i < blocks * 32u; i++) xq[i0 + i] = 0;
+    }
+}
+
+/* Dot one Q8_0 weight row against a pre-quantized Q8_0 activation
+ * (identical to ds4.c dot_q8_0_row). */
+static float ds4_attn_out_dot_q8_0(const uint8_t *row, const int8_t *xq,
+                                   const float *xscale, uint64_t in_dim,
+                                   uint64_t blocks) {
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+        const uint64_t i0 = b * 32u;
+        const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        int32_t sum = 0;
+        for (uint64_t i = 0; i < n; i++) sum += (int32_t)qs[i] * (int32_t)xq[i0 + i];
+        acc += ds4_half_to_float(scale_bits) * xscale[b] * (float)sum;
+    }
+    return acc;
+}
+
+int ds4_gpu_attention_output_low_q8_tensor(ds4_gpu_tensor *low,
+    const void *model_map, uint64_t model_size, uint64_t out_a_offset,
+    uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+    const ds4_gpu_tensor *heads)
+{
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0)
+        return 0;
+    if (!low->ptr || !heads->ptr) return 0;
+
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = low_dim * row_a_bytes;
+
+    /* Safety: never read past the model mmap, never write past tensor bytes. */
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
+    if ((uint64_t)n_groups * group_dim * sizeof(float) > heads->bytes) return 0;
+    if (low_dim * sizeof(float) > low->bytes) return 0;
+
+    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
+    const float *hp = (const float *)heads->ptr;
+    float *lp = (float *)low->ptr;
+
+    /* Quantize each group's activation slice once (n_groups * blocks). */
+    std::vector<int8_t> xq((size_t)n_groups * blocks_a * 32u);
+    std::vector<float> xscale((size_t)n_groups * blocks_a);
+    for (uint32_t g = 0; g < n_groups; g++) {
+        ds4_attn_out_quant_q8_0(hp + (uint64_t)g * group_dim,
+                                xq.data() + (size_t)g * blocks_a * 32u,
+                                xscale.data() + (size_t)g * blocks_a,
+                                group_dim);
+    }
+    /* tensor_row == g*rank + r == idx (ds4.c matvec_q8_0_grouped_worker). */
+    for (uint64_t idx = 0; idx < low_dim; idx++) {
+        const uint64_t g = idx / rank;
+        lp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
+                                        xq.data() + (size_t)g * blocks_a * 32u,
+                                        xscale.data() + (size_t)g * blocks_a,
+                                        group_dim, blocks_a);
+    }
+    return 1;
+}
+
 int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
     ds4_gpu_tensor *gt, ds4_gpu_tensor *lt, const void *mm, uint64_t ms,
     uint64_t oa_off, uint64_t ob_off, uint64_t gd, uint64_t rank,
     uint32_t ng, uint64_t od, const ds4_gpu_tensor *heads, uint32_t nt)
 {
-    (void)low; (void)gt; (void)lt; (void)mm; (void)ms;
-    (void)oa_off; (void)ob_off; (void)gd; (void)rank; (void)ng;
-    if (!out || !heads) return 0;
-    memcpy(out->ptr, heads->ptr, (uint64_t)nt * od * sizeof(float));
+    (void)gt; (void)lt;
+    if (!out || !low || !heads || !mm || gd == 0 || rank == 0 ||
+        ng == 0 || od == 0 || nt == 0) return 0;
+    if (!out->ptr || !low->ptr || !heads->ptr) return 0;
+
+    const uint64_t low_dim = (uint64_t)ng * rank;
+    const uint64_t blocks_a = (gd + 31u) / 32u;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = low_dim * row_a_bytes;
+    const uint64_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t row_b_bytes = blocks_b * 34u;
+    const uint64_t out_b_bytes = od * row_b_bytes;
+
+    /* Safety: model ranges and tensor byte sizes. */
+    if (oa_off > ms || out_a_bytes > ms - oa_off) return 0;
+    if (ob_off > ms || out_b_bytes > ms - ob_off) return 0;
+    if ((uint64_t)nt * ng * gd * sizeof(float) > heads->bytes) return 0;
+    if ((uint64_t)nt * low_dim * sizeof(float) > low->bytes) return 0;
+    if ((uint64_t)nt * od * sizeof(float) > out->bytes) return 0;
+
+    const uint8_t *wa = (const uint8_t *)mm + oa_off;
+    const uint8_t *wb = (const uint8_t *)mm + ob_off;
+    const float *hp = (const float *)heads->ptr;
+    float *lp = (float *)low->ptr;
+    float *op = (float *)out->ptr;
+
+    /* Stage A: quantize every (token, group) activation slice once. */
+    std::vector<int8_t> axq((size_t)nt * ng * blocks_a * 32u);
+    std::vector<float> axscale((size_t)nt * ng * blocks_a);
+    for (uint32_t t = 0; t < nt; t++) {
+        const float *ht = hp + (uint64_t)t * ng * gd;
+        for (uint32_t g = 0; g < ng; g++) {
+            const size_t base = ((size_t)t * ng + g) * blocks_a;
+            ds4_attn_out_quant_q8_0(ht + (uint64_t)g * gd,
+                                    axq.data() + base * 32u,
+                                    axscale.data() + base,
+                                    gd);
+        }
+    }
+    /* low[t][g*rank + r] = dot(out_a row g*rank + r, q8(heads[t][g])). */
+    for (uint32_t t = 0; t < nt; t++) {
+        float *ltp = lp + (uint64_t)t * low_dim;
+        for (uint64_t idx = 0; idx < low_dim; idx++) {
+            const uint64_t g = idx / rank;
+            const size_t base = ((size_t)t * ng + (uint32_t)g) * blocks_a;
+            ltp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
+                                             axq.data() + base * 32u,
+                                             axscale.data() + base,
+                                             gd, blocks_a);
+        }
+    }
+
+    /* Stage B: quantize low per token, out[t][o] = dot(out_b row o, q8(low[t])). */
+    std::vector<int8_t> bxq((size_t)nt * blocks_b * 32u);
+    std::vector<float> bxscale((size_t)nt * blocks_b);
+    for (uint32_t t = 0; t < nt; t++) {
+        ds4_attn_out_quant_q8_0(lp + (uint64_t)t * low_dim,
+                                bxq.data() + (size_t)t * blocks_b * 32u,
+                                bxscale.data() + (size_t)t * blocks_b,
+                                low_dim);
+    }
+    for (uint64_t o = 0; o < od; o++) {
+        const uint8_t *row = wb + o * row_b_bytes;
+        for (uint32_t t = 0; t < nt; t++) {
+            op[(uint64_t)t * od + o] =
+                ds4_attn_out_dot_q8_0(row,
+                                      bxq.data() + (size_t)t * blocks_b * 32u,
+                                      bxscale.data() + (size_t)t * blocks_b,
+                                      low_dim, blocks_b);
+        }
+    }
     return 1;
 }
 
@@ -1428,6 +2279,117 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     return 1;
 }
 
+/* ---- ds4_gpu_router_select_tensor (CPU-hosted) ----
+ *
+ * MoE router for a single decode token.  Computed on the host over the
+ * host-mapped tensor memory (same pattern as ds4_gpu_add_tensor): the
+ * router output is tiny (n_expert ~ 256, n_expert_used ~ 6) and produced
+ * once per decode step, so a GPU dispatch would only add submit latency
+ * without a compute win.  A shader can replace this later without changing
+ * the contract.
+ *
+ * Semantics (matches the engine's layer_hash_router_weights_from_probs):
+ *   l[i]      = logits[token*n_expert + i] + (has_bias ? bias[i] : 0)
+ *   probs     = softmax(l) over ALL experts                    (per token)
+ *   selected  = top n_expert_used of l, sorted by l desc (ties: lower id)
+ *   weights   = softmax over the CHOSEN l (exp/sum) * expert_weight_scale
+ *   fallback  : if every chosen l is -inf, weights = 1/n_expert_used
+ *               (exactly, no scale, per the kernel contract)
+ *
+ * Simplifications for the first verified version (documented):
+ *   - n_expert_groups/n_group_used are ignored: n_expert_groups > 1 still
+ *     performs a plain global top-k (no group pre-selection).  The engine
+ *     currently passes 0/0 on the DeepSeek path, so this is unused.
+ *   - hash_mode is ignored (no crash): the engine overwrites the selection
+ *     with the hash-based override right after this call, so the hash path
+ *     here is intentionally a no-op; hash_offset/hash_rows are unused.
+ *   - probs with all -inf logits uses 1/n_expert per entry (natural
+ *     degenerate-case extension of the weights fallback).
+ *   - NaN logits are treated as -inf so the top-k stays well-defined.
+ */
+int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+    ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size,
+    uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows,
+    uint32_t token, uint32_t n_expert, uint32_t n_expert_used,
+    float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used,
+    bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits)
+{
+    (void)hash_offset; (void)hash_rows; (void)n_expert_groups; (void)n_group_used;
+    (void)hash_mode;
+    if (!selected || !weights || !probs || !logits || !logits->ptr) return 0;
+    if (n_expert == 0 || n_expert_used == 0 || n_expert_used > n_expert) return 0;
+
+    /* Bounds: tensor byte ranges and the model bias range (never read past
+     * the file-backed mmap - SIGBUS).  (uint64_t)token + 1 <= 2^32 and
+     * n_expert < 2^32, so n_logits cannot wrap uint64. */
+    uint64_t n_logits = ((uint64_t)token + 1) * n_expert;
+    if (n_logits > logits->bytes / sizeof(float)) return 0;
+    if ((uint64_t)n_expert_used * sizeof(int32_t) > selected->bytes) return 0;
+    if ((uint64_t)n_expert_used * sizeof(float) > weights->bytes) return 0;
+    if ((uint64_t)n_expert * sizeof(float) > probs->bytes) return 0;
+    if (has_bias) {
+        if (!model_map || model_size < sizeof(float)) return 0;
+        if (bias_offset > model_size ||
+            (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) return 0;
+    }
+
+    /* Copy the token's logits row, folding in the bias.  The input tensor is
+     * never mutated (the old batch fallback used to clobber it). */
+    const float *lp = (const float*)logits->ptr + (uint64_t)token * n_expert;
+    const float *bias = has_bias ? (const float*)((const char*)model_map + bias_offset) : nullptr;
+    std::vector<float> l(n_expert);
+    for (uint32_t i = 0; i < n_expert; i++) {
+        float v = lp[i];
+        if (bias) v += bias[i];
+        l[i] = std::isnan(v) ? -INFINITY : v;
+    }
+
+    /* Full softmax over all experts (numerically stable, double acc). */
+    float max_l = l[0];
+    for (uint32_t i = 1; i < n_expert; i++) if (l[i] > max_l) max_l = l[i];
+    float *pp = (float*)probs->ptr;
+    if (std::isinf(max_l) && max_l < 0) {              /* all -inf: undefined */
+        for (uint32_t i = 0; i < n_expert; i++) pp[i] = 1.0f / n_expert;
+    } else {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < n_expert; i++) sum += std::exp((double)l[i] - max_l);
+        for (uint32_t i = 0; i < n_expert; i++)
+            pp[i] = (float)(std::exp((double)l[i] - max_l) / sum);
+    }
+
+    /* Top-k insertion sort by l desc, tie -> lower expert id. */
+    std::vector<int32_t> topk(n_expert_used, -1);
+    for (uint32_t i = 0; i < n_expert; i++) {
+        for (uint32_t j = 0; j < n_expert_used; j++) {
+            if (topk[j] < 0 || l[i] > l[topk[j]] || (l[i] == l[topk[j]] && i < (uint32_t)topk[j])) {
+                for (uint32_t m = n_expert_used - 1; m > j; m--) topk[m] = topk[m - 1];
+                topk[j] = (int32_t)i;
+                break;
+            }
+        }
+    }
+
+    /* Weights: softmax over the chosen logits, scaled. */
+    int32_t *sel = (int32_t*)selected->ptr;
+    float *wp = (float*)weights->ptr;
+    float max_sel = l[topk[0]];
+    for (uint32_t k = 1; k < n_expert_used; k++) if (l[topk[k]] > max_sel) max_sel = l[topk[k]];
+    if (std::isinf(max_sel) && max_sel < 0) {          /* chosen are all -inf */
+        for (uint32_t k = 0; k < n_expert_used; k++) {
+            sel[k] = topk[k];
+            wp[k] = 1.0f / n_expert_used;              /* contract fallback, no scale */
+        }
+    } else {
+        double sum = 0.0;
+        for (uint32_t k = 0; k < n_expert_used; k++) sum += std::exp((double)l[topk[k]] - max_sel);
+        for (uint32_t k = 0; k < n_expert_used; k++) {
+            sel[k] = topk[k];
+            wp[k] = (float)(std::exp((double)l[topk[k]] - max_sel) / sum) * expert_weight_scale;
+        }
+    }
+    return 1;
+}
+
 int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
     ds4_gpu_tensor *probs, const void *mm, uint64_t ms, uint64_t bo, uint64_t ho,
     uint32_t hr, uint32_t ng, uint32_t ngu, bool hb, bool hm,
@@ -1459,6 +2421,160 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
     return 1;
 }
 
+/* ---- DS4 indexer: compressed-row selection (host-side, CPU fallback) ----
+ *
+ * Replicates the engine's CPU reference (ds4.c indexer_allowed_decode_one*
+ * and the per-token score loop) and the Metal/CUDA indexer score kernels
+ * exactly:
+ *
+ *     score[c] = sum_h max(0, dot(q[h], index_comp[c])) * weights[h] * scale
+ *
+ * Layouts (all f32, row-major):
+ *   q          [n_head][head_dim]             (single-token decode)
+ *   weights    [n_head]
+ *   index_comp [n_comp][head_dim]
+ *   scores     [n_comp]
+ *
+ * The batched decode variant uses q [n_tokens][n_head][head_dim],
+ * weights [n_tokens][n_head] and scores [n_tokens][n_comp].  Like the
+ * Metal tiled kernel it applies the causal visibility mask: at position
+ * p = pos0 + t only the first (p + 1) / ratio compressed rows exist, so
+ * rows beyond that are written as -INFINITY (the top-k selection below
+ * then ignores them).
+ */
+
+int ds4_gpu_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale) {
+    if (!scores || !q || !weights || !index_comp ||
+        n_comp == 0 || n_head == 0 || head_dim == 0) {
+        return 0;
+    }
+    const uint64_t q_bytes    = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t w_bytes    = (uint64_t)n_head * sizeof(float);
+    const uint64_t k_bytes    = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t s_bytes    = (uint64_t)n_comp * sizeof(float);
+    if (!scores->ptr || !q->ptr || !weights->ptr || !index_comp->ptr ||
+        q->bytes < q_bytes || weights->bytes < w_bytes ||
+        index_comp->bytes < k_bytes || scores->bytes < s_bytes) {
+        return 0;
+    }
+    const float *qp = (const float*)q->ptr;
+    const float *wp = (const float*)weights->ptr;
+    const float *kp = (const float*)index_comp->ptr;
+    float *sp = (float*)scores->ptr;
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const float *kv = kp + (uint64_t)c * head_dim;
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = qp + (uint64_t)h * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += kv[d] * qh[d];
+            if (dot < 0.0f) dot = 0.0f;          /* ReLU, as in ds4.c */
+            acc += dot * (wp[h] * scale);
+        }
+        sp[c] = acc;
+    }
+    return 1;
+}
+
+int ds4_gpu_indexer_scores_decode_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale) {
+    if (!scores || !q || !weights || !index_comp ||
+        n_comp == 0 || n_tokens == 0 || n_head == 0 ||
+        head_dim == 0 || ratio == 0) {
+        return 0;
+    }
+    const uint64_t q_bytes    = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t w_bytes    = (uint64_t)n_tokens * n_head * sizeof(float);
+    const uint64_t k_bytes    = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t s_bytes    = (uint64_t)n_comp * n_tokens * sizeof(float);
+    if (!scores->ptr || !q->ptr || !weights->ptr || !index_comp->ptr ||
+        q->bytes < q_bytes || weights->bytes < w_bytes ||
+        index_comp->bytes < k_bytes || scores->bytes < s_bytes) {
+        return 0;
+    }
+    const float *qp = (const float*)q->ptr;
+    const float *wp = (const float*)weights->ptr;
+    const float *kp = (const float*)index_comp->ptr;
+    float *sp = (float*)scores->ptr;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *qt = qp + (uint64_t)t * n_head * head_dim;
+        const float *wt = wp + (uint64_t)t * n_head;
+        float *st = sp + (uint64_t)t * n_comp;
+        const uint32_t visible = (uint32_t)(((uint64_t)pos0 + t + 1u) / ratio);
+        const uint32_t n_visible = visible < n_comp ? visible : n_comp;
+        for (uint32_t c = 0; c < n_comp; c++) {
+            if (c >= n_visible) {
+                st[c] = -INFINITY;
+                continue;
+            }
+            const float *kv = kp + (uint64_t)c * head_dim;
+            float acc = 0.0f;
+            for (uint32_t h = 0; h < n_head; h++) {
+                const float *qh = qt + (uint64_t)h * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += kv[d] * qh[d];
+                if (dot < 0.0f) dot = 0.0f;      /* ReLU, as in ds4.c */
+                acc += dot * (wt[h] * scale);
+            }
+            st[c] = acc;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_indexer_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                top_k) {
+    if (!selected || !scores || n_comp == 0 || n_tokens == 0 ||
+        top_k == 0 || top_k > n_comp) {
+        return 0;
+    }
+    const uint64_t s_bytes    = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t sel_bytes  = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
+    if (!selected->ptr || !scores->ptr ||
+        scores->bytes < s_bytes || selected->bytes < sel_bytes) {
+        return 0;
+    }
+    const float *sp = (const float*)scores->ptr;
+    uint32_t *out = (uint32_t*)selected->ptr;
+    std::vector<uint32_t> idx(n_comp);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *row = sp + (uint64_t)t * n_comp;
+        for (uint32_t c = 0; c < n_comp; c++) idx[c] = c;
+        /* Descending score, tie -> lower index (matches ds4.c reference and
+         * CUDA topk_score_better).  NaN sorts last so masked -INF rows are
+         * never selected ahead of real scores. */
+        std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            if (std::isnan(row[a])) return false;
+            if (std::isnan(row[b])) return true;
+            return row[a] > row[b] || (row[a] == row[b] && a < b);
+        });
+        for (uint32_t k = 0; k < top_k; k++) out[(uint64_t)t * top_k + k] = idx[k];
+    }
+    return 1;
+}
+
 } /* extern "C" close CPU fallbacks */
 
 /* ---- MoE CPU implementation ---- */
@@ -1467,47 +2583,704 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
 /* Q2_K block dequantization */
 #define QK_KMOE 256
 
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out,
-    ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
-    ds4_gpu_tensor *down, const void *mm, uint64_t ms,
-    uint64_t go, uint64_t uo, uint64_t doff, uint32_t gt, uint32_t dt,
-    uint64_t geb, uint64_t grb, uint64_t deb, uint64_t drb,
-    uint32_t eid, uint32_t emd, uint32_t od,
-    const ds4_gpu_tensor *sel, const ds4_gpu_tensor *wgt,
-    uint32_t ne, uint32_t neu, float clamp, const ds4_gpu_tensor *x,
-    uint32_t li, uint32_t nt, bool *mid_f16)
-{
-    (void)gate; (void)up; (void)mid; (void)down; (void)ms;
-    (void)gt; (void)dt; (void)go; (void)uo; (void)doff;
-    (void)geb; (void)grb; (void)deb; (void)drb;
-    (void)eid; (void)emd; (void)ne; (void)li;
-    (void)mid_f16;
-    if (!out || !sel || !wgt || !x || !mm) return 0;
-    
-    int *selected = (int*)sel->ptr;
-    float *weights = (float*)wgt->ptr;
-    float *op = (float*)out->ptr;
-    const float *xp = (const float*)x->ptr;
-    uint64_t out_dim = od;
-    
-    memset(op, 0, nt * out_dim * sizeof(float));
-    
-    for (uint32_t t = 0; t < nt; t++) {
-        for (uint32_t e = 0; e < neu; e++) {
-            int expert = selected[t * neu + e];
-            float weight = weights[t * neu + e];
-            if (expert < 0) continue;
-            
-            /* Gate and Up are IQ2_XXS or Q8_0 quantized in model file.
-             * Down is Q2_K quantized.
-             * For simplicity, we read weights from model_map and use
-             * ds4.c's internal functions via the CPU path.
-             * For now, just accumulate attention-only output (no FFN).
-             */
-            /* TODO: implement proper IQ2_XXS/Q2_K dequant */
+/* ds4_gpu_routed_moe_batch_tensor (prefill routed MoE) is implemented after
+ * ds4_gpu_routed_moe_one_tensor below: it loops the same per-token math over
+ * n_tokens slots.  The old stub here zeroed the output; the real
+ * implementation lives next to the single-token kernel it shares helpers
+ * with. */
+
+/* =========================================================================
+ * Single-token routed MoE: ds4_gpu_routed_moe_one_tensor
+ *
+ * Host-side implementation of the engine's routed expert FFN step.  The
+ * reference math lives in ds4.c (layer_routed_moe_one_prealloc and the
+ * matvec_*_prequant helpers); this is a faithful CPU port that reads the
+ * quantized expert weights straight from the model mmap and writes into the
+ * host-mapped tensors.  The quant block layouts, IQ2 tables, and dot helpers
+ * below are copied from ds4.c (GGUF formats) because ds4.c cannot be
+ * included by the backend.
+ *
+ * Supported routed tensor types (DS4_TENSOR_* ids, ds4.c:2040):
+ *   gate/up: Q8_0 (8), Q2_K (10), IQ2_XXS (16)
+ *   down:    Q8_0 (8), Q2_K (10), IQ2_XXS (16)
+ * ========================================================================= */
+namespace {
+
+constexpr uint32_t DS4GK_QK_K = 256;
+
+/* GGUF quant block layouts (copied from ds4.c, GGUF format). */
+struct ds4gk_block_q2_K {
+    uint8_t  scales[DS4GK_QK_K / 16];
+    uint8_t  qs[DS4GK_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+};
+
+struct ds4gk_block_iq2_xxs {
+    uint16_t d;
+    uint16_t qs[DS4GK_QK_K / 8];
+};
+
+struct ds4gk_block_q8_K {
+    float   d;
+    int8_t  qs[DS4GK_QK_K];
+    int16_t bsums[DS4GK_QK_K / 16];
+};
+
+/* IQ2_XXS tables (copied from ds4.c). */
+static const uint8_t ds4gk_kmask_iq2xs[8] = {
+    1, 2, 4, 8, 16, 32, 64, 128
+};
+
+static const uint8_t ds4gk_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static const uint64_t ds4gk_iq2xxs_grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+static int8_t ds4gk_iq2xxs_signed_grid[256][128][8];
+static std::once_flag ds4gk_iq2xxs_once;
+
+static void ds4gk_iq2xxs_signed_grid_init(void) {
+    for (uint32_t g = 0; g < 256; g++) {
+        const uint8_t *grid = (const uint8_t *)(ds4gk_iq2xxs_grid + g);
+        for (uint32_t s = 0; s < 128; s++) {
+            const uint8_t signs = ds4gk_ksigns_iq2xs[s];
+            for (uint32_t j = 0; j < 8; j++) {
+                const int v = (int)grid[j];
+                ds4gk_iq2xxs_signed_grid[g][s][j] =
+                    (int8_t)((signs & ds4gk_kmask_iq2xs[j]) ? -v : v);
+            }
         }
     }
-    
+}
+
+static void ds4gk_iq2xxs_ensure(void) {
+    std::call_once(ds4gk_iq2xxs_once, ds4gk_iq2xxs_signed_grid_init);
+}
+
+/* IEEE half -> f32 (copied from ds4.c). */
+static inline float ds4gk_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x03ff;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ff;
+            bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static float ds4gk_sigmoid_stable(float x) {
+    if (x >= 0.0f) {
+        const float e = expf(-x);
+        return 1.0f / (1.0f + e);
+    } else {
+        const float e = expf(x);
+        return e / (1.0f + e);
+    }
+}
+
+static float ds4gk_silu(float x) { return x * ds4gk_sigmoid_stable(x); }
+
+/* Q8_0 activation quantization (copied from ds4.c). */
+static void ds4gk_quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n) {
+    const uint64_t blocks = (n + 31) / 32;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = n - i0 < 32 ? n - i0 : 32;
+        float amax = 0.0f;
+        for (uint64_t i = 0; i < bn; i++) {
+            const float ax = fabsf(x[i0 + i]);
+            if (ax > amax) amax = ax;
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        scale[b] = d;
+        for (uint64_t i = 0; i < bn; i++) {
+            int v = (int)lrintf(x[i0 + i] * id);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            xq[i0 + i] = (int8_t)v;
+        }
+        for (uint64_t i = bn; i < 32 && i0 + i < blocks * 32; i++) {
+            xq[i0 + i] = 0;
+        }
+    }
+}
+
+static inline int32_t ds4gk_dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
+    int32_t sum = 0;
+    for (uint64_t i = 0; i < n; i++) sum += (int32_t)a[i] * (int32_t)b[i];
+    return sum;
+}
+
+/* Dot one Q8_0 weight row (f16 scale + 32 int8 per block) against a
+ * pre-quantized Q8_0 activation (copied from ds4.c dot_q8_0_row). */
+static inline float ds4gk_dot_q8_0_row(
+        const uint8_t *row,
+        const int8_t  *xq,
+        const float   *xscale,
+        uint64_t       in_dim,
+        uint64_t       blocks) {
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+
+        const uint64_t i0 = b * 32;
+        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        acc += ds4gk_f16_to_f32(scale_bits) * xscale[b] * (float)ds4gk_dot_i8_32(qs, xq + i0, n);
+    }
+    return acc;
+}
+
+/* Q8_K activation quantization (copied from ds4.c ds4_quantize_row_q8_K). */
+static void ds4gk_quantize_row_q8_K(const float *x, ds4gk_block_q8_K *y, int64_t k) {
+    const int64_t nb = k / (int64_t)DS4GK_QK_K;
+    for (int64_t b = 0; b < nb; b++) {
+        float max = 0.0f;
+        float amax = 0.0f;
+        for (int j = 0; j < (int)DS4GK_QK_K; j++) {
+            const float ax = fabsf(x[j]);
+            if (ax > amax) {
+                amax = ax;
+                max = x[j];
+            }
+        }
+        if (amax == 0.0f) {
+            y[b].d = 0.0f;
+            memset(y[b].qs, 0, sizeof(y[b].qs));
+            memset(y[b].bsums, 0, sizeof(y[b].bsums));
+            x += DS4GK_QK_K;
+            continue;
+        }
+        const float iscale = -127.0f / max;
+        for (int j = 0; j < (int)DS4GK_QK_K; j++) {
+            int v = (int)lrintf(iscale * x[j]);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            y[b].qs[j] = (int8_t)v;
+        }
+        for (int j = 0; j < (int)(DS4GK_QK_K / 16); j++) {
+            int sum = 0;
+            for (int i = 0; i < 16; i++) sum += y[b].qs[j * 16 + i];
+            y[b].bsums[j] = (int16_t)sum;
+        }
+        y[b].d = 1.0f / iscale;
+        x += DS4GK_QK_K;
+    }
+}
+
+static inline int32_t ds4gk_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 16; i++) sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
+    return sum;
+}
+
+/* Q2_K x Q8_K dot (plain-C path of ds4.c ds4_vec_dot_q2_K_q8_K). */
+static float ds4gk_vec_dot_q2_K_q8_K(int n, const ds4gk_block_q2_K *x, const ds4gk_block_q8_K *y) {
+    const int nb = n / (int)DS4GK_QK_K;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        int summs = 0;
+        for (int j = 0; j < 16; j++) {
+            summs += y[i].bsums[j] * (sc[j] >> 4);
+        }
+
+        const float dall = y[i].d * ds4gk_f16_to_f32(x[i].d);
+        const float dmin = y[i].d * ds4gk_f16_to_f32(x[i].dmin);
+
+        int isum = 0;
+        int is = 0;
+        for (int k = 0; k < (int)(DS4GK_QK_K / 128); k++) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                int d = sc[is++] & 0x0f;
+                int isuml = ds4gk_dot_q2_16(q2, q8, shift);
+                isum += d * isuml;
+
+                d = sc[is++] & 0x0f;
+                isuml = ds4gk_dot_q2_16(q2 + 16, q8 + 16, shift);
+                isum += d * isuml;
+
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+        sumf += dall * (float)isum - dmin * (float)summs;
+    }
+    return sumf;
+}
+
+static inline int32_t ds4gk_dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
+    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid1[i] * (int32_t)q8[8 + i];
+    return sum;
+}
+
+/* IQ2_XXS x Q8_K dot (plain-C path of ds4.c ds4_vec_dot_iq2_xxs_q8_K). */
+static float ds4gk_vec_dot_iq2_xxs_q8_K(int n, const ds4gk_block_iq2_xxs *x, const ds4gk_block_q8_K *y) {
+    ds4gk_iq2xxs_ensure();
+    const int nb = n / (int)DS4GK_QK_K;
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = ds4gk_f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        int32_t bsum = 0;
+
+        for (int ib32 = 0; ib32 < (int)(DS4GK_QK_K / 32); ib32++) {
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+
+            const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 4; l += 2) {
+                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
+                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
+                sumi += ds4gk_dot_iq2_pair_16(ds4gk_iq2xxs_signed_grid[aux8[l]][sign_idx0],
+                                              ds4gk_iq2xxs_signed_grid[aux8[l + 1]][sign_idx1],
+                                              q8);
+                q8 += 16;
+            }
+            bsum += sumi * (int32_t)ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+/* One token slot of the routed MoE FFN.  Shared by the single-token API and
+ * the prefill batch API (the batch is just the per-token loop over this with
+ * slot offsets).  All output pointers must already be advanced to this
+ * token's slot; the caller validates the tensors and dimensions.  Returns
+ * false and prints a diagnostic on an unsupported quant type, an out-of-range
+ * selected expert, or weights past the end of the model map. */
+static bool ds4gk_routed_moe_slot(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const uint8_t *base, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        const float *xp, const int32_t *selp, const float *wp,
+        float *gp, float *upp, float *mp, float *ep, float *op,
+        const char *tag)
+{
+    /* Range helper: rows*row_bytes must fit inside [off, model_size). */
+    auto range_ok = [model_size](uint64_t off, uint64_t rows, uint64_t row_bytes) -> bool {
+        if (row_bytes == 0 || off > model_size) return false;
+        return rows <= (model_size - off) / row_bytes;
+    };
+
+    const bool gate_q8_0 = (gate_type == 8);
+    const bool gate_q2_k = (gate_type == 10);
+    const bool gate_iq2  = (gate_type == 16);
+
+    /* Input quantization: Q8_0 rows need a Q8_0 activation, Q2_K / IQ2_XXS
+     * rows need a Q8_K activation (mirrors ds4.c matvec_*_prequant). */
+    std::vector<int8_t> xq8;
+    std::vector<float>  xscale8;
+    std::vector<ds4gk_block_q8_K> xqk;
+    if (gate_q8_0) {
+        const uint64_t blocks = (in_dim + 31) / 32;
+        xq8.resize(blocks * 32);
+        xscale8.resize(blocks);
+        ds4gk_quantize_q8_0_activation(xp, xq8.data(), xscale8.data(), in_dim);
+    } else {
+        if (!gate_q2_k && !gate_iq2) {
+            fprintf(stderr, "ds4: %s: unsupported gate type %u\n", tag, gate_type);
+            return false;
+        }
+        if (in_dim % DS4GK_QK_K != 0) {
+            fprintf(stderr, "ds4: %s: QK_K-aligned expert input required for type %u\n", tag, gate_type);
+            return false;
+        }
+        xqk.resize(in_dim / DS4GK_QK_K);
+        ds4gk_quantize_row_q8_K(xp, xqk.data(), in_dim);
+    }
+
+    /* Per-expert mid (weighted SwiGLU), re-quantized before the down dot. */
+    std::vector<float> midv(mid_dim);
+    std::vector<int8_t> midq8;
+    std::vector<float> midscale8;
+    std::vector<ds4gk_block_q8_K> midqk;
+    const uint64_t mid_q8_0_blocks = (mid_dim + 31) / 32;
+    const uint64_t mid_q8k_blocks  = mid_dim / DS4GK_QK_K;
+    const bool down_q8_0 = (down_type == 8);
+    const bool down_q2_k = (down_type == 10);
+    const bool down_iq2  = (down_type == 16);
+    if (down_q8_0) {
+        midq8.resize(mid_q8_0_blocks * 32);
+        midscale8.resize(mid_q8_0_blocks);
+    } else {
+        if (!down_q2_k && !down_iq2) {
+            fprintf(stderr, "ds4: %s: unsupported down type %u\n", tag, down_type);
+            return false;
+        }
+        if (mid_dim % DS4GK_QK_K != 0) {
+            fprintf(stderr, "ds4: %s: QK_K-aligned expert mid required for down type %u\n", tag, down_type);
+            return false;
+        }
+        midqk.resize(mid_q8k_blocks);
+    }
+
+    memset(op, 0, (uint64_t)out_dim * sizeof(float));
+
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const int32_t expert = selp[e];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) {
+            fprintf(stderr, "ds4: %s: selected expert %d out of range [0,%u)\n",
+                    tag, expert, n_total_expert);
+            return false;
+        }
+        const float weight = wp[e];
+
+        const uint64_t gate_ex_off = gate_offset + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t up_ex_off   = up_offset   + (uint64_t)expert * gate_expert_bytes;
+        const uint64_t down_ex_off = down_offset + (uint64_t)expert * down_expert_bytes;
+        if (!range_ok(gate_ex_off, mid_dim, gate_row_bytes) ||
+            !range_ok(up_ex_off, mid_dim, gate_row_bytes) ||
+            !range_ok(down_ex_off, out_dim, down_row_bytes)) {
+            fprintf(stderr, "ds4: %s: expert %d weights out of model map range\n", tag, expert);
+            return false;
+        }
+        const uint8_t *gate_base = base + gate_ex_off;
+        const uint8_t *up_base   = base + up_ex_off;
+        const uint8_t *down_base = base + down_ex_off;
+
+        /* gate/up projection, clamp, SwiGLU, router weight (ds4.c order). */
+        for (uint32_t r = 0; r < mid_dim; r++) {
+            float gval = 0.0f;
+            float uval = 0.0f;
+            if (gate_q8_0) {
+                gval = ds4gk_dot_q8_0_row(gate_base + (uint64_t)r * gate_row_bytes,
+                                          xq8.data(), xscale8.data(),
+                                          in_dim, xq8.size() / 32);
+                uval = ds4gk_dot_q8_0_row(up_base + (uint64_t)r * gate_row_bytes,
+                                          xq8.data(), xscale8.data(),
+                                          in_dim, xq8.size() / 32);
+            } else if (gate_q2_k) {
+                gval = ds4gk_vec_dot_q2_K_q8_K(in_dim,
+                                               (const ds4gk_block_q2_K *)(gate_base + (uint64_t)r * gate_row_bytes),
+                                               xqk.data());
+                uval = ds4gk_vec_dot_q2_K_q8_K(in_dim,
+                                               (const ds4gk_block_q2_K *)(up_base + (uint64_t)r * gate_row_bytes),
+                                               xqk.data());
+            } else { /* gate_iq2 */
+                gval = ds4gk_vec_dot_iq2_xxs_q8_K(in_dim,
+                                                  (const ds4gk_block_iq2_xxs *)(gate_base + (uint64_t)r * gate_row_bytes),
+                                                  xqk.data());
+                uval = ds4gk_vec_dot_iq2_xxs_q8_K(in_dim,
+                                                  (const ds4gk_block_iq2_xxs *)(up_base + (uint64_t)r * gate_row_bytes),
+                                                  xqk.data());
+            }
+
+            if (clamp > 1.0e-6f) {
+                if (gval > clamp) gval = clamp;
+                if (uval > clamp) uval = clamp;
+                if (uval < -clamp) uval = -clamp;
+            }
+            const float mval = ds4gk_silu(gval) * uval * weight;
+            gp[(uint64_t)e * mid_dim + r] = gval;
+            upp[(uint64_t)e * mid_dim + r] = uval;
+            mp[(uint64_t)e * mid_dim + r] = mval;
+            midv[r] = mval;
+        }
+
+        /* Down projection on the re-quantized weighted mid. */
+        if (down_q8_0) {
+            ds4gk_quantize_q8_0_activation(midv.data(), midq8.data(), midscale8.data(),
+                                           mid_dim);
+            for (uint32_t r2 = 0; r2 < out_dim; r2++) {
+                const float dv = ds4gk_dot_q8_0_row(down_base + (uint64_t)r2 * down_row_bytes,
+                                                    midq8.data(), midscale8.data(),
+                                                    mid_dim, mid_q8_0_blocks);
+                ep[(uint64_t)e * out_dim + r2] = dv;
+                op[r2] += dv;
+            }
+        } else {
+            ds4gk_quantize_row_q8_K(midv.data(), midqk.data(), mid_dim);
+            if (down_q2_k) {
+                for (uint32_t r2 = 0; r2 < out_dim; r2++) {
+                    const float dv = ds4gk_vec_dot_q2_K_q8_K(mid_dim,
+                                                             (const ds4gk_block_q2_K *)(down_base + (uint64_t)r2 * down_row_bytes),
+                                                             midqk.data());
+                    ep[(uint64_t)e * out_dim + r2] = dv;
+                    op[r2] += dv;
+                }
+            } else { /* down_iq2 */
+                for (uint32_t r2 = 0; r2 < out_dim; r2++) {
+                    const float dv = ds4gk_vec_dot_iq2_xxs_q8_K(mid_dim,
+                                                                (const ds4gk_block_iq2_xxs *)(down_base + (uint64_t)r2 * down_row_bytes),
+                                                                midqk.data());
+                    ep[(uint64_t)e * out_dim + r2] = dv;
+                    op[r2] += dv;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+} /* namespace */
+
+extern "C" int ds4_gpu_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        uint32_t                layer_index,
+        bool                    force_resident)
+{
+    (void)layer_index;
+    (void)force_resident;
+    if (!out || !out->ptr || !gate || !gate->ptr || !up || !up->ptr ||
+        !mid || !mid->ptr || !experts || !experts->ptr ||
+        !selected || !selected->ptr || !weights || !weights->ptr ||
+        !x || !x->ptr || !model_map) {
+        fprintf(stderr, "ds4: routed_moe_one: invalid argument\n");
+        return 0;
+    }
+    if (n_expert == 0 || expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0) {
+        fprintf(stderr, "ds4: routed_moe_one: empty dimensions\n");
+        return 0;
+    }
+
+    if (!ds4gk_routed_moe_slot(
+            gate_type, down_type,
+            expert_in_dim, expert_mid_dim, out_dim,
+            n_total_expert, n_expert, clamp,
+            (const uint8_t *)model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            (const float *)x->ptr,
+            (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+            (float *)experts->ptr, (float *)out->ptr,
+            "routed_moe_one")) {
+        return 0;
+    }
+
+    if (add_in && add_in->ptr) {
+        const float *ap = (const float *)add_in->ptr;
+        float *op = (float *)out->ptr;
+        for (uint32_t r = 0; r < out_dim; r++) op[r] += ap[r];
+    }
+    return 1;
+}
+
+/* Prefill routed MoE over n_tokens tokens.  Same math as the single-token
+ * path, looped per token with batch-slot tensor layout:
+ *   selected[t*n_expert+e], weights[t*n_expert+e]
+ *   gate/up/mid[t*n_expert*expert_mid_dim + e*expert_mid_dim + r]
+ *   experts[t*n_expert*out_dim + e*out_dim + r2]
+ *   out[t*out_dim + r2]
+ * The host writes f32 mid, so *mid_is_f16 is set to false (the engine reads
+ * the mid tensor as f32 afterwards; CUDA does the same). */
+extern "C" int ds4_gpu_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16,
+        bool                    force_resident)
+{
+    (void)layer_index;
+    (void)force_resident;
+    if (mid_is_f16) *mid_is_f16 = false;   /* host path writes f32 mid */
+    if (!out || !out->ptr || !gate || !gate->ptr || !up || !up->ptr ||
+        !mid || !mid->ptr || !experts || !experts->ptr ||
+        !selected || !selected->ptr || !weights || !weights->ptr ||
+        !x || !x->ptr || !model_map) {
+        fprintf(stderr, "ds4: routed_moe_batch: invalid argument\n");
+        return 0;
+    }
+    if (n_tokens == 0 || n_expert == 0 || expert_in_dim == 0 ||
+        expert_mid_dim == 0 || out_dim == 0) {
+        fprintf(stderr, "ds4: routed_moe_batch: empty dimensions\n");
+        return 0;
+    }
+    if (gate_expert_bytes == 0 || gate_row_bytes == 0 ||
+        down_expert_bytes == 0 || down_row_bytes == 0 ||
+        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        fprintf(stderr, "ds4: routed_moe_batch: expert byte-size overflow\n");
+        return 0;
+    }
+
+    const uint8_t *base = (const uint8_t *)model_map;
+    const uint64_t pair_stride = (uint64_t)n_expert * expert_mid_dim;
+    const uint64_t exp_stride  = (uint64_t)n_expert * out_dim;
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (!ds4gk_routed_moe_slot(
+                gate_type, down_type,
+                expert_in_dim, expert_mid_dim, out_dim,
+                n_total_expert, n_expert, clamp,
+                base, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                (const float *)x->ptr + (uint64_t)t * expert_in_dim,
+                (const int32_t *)selected->ptr + (uint64_t)t * n_expert,
+                (const float *)weights->ptr + (uint64_t)t * n_expert,
+                (float *)gate->ptr     + (uint64_t)t * pair_stride,
+                (float *)up->ptr       + (uint64_t)t * pair_stride,
+                (float *)mid->ptr      + (uint64_t)t * pair_stride,
+                (float *)experts->ptr  + (uint64_t)t * exp_stride,
+                (float *)out->ptr      + (uint64_t)t * out_dim,
+                "routed_moe_batch")) {
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -1519,4 +3292,224 @@ extern "C" {
 /* ---- BEGIN AUTO-GENERATED STUBS ---- */
 extern "C" {
 #include "_stubs.gen.cpp"
+}
+
+/* =====================================================================
+ * Multi-GPU plumbing compatibility shims (single logical device).
+ *
+ * ds4.c and the CLI parser reference these on Linux builds.  The Vulkan
+ * backend drives one logical device, so most of them are trivial.
+ * ===================================================================== */
+
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
+int g_n_gpus = 1;
+int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
+
+extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
+    if (!cfg || cfg->n_gpus != 1) {
+        fprintf(stderr, "ds4: Vulkan supports one GPU per process\n");
+        return 0;
+    }
+    g_gpu[0].device_id = cfg->device_indices[0];
+    g_n_gpus = 1;
+    return ds4_gpu_init();
+}
+
+extern "C" int ds4_gpu_set_current_device(int logical_tier) {
+    (void)logical_tier;
+    return 0; /* single device: 0 = success */
+}
+
+extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
+    return ds4_gpu_set_current_device(logical_tier);
+}
+
+extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
+    if (logical_tier != 0) return 0;
+    return g_vk.caps.device_memory_total;
+}
+
+extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
+                                       uint64_t bytes) {
+    if (!t) return 1;
+    if (device_id != 0) return 2;
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(bytes ? bytes : 1);
+    if (!a) return 3;
+    t->ptr = a->ptr; t->bytes = a->bytes; t->owner = a->owner;
+    t->device_id = 0;
+    free(a);
+    return 0;
+}
+
+extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
+    if (!t) return;
+    if (t->owner && t->ptr) {
+        auto it = g_vk.tensor_headers.find(t->ptr);
+        if (it != g_vk.tensor_headers.end()) {
+            vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
+            free(it->second);
+            g_vk.tensor_headers.erase(it);
+        }
+    }
+    memset(t, 0, sizeof(*t));
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
+    if (tier != 0) return NULL;
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
+    if (tier != 0) return NULL;
+    return ds4_gpu_tensor_alloc_managed(bytes);
+}
+
+extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,
+                                          const ds4_gpu_tensor *src,
+                                          uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
+                                         const ds4_gpu_tensor *src,
+                                         uint64_t bytes) {
+    return ds4_gpu_tensor_copy_xdev_default(dst, src, bytes);
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
+                                                 const ds4_gpu_tensor *src,
+                                                 uint64_t bytes) {
+    return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
+                                                 const ds4_gpu_tensor *src,
+                                                 uint64_t bytes) {
+    return ds4_gpu_tensor_copy_xdev_default(dst, src, bytes);
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev3(
+        ds4_gpu_tensor       *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
+        ds4_gpu_tensor       *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
+        ds4_gpu_tensor       *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2) {
+    return (bytes0 == 0 || ds4_gpu_tensor_copy_xdev_default(dst0, src0, bytes0)) &&
+           (bytes1 == 0 || ds4_gpu_tensor_copy_xdev_default(dst1, src1, bytes1)) &&
+           (bytes2 == 0 || ds4_gpu_tensor_copy_xdev_default(dst2, src2, bytes2));
+}
+
+extern "C" int ds4_gpu_tensor_copy_xdev3_default_dst(
+        ds4_gpu_tensor       *dst0, const ds4_gpu_tensor *src0, uint64_t bytes0,
+        ds4_gpu_tensor       *dst1, const ds4_gpu_tensor *src1, uint64_t bytes1,
+        ds4_gpu_tensor       *dst2, const ds4_gpu_tensor *src2, uint64_t bytes2) {
+    return ds4_gpu_tensor_copy_xdev3(dst0, src0, bytes0, dst1, src1, bytes1,
+                                     dst2, src2, bytes2);
+}
+
+extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier) {
+    return src && dst_tier == 0;
+}
+
+extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src,
+                                                 int dst_tier) {
+    return ds4_gpu_tensor_wait_xdev(src, dst_tier);
+}
+
+extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
+    return t ? t->device_id : -1;
+}
+
+extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
+                                        const ds4_gpu_tensor *local,
+                                        const ds4_gpu_tensor *remote,
+                                        ds4_gpu_tensor *remote_tmp,
+                                        uint32_t n) {
+    (void)remote_tmp;
+    if (!out || !local || !remote || !out->ptr || !local->ptr || !remote->ptr)
+        return 0;
+    float *op = (float*)out->ptr;
+    const float *lp = (const float*)local->ptr;
+    const float *rp = (const float*)remote->ptr;
+    for (uint32_t i = 0; i < n; i++) op[i] = lp[i] + rp[i];
+    return 1;
+}
+
+extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map,
+                                                   uint64_t model_size) {
+    return ds4_gpu_set_model_map(model_map, model_size);
+}
+
+extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
+                                            uint64_t bytes,
+                                            int      expected_device,
+                                            void   **out_device_ptr) {
+    (void)source_offset; (void)bytes; (void)expected_device;
+    if (out_device_ptr) *out_device_ptr = NULL;
+    return 0;
+}
+
+extern "C" int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
+                                     int *out_device_id, void **out_device_ptr) {
+    (void)source_offset; (void)bytes;
+    if (out_device_id) *out_device_id = 0;
+    if (out_device_ptr) *out_device_ptr = NULL;
+    return 0;
+}
+
+extern "C" int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
+    (void)source_offset; (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_args_probe_auto_cuda(const int *device_filter,
+                                             int filter_len,
+                                             ds4_gpu_config *out,
+                                             size_t safety_margin_bytes,
+                                             char *errbuf,
+                                             size_t errbuflen) {
+    (void)device_filter; (void)filter_len; (void)out; (void)safety_margin_bytes;
+    if (errbuf && errbuflen) {
+        snprintf(errbuf, errbuflen,
+                 "Vulkan: --gpu-vram auto is not supported; pass explicit budgets");
+    }
+    return 1;
+}
+
+extern "C" void ds4_gpu_enable_q8_dequant_gemm(void) {}
+
+extern "C" int ds4_gpu_set_decode_fast_attention(int enabled) {
+    (void)enabled; return 0;
+}
+
+extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
+    (void)enabled; return 0;
+}
+
+extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size,
+                                             uint64_t bias) {
+    (void)map; (void)size; (void)bias; return 1;
+}
+
+extern "C" int ds4_gpu_device_cache_tensors(int device_id,
+                                             const ds4_tensor_range *ranges,
+                                             int n_ranges) {
+    (void)device_id; (void)ranges; (void)n_ranges; return 1;
+}
+
+extern "C" int ds4_gpu_device_cache_support_tensors(int device_id,
+                                                     int entry_device_id,
+                                                     const ds4_tensor_range *ranges,
+                                                     int n_ranges,
+                                                     int from_main_map) {
+    (void)device_id; (void)entry_device_id; (void)ranges;
+    (void)n_ranges; (void)from_main_map; return 1;
+}
+
+static int g_vk_q8_cache_suppressed = 0;
+
+extern "C" int ds4_gpu_q8_cache_suppressed(void) {
+    return g_vk_q8_cache_suppressed;
+}
+
+extern "C" void ds4_gpu_set_q8_cache_suppressed(int suppressed) {
+    g_vk_q8_cache_suppressed = suppressed != 0;
 }

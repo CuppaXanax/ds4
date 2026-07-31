@@ -1,9 +1,11 @@
 #version 460 core
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 /* matmul_f16_tensor: out_buf[tok][col] = x[tok][*] · W_f16[col][*]
- * F16 weights stored as uint16; convert to float via bitcast.
+ * F16 weights stored as 2-byte IEEE halves packed two-per-uint32 in the
+ * storage buffer; extract the correct half (low if even element index,
+ * high if odd) and convert to float via f16tof32.
  * Workgroup per (out_dim, n_tok). 256 threads.
+ * Plain workgroup reduction (no subgroup ops: subgroupAdd on double is
+ * unreliable on some RADV builds).
  */
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer XBuf   { float x_buf[]; };
@@ -11,7 +13,7 @@ layout(set = 0, binding = 1) buffer WBuf   { uint  w_buf[]; };
 layout(set = 0, binding = 2) buffer OutBuf  { float out_buf[]; };
 layout(push_constant) uniform PC { uint in_dim; uint out_dim; uint n_tok; } pc;
 
-shared float sx[8192];
+shared float ssum[256];
 
 /* F16 -> F32 using the standard algorithm */
 float f16tof32(uint h) {
@@ -40,19 +42,19 @@ void main() {
     uint lid = gl_LocalInvocationIndex;
     if (col >= pc.out_dim || tok >= pc.n_tok) return;
     uint xo = tok * pc.in_dim;
-    for (uint i = lid; i < pc.in_dim; i += 256u) sx[i] = x_buf[xo + i];
-    barrier();
     double sum = 0.0;
-    uint wo = col * pc.in_dim;
-    for (uint i = lid; i < pc.in_dim; i += 256u)
-        sum += double(sx[i]) * double(f16tof32(w_buf[wo + i]));
-    double grp = subgroupAdd(sum);
-    if (subgroupElect()) sx[lid] = float(grp);
+    uint wo = col * pc.in_dim;               /* first f16 element of row `col` */
+    for (uint i = lid; i < pc.in_dim; i += 256u) {
+        uint e = wo + i;                     /* f16 element index */
+        uint w32 = w_buf[e >> 1];            /* two f16 packed per uint32 */
+        uint h  = (e & 1u) == 0u ? (w32 & 0xffffu) : (w32 >> 16);
+        sum += double(x_buf[xo + i]) * double(f16tof32(h));
+    }
+    ssum[lid] = float(sum);
     barrier();
     if (lid == 0u) {
         double final = 0.0;
-        for (uint i = 0u; i < 256u; i += gl_SubgroupSize)
-            final += double(sx[i]);
+        for (uint i = 0u; i < 256u; i++) final += double(ssum[i]);
         out_buf[tok * pc.out_dim + col] = float(final);
     }
 }

@@ -4,7 +4,7 @@ Called from Makefile during build. Outputs to shaders/spv/."""
 
 import subprocess, sys, os, pathlib
 
-GLSLANG = os.environ.get("GLSLANG", "../glslangValidator")
+GLSLANG = os.environ.get("GLSLANG", "glslangValidator")
 SRC_DIR = pathlib.Path(__file__).parent
 OUT_DIR = SRC_DIR / "spv"
 OUT_DIR.mkdir(parents=True, exist_ok=True)

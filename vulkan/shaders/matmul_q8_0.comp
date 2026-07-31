@@ -1,13 +1,16 @@
 #version 460 core
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 
 /* Q8_0 matrix-vector: out[tok][row] = x[tok][*] · W_Q8[row][*]
  *
  * Grid: (y_scale, ceil(out_dim/y_scale), n_tok). 2D grid for out_dim up to 4G.
  * row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale
  *
- * Q8_0 block = 36 bytes: float d (4) + int8 qs[32] (32) = 36 bytes = 9 x uint32.
+ * Q8_0 block (GGUF, matches ds4.c / ds4_test.c): 34 bytes =
+ *   f16 scale d (2 bytes) + int8 qs[32] (32 bytes).
+ * Blocks are not 4-byte aligned (34 % 4 == 2), so the weight buffer is read
+ * byte-wise through a uint view with an end-of-buffer guard.
+ *
+ * Plain workgroup reduction (no subgroupAdd on double: unreliable on RADV).
  */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -26,9 +29,41 @@ layout(push_constant) uniform PC {
 
 shared float sx[8192];
 
-int extract_i8(uint word, uint byte_i) {
-    uint shifted = word >> (byte_i * 8u);
-    uint raw = shifted & 0xFFu;
+/* F16 -> F32 (same semantics as matmul_f16.comp). */
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;       /* sign bit */
+    uint e = (h >> 10) & 0x1fu; /* exponent */
+    uint m = h & 0x3ffu;        /* mantissa */
+    if (e == 0u) {
+        /* zero/subnormal */
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float fm = float(m) / 1024.0;
+        return (s != 0u ? -1.0 : 1.0) * fm * (1.0 / 16384.0); /* 2^-14 */
+    }
+    if (e == 31u) {
+        /* inf/nan */
+        return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    }
+    /* normal */
+    float fm = 1.0 + float(m) / 1024.0;
+    int exp = int(e) - 15;
+    return (s != 0u ? -1.0 : 1.0) * fm * exp2(float(exp));
+}
+
+/* Total weight buffer size in bytes. */
+uint w_total_bytes() {
+    return pc.out_dim * pc.blocks_per_row * 34u;
+}
+
+/* Read one byte of the weight buffer (guards the last-word over-read). */
+uint byte_at(uint byte_idx) {
+    if (byte_idx >= w_total_bytes()) return 0u;
+    return (w_buf[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 0xFFu;
+}
+
+/* Byte as signed int8. */
+int i8_at(uint byte_idx) {
+    uint raw = byte_at(byte_idx);
     return raw < 128u ? int(raw) : int(raw) - 256;
 }
 
@@ -48,29 +83,23 @@ void main() {
     uint row_blk = row * pc.blocks_per_row;
 
     for (uint b = lid; b < pc.blocks_per_row; b += 256u) {
-        uint blk_off = (row_blk + b) * 9u;
-        float d = uintBitsToFloat(w_buf[blk_off]);
+        uint blk_off = (row_blk + b) * 34u;              /* byte offset */
+        uint scale_bits = byte_at(blk_off) | (byte_at(blk_off + 1u) << 8u);
+        float d = f16tof32(scale_bits);
 
         uint base = b * 32u;
-        for (uint w = 0u; w < 8u; w++) {
-            uint word = w_buf[blk_off + 1u + w];
-            uint byte_base = base + w * 4u;
-            for (uint j = 0u; j < 4u && (byte_base + j) < pc.in_dim; j++) {
-                int q = extract_i8(word, j);
-                sum += double(sx[byte_base + j]) * double(d * float(q));
-            }
+        for (uint w = 0u; w < 32u && (base + w) < pc.in_dim; w++) {
+            int q = i8_at(blk_off + 2u + w);
+            sum += double(sx[base + w]) * double(d * float(q));
         }
     }
 
-    double grp = subgroupAdd(sum);
-
-    if (subgroupElect())
-        sx[lid] = float(grp);
+    sx[lid] = float(sum);
     barrier();
 
     if (lid == 0u) {
         double final = 0.0;
-        for (uint i = 0u; i < 256u; i += gl_SubgroupSize)
+        for (uint i = 0u; i < 256u; i++)
             final += double(sx[i]);
         out_buf[tok * pc.out_dim + row] = float(final);
     }

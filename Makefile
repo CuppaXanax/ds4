@@ -55,7 +55,7 @@ CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 VULKAN_CXX ?= g++
 VULKAN_CXXFLAGS ?= -O3 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include $(NATIVE_CPU_FLAG)
-VULKAN_LDLIBS ?= -lm -pthread /usr/lib/x86_64-linux-gnu/libvulkan.so.1.4.341
+VULKAN_LDLIBS ?= -lm -pthread -lvulkan
 VULKAN_SRCS := $(wildcard vulkan/shaders/*.comp)
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -353,7 +353,7 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-ds4_vulkan.o: vulkan/vulkan_backend.cpp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp
+ds4_vulkan.o: vulkan/vulkan_backend.cpp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp vulkan/_impl_gen.cpp vulkan/gen_impl.py
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/vulkan_backend.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)

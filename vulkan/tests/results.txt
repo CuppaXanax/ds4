@@ -5,10 +5,28 @@ ds4: VULKAN backend ready
 [PASS] attention_decode
 [PASS] attention_output_low_q8
 [PASS] attention_output_q8_batch
+[PASS] compressor_store_batch
+[PASS] compressor_store_batch_f16
+[PASS] compressor_update_emit_ratio4
+[PASS] compressor_update_emit_ratio2
+[PASS] compressor_update_non_emit
+[PASS] compressor_update_state_already_stored
+[PASS] compressor_prefill_ratio4
+[PASS] compressor_prefill_ratio2
+[PASS] compressor_prefill_fp8
+[PASS] compressor_bounds
 [PASS] embed_token_q8_0
 [PASS] embed_tokens_q8_0
 [PASS] embed_token_quant
 [PASS] embed_tokens_quant
+[PASS] hc_expand
+[PASS] hc_expand_add
+[PASS] hc_weighted_sum
+[PASS] output_hc_weights
+[PASS] hc_split_weighted_sum_norm
+[PASS] hc_expand_split
+[PASS] hc_weighted_sum_split
+[PASS] hc_split_weighted_sum
 [PASS] indexer_score_one
 [PASS] indexer_scores_decode_batch
 [PASS] indexer_topk
@@ -71,4 +89,7 @@ ds4: routed_moe_one: invalid argument
 ds4: routed_moe_one: expert 0 weights out of model map range
 [PASS] routed_moe_one
 [PASS] router_select
-harness: 26 passed, 0 failed
+[PASS] shared_gate_up_swiglu_q8_0
+[PASS] shared_mid_swiglu_q8_0
+[PASS] shared_down_hc_expand_q8_0
+harness: 47 passed, 0 failed

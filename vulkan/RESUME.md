@@ -240,38 +240,62 @@ DS4_VULKAN_LOG_STUBS=1 ./run-test.sh       # stub chiamati
 
 ## 9. Prossimi passi
 
-### 9.1 PRIMO: diagnosticare il fermo dopo 1 token di decode
+### 9.1 DIAGNOSI COMPLETATA (2026-08-01): fermo dopo 1 token = EOS da logits garbage
 
-Sintomo: `<｜begin▁of▁sentence｜>庄园` poi stop (NTOK=8 e NTOK=30).
+Sintomo: `<｜begin▁of▁sentence｜>庄园` poi stop (NTOK=8 e NTOK=30), nessun errore.
 
-- L'utente deve eseguire e incollare la coda:
-  ```
-  DS4_VULKAN_LOG_STUBS=1 NTOK=4 ./run-test.sh 2>&1 | tail -30
-  ```
-- Cercare: `ok=false`, `synchronize failed`, errori motore, o quale stub/errore
-  appare dopo il 1° token. Sospetti: un kernel reale che ritorna 0 al 2° token,
-  o un errore nel motore di decode (sample/readback).
+- **Causa (confermata dal codice)**: il loop in `ds4.c:46931`
+  (`generate_metal_graph_raw_swa`) fa `sample_argmax(logits)` e, se il token è
+  EOS (`<｜end▁of▁sentence｜>`), fa `break` **senza emettere nulla**
+  (`vocab_token_is_generation_stop`, ds4.c:36656). Al 2° step i logits sono
+  ancora garbage perché gli 8 stub non scrivevano gli output → argmax = EOS →
+  stop silenzioso. NON è un crash/errore di sync.
+- **Fix**: implementati gli 8 stub (sezione 9.2) — ora il decode deve produrre
+  logits reali e non campionare più EOS.
 
-### 9.2 Poi: 8 stub ancora sul percorso critico
+### 9.2 FATTO (2026-08-01): implementati gli 8 stub del percorso critico
 
-Dal log `DS4_VULKAN_LOG_STUBS=1` (prima del fix, ~42-43 chiamate ciascuno):
+Tutti host-side su memoria mappata (come `add_tensor`), a colonna 0 in
+`vulkan/vulkan_backend.cpp`, stub rimossi da `_impl_gen.cpp`, harness completo
+compila (exit 0):
 
-1. `ds4_gpu_matmul_q8_0_f16_out_tensor`
-2. `ds4_gpu_hc_expand_split_half_tensor`
-3. `ds4_gpu_hc_expand_add_split_half_add_tensor`
-4. `ds4_gpu_attention_output_q8_batch_f16_tensor`
-5. `ds4_gpu_matmul_f16_pair_tensor`
-6. `ds4_gpu_dsv4_indexer_qat_tensor`
-7. `ds4_gpu_compressor_prefill_state_ratio4_tensor`
-8. `ds4_gpu_attention_prefill_static_mixed_heads_tensor`
+1. `ds4_gpu_matmul_q8_0_f16_out_tensor` — matmul Q8_0 (34 B/blocco) con output
+   IEEE f16 (2 B/elem) via `ds4_float_to_half` (~riga 5053).
+2. `ds4_gpu_matmul_f16_pair_tensor` — due matmul F16 paralleli f32 out
+   (comp_kv + comp_sc), gestisce n_tok>1 (~riga 5101).
+3. `ds4_gpu_hc_expand_split_half_tensor` — come hc_expand_split ma block_out_h
+   f16; semantica split fast-path: `o = split[n_hc+h]*deq_f16(block_out) +
+   residual` (~riga 2949).
+4. `ds4_gpu_hc_expand_add_split_half_add_tensor` — add con block_add_h f16
+   (~riga 2984).
+5. `ds4_gpu_attention_output_q8_batch_f16_tensor` — come
+   attention_output_q8_batch (stage A/B Q8_0) ma out_h f16 (~riga 2356).
+6. `ds4_gpu_attention_prefill_static_mixed_heads_tensor` — prefill attention
+   con raw_kv sliding window + comp_kv (f32/f16, `comp_kv_f16`), sink prior,
+   softmax, layout MLA K==V (~riga 2463). Semantica comp: `raw_count =
+   window ? min(window, t+1) : t+1`; `comp_count = min((t+1)/ratio, n_comp)`.
+7. `ds4_gpu_dsv4_indexer_qat_tensor` — in-place per riga: Hadamard128
+   (1/√128) + quantizzazione FP4 E2M1FN (blocchi da 32, scale = ldexp(1,
+   ceil(log2(amax/6))), tie-to-even); head_dim DEVE essere 128 (~riga 3469).
+8. `ds4_gpu_compressor_prefill_state_ratio4_tensor` — stato rolling ratio-4:
+   azzera state_kv (8×width), state_score = -INF, copia le 4 righe tail in
+   dst 0..3 (lane attention) con ape (f32/f16) sommato a state_score
+   (~riga 5171). NB: dst 0..3 (NON 4..7, che è la semantica di store_batch).
 
-(+ `ds4_gpu_set_glm_model` 1 volta, innocuo).
+Test nuovi (tutti in `vulkan/tests/tests/`):
+`t_matmul_q8_0_f16_out.cpp` (matmul_q8_0_f16_out), `t_matmul_f16_pair.cpp`
+(matmul_f16_pair), `t_hc_expand_split_half.cpp` (hc_expand_split_half),
+`t_hc_expand_add_split_half_add.cpp` (hc_expand_add_split_half_add),
+`t_attention_output_f16.cpp` (attention_output_q8_batch_f16),
+`t_attention_prefill_static_mixed.cpp` (attention_prefill_static_mixed_heads,
+5 casi: window/ratio piccoli, comp f16/f32, error-path),
+`t_dsv4_indexer_qat.cpp` (dsv4_indexer_qat, _one_row, _bounds),
+`t_compressor_prefill_state_ratio4.cpp` (compressor_prefill_state_ratio4,
+_f16, _bounds).
 
-Implementarli con batch paralleli di subagent (workflow sezione 10), poi
-ri-testare harness e modello. Ogni kernel: implementazione host-side + test
-`vulkan/tests/tests/t_<nome>.cpp` con reference CPU. N.B.: alcuni di questi
-possono essere già stati implementati dopo l'ultimo log — verificare con
-`grep ds4_gpu_<nome> vulkan/vulkan_backend.cpp` prima di assegnarli.
+PROSSIMO PASSO: l'utente lancia `./run-kernel-tests.sh` (serve GPU) e incolla
+l'output; poi `SKIP_BUILD=1 NTOK=8 ./run-test.sh 2>&1 | tail -30` per vedere
+se il modello ora genera più di 1 token.
 
 ### 9.3 Dopo la correttezza
 

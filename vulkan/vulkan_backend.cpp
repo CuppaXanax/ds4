@@ -452,6 +452,10 @@ static int begin_cmd(void) {
     return 1;
 }
 
+#define DS4_VK_TRACE_KERNEL(name) \
+    do { if (getenv("DS4_VULKAN_TRACE_KERNELS")) \
+             fprintf(stderr, "ds4: [trace] %s\n", name); } while (0)
+
 static int end_and_submit(void) {
     auto &c = get_cmd_ctx();
     if (c.command_count == 0) return 1;
@@ -1016,6 +1020,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
 int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                                     const void *mm, uint64_t ms, uint64_t woff,
                                     uint32_t n, float eps) {
+    DS4_VK_TRACE_KERNEL("rms_norm_weight");
     if (!out || !x) return 0;
     const float *w = (const float*)((const char*)mm + woff);
     float *op = (float*)out->ptr; const float *xp = (const float*)x->ptr;
@@ -1054,13 +1059,67 @@ int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_g
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
  * ========================================================================= */
 
+/* ---- matmul_q8_0 dispatch (host-side fallback for huge output rows) ---- */
+
 int ds4_gpu_matmul_q8_0_tensor(
-    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-    const ds4_gpu_tensor *x, uint64_t n_tok)
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok)
 {
-    (void)model_map; (void)model_size;
+    DS4_VK_TRACE_KERNEL("matmul_q8_0");
     if (!out || !x) return 0;
+
+    /* The GPU dispatch is pathological for very wide output rows (the vocab
+     * head, out_dim = 129280): RADV stalls for minutes and blocks the next
+     * decode's vkWaitForFences.  Fall back to a host-side q8_0 matmul (same
+     * math as the shader: 34 B blocks, double accumulation) for wide rows;
+     * the narrow per-layer matmuls keep the fast shader path. */
+    if (out_dim > 50000u) {
+        if (!model_map || !out->ptr || !x->ptr) return 0;
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        const uint64_t row_bytes = blocks * 34u;
+        if (weight_offset > model_size ||
+            out_dim > (model_size - weight_offset) / row_bytes) return 0;
+        if (n_tok > UINT64_MAX / in_dim ||
+            (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes) return 0;
+        if (n_tok > UINT64_MAX / out_dim ||
+            (uint64_t)out_dim * n_tok * sizeof(float) > out->bytes) return 0;
+        const uint8_t *base = (const uint8_t *)model_map + weight_offset;
+        const float *xp = (const float *)x->ptr;
+        float *op = (float *)out->ptr;
+        for (uint64_t t = 0; t < n_tok; t++) {
+            const float *xt = xp + t * in_dim;
+            for (uint64_t o = 0; o < out_dim; o++) {
+                const uint8_t *row = base + o * row_bytes;
+                double acc = 0.0;
+                for (uint64_t b = 0; b < blocks; b++) {
+                    uint16_t scale_bits;
+                    memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
+                    const uint32_t sb = scale_bits;
+                    const uint32_t se = (sb >> 10) & 0x1fu;
+                    const uint32_t sm = sb & 0x3ffu;
+                    float scale;
+                    if (se == 0u) scale = sm != 0u ? (float)sm / 16384.0f : 0.0f;
+                    else if (se == 31u) scale = sm != 0u ? 0.0f : 1.0f / 0.0f;
+                    else scale = (1.0f + (float)sm / 1024.0f) * exp2f((int)se - 15);
+                    const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+                    const uint64_t i0 = b * 32u;
+                    const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+                    for (uint64_t i = 0; i < n; i++)
+                        acc += (double)scale * (double)qs[i] * (double)xt[i0 + i];
+                }
+                op[t * out_dim + o] = (float)acc;
+            }
+        }
+        return 1;
+    }
+
+    (void)model_map; (void)model_size;
     uint64_t n_blocks = (in_dim + 31) / 32;
 
     /* Get shader */
@@ -1192,10 +1251,16 @@ int ds4_gpu_matmul_f32_tensor(
 
 /* ---- matmul_f16_tensor dispatch ---- */
 int ds4_gpu_matmul_f16_tensor(
-    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
-    const ds4_gpu_tensor *x, uint64_t n_tok)
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok)
 {
+    DS4_VK_TRACE_KERNEL("matmul_f16");
     (void)model_map; (void)model_size;
     if (!out || !x) return 0;
 
@@ -1415,6 +1480,7 @@ int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc,
     const void *model_map, uint64_t model_size, uint64_t weight_offset,
     uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc)
 {
+    DS4_VK_TRACE_KERNEL("embed_token_hc");
     (void)model_size; (void)n_hc;
     if (!out_hc || !model_map) return 0;
     int32_t id = (int32_t)token;
@@ -2026,6 +2092,8 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim)
 {
+    DS4_VK_TRACE_KERNEL("attention_decode_heads");
+
     if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
         !model_map || n_raw == 0 || n_head == 0 || head_dim == 0 ||
         raw_cap < n_raw || raw_start >= raw_cap ||
@@ -2337,6 +2405,232 @@ int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                                       bxq.data() + (size_t)t * blocks_b * 32u,
                                       bxscale.data() + (size_t)t * blocks_b,
                                       low_dim, blocks_b);
+        }
+    }
+    return 1;
+}
+
+/* ---- ds4_gpu_attention_output_q8_batch_f16_tensor (CPU-hosted) ----
+ *
+ * Identical math to ds4_gpu_attention_output_q8_batch_tensor above
+ * (grouped Q8_0 attention output projection), but the final out_dim-wide
+ * projection of every token is stored as IEEE f16 (2 bytes/element) into
+ * out_h instead of f32.  The engine's fast prefill path consumes
+ * g->batch_q_half directly, so each output is rounded with
+ * ds4_float_to_half (the same half rounding the engine applies elsewhere).
+ * low stays f32 (the stage-A low vector buffer is shared with the f32
+ * variant).
+ */
+int ds4_gpu_attention_output_q8_batch_f16_tensor(
+        ds4_gpu_tensor       *out_h,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens)
+{
+    DS4_VK_TRACE_KERNEL("attention_output_q8_batch_f16");
+    if (!out_h || !low || !heads || !model_map || group_dim == 0 || rank == 0 ||
+        n_groups == 0 || out_dim == 0 || n_tokens == 0) return 0;
+    if (!out_h->ptr || !low->ptr || !heads->ptr) return 0;
+
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = low_dim * row_a_bytes;
+    const uint64_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t row_b_bytes = blocks_b * 34u;
+    const uint64_t out_b_bytes = out_dim * row_b_bytes;
+
+    /* Safety: model ranges and tensor byte sizes (out_h is f16!). */
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
+    if (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
+    if ((uint64_t)n_tokens * n_groups * group_dim * sizeof(float) > heads->bytes) return 0;
+    if ((uint64_t)n_tokens * low_dim * sizeof(float) > low->bytes) return 0;
+    if ((uint64_t)n_tokens * out_dim * sizeof(uint16_t) > out_h->bytes) return 0;
+
+    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
+    const uint8_t *wb = (const uint8_t *)model_map + out_b_offset;
+    const float *hp = (const float *)heads->ptr;
+    float *lp = (float *)low->ptr;
+    uint16_t *op = (uint16_t *)out_h->ptr;
+
+    /* Stage A: quantize every (token, group) activation slice once. */
+    std::vector<int8_t> axq((size_t)n_tokens * n_groups * blocks_a * 32u);
+    std::vector<float> axscale((size_t)n_tokens * n_groups * blocks_a);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *ht = hp + (uint64_t)t * n_groups * group_dim;
+        for (uint32_t g = 0; g < n_groups; g++) {
+            const size_t base = ((size_t)t * n_groups + g) * blocks_a;
+            ds4_attn_out_quant_q8_0(ht + (uint64_t)g * group_dim,
+                                    axq.data() + base * 32u,
+                                    axscale.data() + base,
+                                    group_dim);
+        }
+    }
+    /* low[t][g*rank + r] = dot(out_a row g*rank + r, q8(heads[t][g])). */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float *ltp = lp + (uint64_t)t * low_dim;
+        for (uint64_t idx = 0; idx < low_dim; idx++) {
+            const uint64_t g = idx / rank;
+            const size_t base = ((size_t)t * n_groups + (uint32_t)g) * blocks_a;
+            ltp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
+                                             axq.data() + base * 32u,
+                                             axscale.data() + base,
+                                             group_dim, blocks_a);
+        }
+    }
+
+    /* Stage B: quantize low per token, out_h[t][o] =
+     * half(dot(out_b row o, q8(low[t]))). */
+    std::vector<int8_t> bxq((size_t)n_tokens * blocks_b * 32u);
+    std::vector<float> bxscale((size_t)n_tokens * blocks_b);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        ds4_attn_out_quant_q8_0(lp + (uint64_t)t * low_dim,
+                                bxq.data() + (size_t)t * blocks_b * 32u,
+                                bxscale.data() + (size_t)t * blocks_b,
+                                low_dim);
+    }
+    for (uint64_t o = 0; o < out_dim; o++) {
+        const uint8_t *row = wb + o * row_b_bytes;
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const float v = ds4_attn_out_dot_q8_0(row,
+                                                  bxq.data() + (size_t)t * blocks_b * 32u,
+                                                  bxscale.data() + (size_t)t * blocks_b,
+                                                  low_dim, blocks_b);
+            op[(uint64_t)t * out_dim + o] = ds4_float_to_half(v);
+        }
+    }
+    return 1;
+}
+
+/* ---- ds4_gpu_attention_prefill_static_mixed_heads_tensor (CPU-hosted) ----
+ *
+ * Prefill attention over the mixed key set: the raw batch KV rows of the
+ * current chunk (MLA-style: one row per token, K and V share the row, as in
+ * the verified ds4_gpu_attention_prefill_raw_heads_tensor) plus the
+ * compressed MLA rows of the earlier prefix, with a per-head sink prior and
+ * a causal mask (token t only sees keys at positions <= t).
+ *
+ * Replicates the ROCm attention_static_mixed_heads8_online_kernel and the
+ * verified attention_prefill_raw_heads_tensor / attention_decode_heads_tensor
+ * math exactly:
+ *   raw_count = (window != 0 && t+1 > window) ? window : t+1
+ *   raw_start = t+1 - raw_count
+ *   comp_count = (n_comp != 0 && ratio != 0) ? min((t+1)/ratio, n_comp) : 0
+ *   scale = 1/sqrtf(head_dim)
+ *   per head h: max starts at sinks[h]; raw score  = dot(qh, raw[raw_start+r]) * scale
+ *               comp score = dot(qh, comp[c]) * scale (comp rows f32 or f16)
+ *   heads[t][h] = sum(exp(score - max) * v) / (exp(sinks[h]-max) + sum exp(...))
+ */
+int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim)
+{
+    DS4_VK_TRACE_KERNEL("attention_prefill_static_mixed");
+    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
+        !model_map || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        (n_comp != 0 && (!comp_kv || !comp_kv->ptr)))
+        return 0;
+    const uint64_t head_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
+    const uint64_t comp_elem = comp_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < kv_bytes ||
+        (n_comp != 0 && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem))
+        return 0;
+
+    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
+    const float *qp = (const float *)q->ptr;
+    const float *rawp = (const float *)raw_kv->ptr;
+    const uint8_t *compp = (n_comp && comp_kv) ? (const uint8_t *)comp_kv->ptr : nullptr;
+    float *hp = (float *)heads->ptr;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+    std::vector<float> score;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_count = (window != 0 && t + 1u > window) ? window : (t + 1u);
+        const uint32_t raw_start = t + 1u - raw_count;
+        uint32_t comp_count = 0;
+        if (n_comp != 0 && ratio != 0) {
+            comp_count = (t + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
+        const uint32_t n_total = raw_count + comp_count;
+        score.resize(n_total);
+
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = qp + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                score[r] = dot * scale;
+                if (score[r] > max_score) max_score = score[r];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const uint32_t idx = raw_count + c;
+                const uint8_t *kv = compp + (uint64_t)c * head_dim * comp_elem;
+                float dot = 0.0f;
+                if (comp_kv_f16) {
+                    const uint16_t *kvh = (const uint16_t *)kv;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        dot += qh[d] * ds4_half_to_float(kvh[d]);
+                } else {
+                    const float *kvf = (const float *)kv;
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvf[d];
+                }
+                score[idx] = dot * scale;
+                if (score[idx] > max_score) max_score = score[idx];
+            }
+
+            float *oh = hp + ((uint64_t)t * n_head + h) * head_dim;
+            std::memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(score[r] - max_score);
+                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
+                denom += w;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const uint32_t idx = raw_count + c;
+                const uint8_t *kv = compp + (uint64_t)c * head_dim * comp_elem;
+                const float w = expf(score[idx] - max_score);
+                denom += w;
+                if (comp_kv_f16) {
+                    const uint16_t *kvh = (const uint16_t *)kv;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        oh[d] += w * ds4_half_to_float(kvh[d]);
+                } else {
+                    const float *kvf = (const float *)kv;
+                    for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kvf[d];
+                }
+            }
+            const float inv = 1.0f / denom;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
         }
     }
     return 1;
@@ -2709,6 +3003,82 @@ int ds4_gpu_hc_expand_add_tensor(ds4_gpu_tensor *out_hc,
                 acc += co[(size_t)dst + (size_t)src * n_hc] * rh[(uint64_t)src * n_embd + d];
             o[(uint64_t)dst * n_embd + d] = acc;
         }
+    }
+    return 1;
+}
+
+/* ---- HC expand-split, f16 block (batch fast path) ----
+ *
+ * Same as ds4_gpu_hc_expand_split_tensor but the sublayer output arrives in
+ * f16 (2 B/element): the engine's attn_out_f16 path writes the attention
+ * block into g->batch_q_half instead of an f32 tensor.  The split layout is
+ * the sinkhorn buffer [pre | post | comb] and only the post gates
+ * split[n_hc + h] participate (the batch fast path, no combine mixing):
+ *   out_hc[h*n_embd + i] = split[n_hc + h] * deq_f16(block_out_h[i])
+ *                          + residual_hc[h*n_embd + i] */
+int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
+    const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc,
+    const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc)
+{
+    DS4_VK_TRACE_KERNEL("hc_expand_split_half");
+    if (!out_hc || !block_out_h || !residual_hc || !split) return 0;
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t half_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_bytes > out_hc->bytes) return 0;
+    if (half_bytes > block_out_h->bytes) return 0;
+    if (hc_bytes > residual_hc->bytes) return 0;
+    if (mix_hc * sizeof(float) > split->bytes) return 0;
+
+    float *o = (float *)out_hc->ptr;
+    const uint16_t *bo = (const uint16_t *)block_out_h->ptr;
+    const float *rh = (const float *)residual_hc->ptr;
+    const float *sp = (const float *)split->ptr;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const float w = sp[n_hc + h];
+        for (uint32_t i = 0; i < n_embd; i++)
+            o[(uint64_t)h * n_embd + i] =
+                w * ds4_half_to_float(bo[i]) + rh[(uint64_t)h * n_embd + i];
+    }
+    return 1;
+}
+
+/* ---- HC expand-add-split, f16 add block (batch fast path) ----
+ *
+ * Same as ds4_gpu_hc_expand_add_split_tensor but the second block arrives
+ * in f16 (2 B/element): the engine's shared_down_f16 FFN path feeds the
+ * shared-expert half from g->batch_q_half.  The split layout is the
+ * sinkhorn buffer [pre | post | comb]; only the post gates split[n_hc + h]
+ * participate (batch fast path):
+ *   out_hc[h*n_embd + i] = split[n_hc + h] * (block_out[i] + deq_f16(block_add_h[i]))
+ *                          + residual_hc[h*n_embd + i] */
+int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
+    const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h,
+    const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+    uint32_t n_embd, uint32_t n_hc)
+{
+    DS4_VK_TRACE_KERNEL("hc_expand_add_split_half_add");
+    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split) return 0;
+    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t embd_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t half_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_bytes > out_hc->bytes) return 0;
+    if (embd_bytes > block_out->bytes) return 0;
+    if (half_bytes > block_add_h->bytes) return 0;
+    if (hc_bytes > residual_hc->bytes) return 0;
+    if (mix_hc * sizeof(float) > split->bytes) return 0;
+
+    float *o = (float *)out_hc->ptr;
+    const float *bo = (const float *)block_out->ptr;
+    const uint16_t *ba = (const uint16_t *)block_add_h->ptr;
+    const float *rh = (const float *)residual_hc->ptr;
+    const float *sp = (const float *)split->ptr;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const float w = sp[n_hc + h];
+        for (uint32_t i = 0; i < n_embd; i++)
+            o[(uint64_t)h * n_embd + i] =
+                w * (bo[i] + ds4_half_to_float(ba[i])) + rh[(uint64_t)h * n_embd + i];
     }
     return 1;
 }
@@ -3092,6 +3462,96 @@ int ds4_gpu_indexer_topk_tensor(
             return row[a] > row[b] || (row[a] == row[b] && a < b);
         });
         for (uint32_t k = 0; k < top_k; k++) out[(uint64_t)t * top_k + k] = idx[k];
+    }
+    return 1;
+}
+
+/* =========================================================================
+ * DSV4 indexer QAT: in-place 128-wide Hadamard rotation + FP4
+ * activation-simulation round trip on every row of x.
+ *
+ * Replicates ds4.c dsv4_indexer_qat_row_inplace_cpu
+ * (dsv4_hadamard128_inplace_cpu + dsv4_fp4_act_quantize_row_inplace_cpu),
+ * the CUDA indexer_hadamard_fp4_kernel and the Metal
+ * kernel_dsv4_indexer_hadamard_fp4_f32.  head_dim is fixed at 128 by the
+ * model graph (DS4_N_INDEXER_HEAD_DIM); the reference dies for any other
+ * value, so invalid head_dim fails the call here too.
+ *
+ * FP4 activation quantization: per 32-element block, amax = max |x| (clamped
+ * to a tiny floor), scale = 2^ceil(log2(amax/6)), each element is divided by
+ * scale, clamped to [-6, 6], rounded through the E2M1FN values
+ * {0, .5, 1, 1.5, 2, 3, 4, 6} (ties to even) and re-multiplied by scale.
+ * ========================================================================= */
+
+static float dsv4_e2m1fn_value_vk(int i) {
+    static const float values[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    return values[i & 7];
+}
+
+static float dsv4_e2m1fn_dequant_vk(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - dsv4_e2m1fn_value_vk(0));
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - dsv4_e2m1fn_value_vk(i));
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * dsv4_e2m1fn_value_vk(best);
+}
+
+static void dsv4_hadamard128_inplace_vk(float *x) {
+    for (uint32_t stride = 1; stride < 128; stride <<= 1) {
+        for (uint32_t base = 0; base < 128; base += 2u * stride) {
+            for (uint32_t i = 0; i < stride; i++) {
+                const float a = x[base + i];
+                const float b = x[base + stride + i];
+                x[base + i] = a + b;
+                x[base + stride + i] = a - b;
+            }
+        }
+    }
+    const float scale = 0.08838834764831845f;
+    for (uint32_t i = 0; i < 128; i++) x[i] *= scale;
+}
+
+static void dsv4_fp4_act_quantize_row_inplace_vk(float *x, uint32_t n) {
+    for (uint32_t off = 0; off < n; off += 32) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 32; i++) {
+            const float av = fabsf(x[off + i]);
+            if (av > amax) amax = av;
+        }
+        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
+        const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 6.0f)));
+        for (uint32_t i = 0; i < 32; i++) {
+            float v = x[off + i] / scale;
+            if (v > 6.0f) v = 6.0f;
+            if (v < -6.0f) v = -6.0f;
+            x[off + i] = dsv4_e2m1fn_dequant_vk(v) * scale;
+        }
+    }
+}
+
+int ds4_gpu_dsv4_indexer_qat_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_rows,
+        uint32_t          head_dim) {
+    DS4_VK_TRACE_KERNEL("dsv4_indexer_qat");
+    if (!x || n_rows == 0 || head_dim != 128u) return 0;
+    const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
+    if (!x->ptr || x->bytes < bytes) return 0;
+
+    float *xp = (float *)x->ptr;
+    for (uint32_t r = 0; r < n_rows; r++) {
+        float *row = xp + (uint64_t)r * head_dim;
+        dsv4_hadamard128_inplace_vk(row);
+        dsv4_fp4_act_quantize_row_inplace_vk(row, head_dim);
     }
     return 1;
 }
@@ -3676,6 +4136,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident)
 {
+    DS4_VK_TRACE_KERNEL("routed_moe_one");
     (void)layer_index;
     (void)force_resident;
     if (!out || !out->ptr || !gate || !gate->ptr || !up || !up->ptr ||
@@ -4647,6 +5108,182 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             compressor_ape_scalar(model_map, ape_offset, ape_type,
                                   (uint64_t)pos_mod * width + j);
     }
+    return 1;
+}
+
+/* ---- matmul_q8_0_f16_out_tensor (host-side, f16 output) ----
+ *
+ * out_h[o + t*out_dim] = sum_i deq_q8(W[o][i]) * x[i + t*in_dim]
+ * for o in [0, out_dim), t in [0, n_tok), with the same Q8_0 dequant math
+ * as the verified matmul_q8_0 kernel (GGUF 34 B/block: f16 scale + 32
+ * int8, double accumulation, partial last block) but the result is stored
+ * as an IEEE half (2 B/element) instead of f32 — the engine's
+ * batch_q_half buffer for the shared-expert down projection.
+ *
+ * This is host-side (tensor->ptr is host-mapped), so no command buffer is
+ * involved.  Returns 1 on success, -1 on invalid arguments / out-of-range
+ * offsets or tensor sizes.
+ */
+int ds4_gpu_matmul_q8_0_f16_out_tensor(
+    ds4_gpu_tensor *out_h, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x, uint64_t n_tok)
+{
+    DS4_VK_TRACE_KERNEL("matmul_q8_0_f16_out");
+    if (!out_h || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0)
+        return 0;
+    if (!out_h->ptr || !x->ptr) return 0;
+
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;   /* Q8_0: f16 scale + 32 x int8 */
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    /* Never read past the model mmap (SIGBUS guard), never write past
+     * tensor bytes. */
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return 0;
+    if (n_tok > UINT64_MAX / in_dim ||
+        (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes)
+        return 0;
+    if (n_tok > UINT64_MAX / out_dim ||
+        (uint64_t)out_dim * n_tok * sizeof(uint16_t) > out_h->bytes)
+        return 0;
+
+    const uint8_t *base = (const uint8_t *)model_map + weight_offset;
+    const float *xp = (const float *)x->ptr;
+    uint16_t *op = (uint16_t *)out_h->ptr;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        const float *xt = xp + t * in_dim;
+        for (uint64_t o = 0; o < out_dim; o++)
+            op[t * out_dim + o] =
+                ds4_float_to_half(ds4_q8_0_row_dot_f32(base + o * row_bytes,
+                                                        xt, in_dim, blocks));
+    }
+    return 1;
+}
+
+/* ---- matmul_f16_pair_tensor (host-side paired f16 projections) ----
+ *
+ *   out_a[o + t*out_dim] = sum_i deq_f16(Wa[o][i]) * x[i + t*in_dim]
+ *   out_b[o + t*out_dim] = sum_i deq_f16(Wb[o][i]) * x[i + t*in_dim]
+ *
+ * Both weight matrices are IEEE half (2 B/element), row-major
+ * [out_dim][in_dim], like the verified matmul_f16 path; outputs are f32.
+ * Used for the compressor / indexer KV + score paired projections (n_tok
+ * may be > 1, e.g. the ratio-4 prefill tail).  Host-side, no command
+ * buffer.  Returns 1 on success, -1 on invalid arguments / out-of-range
+ * offsets or tensor sizes.
+ */
+int ds4_gpu_matmul_f16_pair_tensor(
+    ds4_gpu_tensor *out_a, ds4_gpu_tensor *out_b,
+    const void *model_map, uint64_t model_size,
+    uint64_t weight_a_offset, uint64_t weight_b_offset,
+    uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x, uint64_t n_tok)
+{
+    DS4_VK_TRACE_KERNEL("matmul_f16_pair");
+    if (!out_a || !out_b || !model_map || !x ||
+        in_dim == 0 || out_dim == 0 || n_tok == 0)
+        return 0;
+    if (!out_a->ptr || !out_b->ptr || !x->ptr) return 0;
+
+    const uint64_t weight_bytes = in_dim * out_dim * 2u;  /* f16: 2 B/elem */
+    /* Never read past the model mmap (SIGBUS guard), never write past
+     * tensor bytes. */
+    if (weight_a_offset > model_size ||
+        weight_bytes > model_size - weight_a_offset)
+        return 0;
+    if (weight_b_offset > model_size ||
+        weight_bytes > model_size - weight_b_offset)
+        return 0;
+    if (n_tok > UINT64_MAX / in_dim ||
+        (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes)
+        return 0;
+    if (n_tok > UINT64_MAX / out_dim ||
+        (uint64_t)out_dim * n_tok * sizeof(float) > out_a->bytes)
+        return 0;
+    if (n_tok > UINT64_MAX / out_dim ||
+        (uint64_t)out_dim * n_tok * sizeof(float) > out_b->bytes)
+        return 0;
+
+    const uint16_t *wa = (const uint16_t *)((const char *)model_map + weight_a_offset);
+    const uint16_t *wb = (const uint16_t *)((const char *)model_map + weight_b_offset);
+    const float *xp = (const float *)x->ptr;
+    float *oa = (float *)out_a->ptr;
+    float *ob = (float *)out_b->ptr;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        const float *xt = xp + t * in_dim;
+        for (uint64_t o = 0; o < out_dim; o++) {
+            const uint16_t *ra = wa + o * in_dim;
+            const uint16_t *rb = wb + o * in_dim;
+            double acca = 0.0, accb = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) {
+                acca += (double)ds4_half_to_float(ra[i]) * (double)xt[i];
+                accb += (double)ds4_half_to_float(rb[i]) * (double)xt[i];
+            }
+                        oa[t * out_dim + o] = (float)acca;
+                        ob[t * out_dim + o] = (float)accb;
+                    }
+                }
+                return 1;
+            }
+            
+/* =========================================================================
+ * ds4_gpu_compressor_prefill_state_ratio4_tensor
+ *
+ * Re-initializes the rolling compressor state of a ratio-4 layer from the
+ * 4 projected tail rows (the last complete window of the prefill), exactly
+ * like the CUDA call site in ds4_cuda.cu (compressor_set_rows_kernel with
+ * src0=0, dst0=0, rows=4) and the Metal compressor_set_rows_projected path
+ * (dst rows {0,1,2,3}) in ds4_metal.m.
+ *
+ * State layout (ratio-4): width = 2 * head_dim, state_rows = 8.
+ *   rows [0,4)  : attention lane  -> filled from the tail window
+ *   rows [4,8)  : indexer lane    -> left empty (kv 0 / score -INFINITY)
+ * The APE scalar of phase (pos0 + src) % 4 is added to the score, exactly as
+ * in compressor_set_rows / compressor_store_batch.  The engine calls this
+ * after projecting the tail (ds4.c ~26336) with kv_tail/sc_tail = the 4-row
+ * metal_graph_batch_comp_kv/sc buffers and pos0 = pos0 + n_tokens - 4.
+ * ========================================================================= */
+int ds4_gpu_compressor_prefill_state_ratio4_tensor(
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv_tail,
+        const ds4_gpu_tensor *sc_tail,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                pos0) {
+    DS4_VK_TRACE_KERNEL("compressor_prefill_state_ratio4");
+    if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
+        head_dim == 0 || (ape_type != 0u && ape_type != 1u)) {
+        return 0;
+    }
+    const uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
+    const uint64_t tail_bytes = (uint64_t)ratio * width * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t ape_bytes = (uint64_t)ratio * width * elem_ape;
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        kv_tail->bytes < tail_bytes || sc_tail->bytes < tail_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        return 0;
+    }
+
+    float *skvp = (float *)state_kv->ptr;
+    float *sscp = (float *)state_score->ptr;
+    const uint64_t state_n = (uint64_t)state_rows * width;
+    memset(skvp, 0, (size_t)(state_n * sizeof(float)));
+    for (uint64_t i = 0; i < state_n; i++) sscp[i] = -INFINITY;
+
+    compressor_set_rows(skvp, sscp,
+                        (const float *)kv_tail->ptr, (const float *)sc_tail->ptr,
+                        model_map, ape_offset, ape_type,
+                        width, ratio, pos0,
+                        0, 0, ratio);
     return 1;
 }
 

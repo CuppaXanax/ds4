@@ -15,9 +15,11 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.n) return;
     float g = gate_val[gid];
-    float u = up_val[gid] * pc.weight;
+    float u = up_val[gid];
+    if (pc.clamp > 1.0e-6) {
+        g = min(g, pc.clamp);
+        u = clamp(u, -pc.clamp, pc.clamp);
+    }
     float silu = g * (1.0 / (1.0 + exp(-g)));
-    if (pc.clamp > 0.0 && silu > pc.clamp) silu = pc.clamp;
-    if (pc.clamp > 0.0 && silu < -pc.clamp) silu = -pc.clamp;
-    out_val[gid] = silu * u;
+    out_val[gid] = silu * u * pc.weight;
 }

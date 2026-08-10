@@ -1037,64 +1037,201 @@ void ds4_gpu_print_memory_report(const char *label) {
     } else fprintf(stderr, "no allocator\n");
 }
 
-/* ---- Simple GPU ops with CPU fallback ---- */
+/* ---- Simple Vulkan compute operations ---- */
+
+static bool find_tensor_buffer(const ds4_gpu_tensor *tensor,
+                               VkBuffer &buffer, VkDeviceSize &offset) {
+    if (!tensor || !tensor->ptr) return false;
+    auto exact = g_vk.tensor_headers.find(tensor->ptr);
+    if (exact != g_vk.tensor_headers.end()) {
+        buffer = exact->second->buffer;
+        offset = 0;
+        return true;
+    }
+    const char *ptr = (const char *)tensor->ptr;
+    for (auto &[base, header] : g_vk.tensor_headers) {
+        const char *begin = (const char *)base;
+        if (ptr >= begin && ptr < begin + header->bytes) {
+            buffer = header->buffer;
+            offset = (VkDeviceSize)(ptr - begin);
+            return true;
+        }
+    }
+    return false;
+}
+
+static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording) {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(ctx.cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+    ctx.command_count++;
+    int ok = submit_and_wait();
+    if (ok && resume_recording) ok = begin_cmd();
+    return ok;
+}
+
+static int allocate_simple_descriptors(const ShaderEntry &shader,
+                                       VkDescriptorBufferInfo *buffers,
+                                       uint32_t count, VkDescriptorSet &set) {
+    const VkDeviceSize alignment =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (alignment != 0) {
+        for (uint32_t i = 0; i < count; i++)
+            if (buffers[i].offset % alignment != 0) return 0;
+    }
+    VkDescriptorSetAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocate.descriptorPool = g_vk.desc_pool;
+    allocate.descriptorSetCount = 1;
+    allocate.pSetLayouts = &shader.desc_layout;
+    if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
+        return 0;
+
+    std::vector<VkWriteDescriptorSet> writes(count);
+    for (uint32_t i = 0; i < count; i++) {
+        writes[i] = {};
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffers[i];
+    }
+    vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
+    return 1;
+}
+
+static int release_simple_descriptors(VkDescriptorSet set) {
+    return vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
+}
+
+static int fail_simple_dispatch(VulkanCommandCtx &ctx) {
+    if (ctx.recording && ctx.command_count == 0) (void)submit_and_wait();
+    return 0;
+}
 
 int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                                    uint32_t n, float eps) {
-    if (!out || !x) return 0;
-    float *op = (float*)out->ptr; const float *xp = (const float*)x->ptr;
-    double sum = 0.0; for (uint32_t i = 0; i < n; i++) sum += (double)xp[i] * xp[i];
-    float rcp = 1.0f / sqrtf((float)(sum / n) + eps);
-    for (uint32_t i = 0; i < n; i++) op[i] = xp[i] * rcp;
-    return 1;
+    return ds4_gpu_rms_norm_plain_rows_tensor(out, x, n, 1, eps);
 }
 
 int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                                         uint32_t n, uint32_t rows, float eps) {
-    if (!out || !x) return 0;
-    float *op = (float*)out->ptr; const float *xp = (const float*)x->ptr;
-    for (uint32_t r = 0; r < rows; r++) {
-        double sum = 0.0;
-        for (uint32_t i = 0; i < n; i++) sum += (double)xp[r * n + i] * xp[r * n + i];
-        float rcp = 1.0f / sqrtf((float)(sum / n) + eps);
-        for (uint32_t i = 0; i < n; i++) op[r * n + i] = xp[r * n + i] * rcp;
-    }
-    return 1;
+    DS4_VK_TRACE_KERNEL("rms_norm");
+    if (!out || !x || n == 0 || rows == 0 ||
+        (uint64_t)n * rows > x->bytes / sizeof(float) ||
+        (uint64_t)n * rows > out->bytes / sizeof(float)) return 0;
+    auto si = g_vk.shader_map.find("rms_norm");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
+    if (!find_tensor_buffer(x, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[2] = {
+        {xbuf, xoff, (VkDeviceSize)n * rows * sizeof(float)},
+        {obuf, ooff, (VkDeviceSize)n * rows * sizeof(float)},
+    };
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 2, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n, rows; float eps; } push = {n, rows, eps};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, rows, 1, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
                                     const void *mm, uint64_t ms, uint64_t woff,
                                     uint32_t n, float eps) {
     DS4_VK_TRACE_KERNEL("rms_norm_weight");
-    if (!out || !x) return 0;
-    const float *w = (const float*)((const char*)mm + woff);
-    float *op = (float*)out->ptr; const float *xp = (const float*)x->ptr;
-    double sum = 0.0; for (uint32_t i = 0; i < n; i++) sum += (double)xp[i] * xp[i];
-    float rcp = 1.0f / sqrtf((float)(sum / n) + eps);
-    for (uint32_t i = 0; i < n; i++) op[i] = xp[i] * rcp * w[i];
-    return 1;
+    return ds4_gpu_rms_norm_weight_rows_tensor(out, x, mm, ms, woff, n, 1, eps);
 }
 
 int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate,
                            const ds4_gpu_tensor *up, uint32_t n, float clamp, float weight) {
-    if (!out || !gate || !up) return 0;
-    float *op = (float*)out->ptr;
-    const float *gp = (const float*)gate->ptr;
-    const float *up_ = (const float*)up->ptr;
-    for (uint32_t i = 0; i < n; i++) {
-        float g = gp[i]; float u = up_[i] * weight;
-        float silu = g / (1.0f + expf(-g));
-        if (clamp > 0.0f) { if (silu > clamp) silu = clamp; if (silu < -clamp) silu = -clamp; }
-        op[i] = silu * u;
-    }
-    return 1;
+    DS4_VK_TRACE_KERNEL("swiglu");
+    if (!out || !gate || !up || n == 0 ||
+        (uint64_t)n * sizeof(float) > gate->bytes ||
+        (uint64_t)n * sizeof(float) > up->bytes ||
+        (uint64_t)n * sizeof(float) > out->bytes) return 0;
+    auto si = g_vk.shader_map.find("swiglu");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer gate_buf, up_buf, out_buf; VkDeviceSize gate_off, up_off, out_off;
+    if (!find_tensor_buffer(gate, gate_buf, gate_off) ||
+        !find_tensor_buffer(up, up_buf, up_off) ||
+        !find_tensor_buffer(out, out_buf, out_off)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[3] = {
+        {gate_buf, gate_off, (VkDeviceSize)n * sizeof(float)},
+        {up_buf, up_off, (VkDeviceSize)n * sizeof(float)},
+        {out_buf, out_off, (VkDeviceSize)n * sizeof(float)},
+    };
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 3, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n; float clamp; float weight; } push = {n, clamp, weight};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, (n + 255) / 256, 1, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n) {
-    if (!out || !a || !b) return 0;
-    float *op = (float*)out->ptr; const float *ap = (const float*)a->ptr; const float *bp = (const float*)b->ptr;
-    for (uint32_t i = 0; i < n; i++) op[i] = ap[i] + bp[i];
-    return 1;
+    DS4_VK_TRACE_KERNEL("add_f32");
+    if (!out || !a || !b || n == 0 ||
+        (uint64_t)n * sizeof(float) > a->bytes ||
+        (uint64_t)n * sizeof(float) > b->bytes ||
+        (uint64_t)n * sizeof(float) > out->bytes) return 0;
+    auto si = g_vk.shader_map.find("add_f32");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer abuf, bbuf, obuf; VkDeviceSize aoff, boff, ooff;
+    if (!find_tensor_buffer(a, abuf, aoff) || !find_tensor_buffer(b, bbuf, boff) ||
+        !find_tensor_buffer(out, obuf, ooff)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[3] = {
+        {abuf, aoff, (VkDeviceSize)n * sizeof(float)},
+        {bbuf, boff, (VkDeviceSize)n * sizeof(float)},
+        {obuf, ooff, (VkDeviceSize)n * sizeof(float)},
+    };
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 3, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(n), &n);
+    vkCmdDispatch(ctx.cmd, (n + 255) / 256, 1, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
@@ -1446,16 +1583,62 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     const void *model_map, uint64_t model_size,
     uint64_t weight_offset, uint32_t n, uint32_t rows, float eps)
 {
-    if (!out || !x) return 0;
-    /* Use CPU implementation for now (Vulkan shader exists but dispatch needs weight buffer) */
-    float *op = (float*)out->ptr; const float *xp = (const float*)x->ptr;
-    const float *wp = (const float*)((const char*)model_map + weight_offset);
-    for (uint32_t r = 0; r < rows; r++) {
-        double sum = 0.0; for (uint32_t i = 0; i < n; i++) sum += (double)xp[r*n+i] * xp[r*n+i];
-        float rcp = 1.0f / sqrtf((float)(sum / n) + eps);
-        for (uint32_t i = 0; i < n; i++) op[r*n+i] = xp[r*n+i] * rcp * wp[i];
+    DS4_VK_TRACE_KERNEL("rms_norm_weight_rows");
+    const uint64_t values = (uint64_t)n * rows;
+    const uint64_t weight_bytes = (uint64_t)n * sizeof(float);
+    if (!out || !x || !model_map || n == 0 || rows == 0 ||
+        values > x->bytes / sizeof(float) || values > out->bytes / sizeof(float) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    auto si = g_vk.shader_map.find("rms_norm_weight_rows");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
+    if (!find_tensor_buffer(x, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
+    if (!ensure_weight(weight_offset, weight_bytes)) return 0;
+
+    VkBuffer wbuf = VK_NULL_HANDLE;
+    VkDeviceSize woff = 0;
+    auto wit = g_vk.weight_cache.end();
+    for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
+        if (weight_offset >= it->first &&
+            weight_offset - it->first <= it->second.size &&
+            weight_bytes <= it->second.size - (weight_offset - it->first)) {
+            wit = it;
+            break;
+        }
     }
-    return 1;
+    if (wit == g_vk.weight_cache.end()) return 0;
+    wit->second.last_used = ++g_vk.lru_counter;
+    wit->second.last_gen = g_vk.cmd_gen;
+    wbuf = wit->second.buffer;
+    woff = weight_offset - wit->first;
+    const VkDeviceSize alignment = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (alignment != 0 && (woff % alignment) != 0) return 0;
+
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[3] = {
+        {xbuf, xoff, (VkDeviceSize)values * sizeof(float)},
+        {wbuf, woff, (VkDeviceSize)weight_bytes},
+        {obuf, ooff, (VkDeviceSize)values * sizeof(float)},
+    };
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 3, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n, rows; float eps; } push = {n, rows, eps};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, rows, 1, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 extern "C" {

@@ -10,15 +10,25 @@ layout(push_constant) uniform PC {
     uint n; uint rows; float eps;
 } pc;
 
+shared float ssum[256];
+
 void main() {
     uint r = gl_WorkGroupID.x;
     uint lid = gl_LocalInvocationIndex;
     if (r >= pc.rows) return;
     uint off = r * pc.n;
-    double sum = 0.0;
+    float sum = 0.0;
     for (uint i = lid; i < pc.n; i += 256u)
-        sum += double(x_buf[off + i]) * double(x_buf[off + i]);
-    float mean = float(sum / double(pc.n));
+        sum += x_buf[off + i] * x_buf[off + i];
+    ssum[lid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) ssum[lid] += ssum[lid + s];
+        barrier();
+    }
+
+    float mean = ssum[0] / float(pc.n);
     float rcp = inversesqrt(mean + pc.eps);
     for (uint i = lid; i < pc.n; i += 256u)
         out_buf[off + i] = x_buf[off + i] * rcp * w_buf[i];

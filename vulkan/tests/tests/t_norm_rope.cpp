@@ -154,11 +154,17 @@ static void synth_row_major(float *v, uint64_t n) {
 static int test_rms_norm_plain_rows(void) {
     const uint32_t n = 16, rows = 4;
     const float eps = 1e-5f;
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n * rows * sizeof(float));
-    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)n * rows * sizeof(float));
-    if (!x || !o) {
+    const uint64_t bytes = (uint64_t)n * rows * sizeof(float);
+    const uint64_t view_offset = 256;
+    ds4_gpu_tensor *xbase = ds4_gpu_tensor_alloc(bytes + view_offset);
+    ds4_gpu_tensor *obase = ds4_gpu_tensor_alloc(bytes + view_offset);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_view(xbase, view_offset, bytes);
+    ds4_gpu_tensor *o = ds4_gpu_tensor_view(obase, view_offset, bytes);
+    if (!xbase || !obase || !x || !o) {
         if (x) ds4_gpu_tensor_free(x);
         if (o) ds4_gpu_tensor_free(o);
+        if (xbase) ds4_gpu_tensor_free(xbase);
+        if (obase) ds4_gpu_tensor_free(obase);
         return 1;
     }
     float xv[n * rows];
@@ -177,6 +183,8 @@ static int test_rms_norm_plain_rows(void) {
     }
     ds4_gpu_tensor_free(o);
     ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(obase);
+    ds4_gpu_tensor_free(xbase);
     return rc;
 }
 REGISTER_TEST(rms_norm_plain_rows, test_rms_norm_plain_rows);

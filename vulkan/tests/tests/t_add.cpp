@@ -6,10 +6,14 @@
 
 static int test_add(void) {
     const uint32_t n = 4096;
-    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(n * sizeof(float));
-    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(n * sizeof(float));
-    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc(n * sizeof(float));
-    if (!a || !b || !o) return 1;
+    const uint64_t view_offset = 256;
+    ds4_gpu_tensor *abase = ds4_gpu_tensor_alloc(n * sizeof(float) + view_offset);
+    ds4_gpu_tensor *bbase = ds4_gpu_tensor_alloc(n * sizeof(float) + view_offset);
+    ds4_gpu_tensor *obase = ds4_gpu_tensor_alloc(n * sizeof(float) + view_offset);
+    ds4_gpu_tensor *a = ds4_gpu_tensor_view(abase, view_offset, n * sizeof(float));
+    ds4_gpu_tensor *b = ds4_gpu_tensor_view(bbase, view_offset, n * sizeof(float));
+    ds4_gpu_tensor *o = ds4_gpu_tensor_view(obase, view_offset, n * sizeof(float));
+    if (!abase || !bbase || !obase || !a || !b || !o) return 1;
     ds4_gpu_tensor_fill_f32(a, 1.5f, n);
     ds4_gpu_tensor_fill_f32(b, 2.25f, n);
     int rc = 1;
@@ -22,6 +26,9 @@ static int test_add(void) {
     ds4_gpu_tensor_free(o);
     ds4_gpu_tensor_free(b);
     ds4_gpu_tensor_free(a);
+    ds4_gpu_tensor_free(obase);
+    ds4_gpu_tensor_free(bbase);
+    ds4_gpu_tensor_free(abase);
     return rc;
 }
 REGISTER_TEST(add_f32, test_add);

@@ -5,6 +5,7 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1   # repo root (this script lives at the repo root)
 
 echo "==> building kernel test harness..."
+python3 vulkan/shaders/compile.py || exit 1
 g++ -O2 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include \
     -DDS4_VULKAN_BUILD \
     vulkan/tests/harness.cpp vulkan/tests/tests.cpp \

@@ -2853,18 +2853,28 @@ int ds4_gpu_hc_split_weighted_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *sp
 {
     if (!out || !split || !mix || !rhc || !mm) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if ((uint64_t)n_embd * sizeof(float) > out->bytes) return 0;
-    if (mix_hc * sizeof(float) > split->bytes) return 0;
-    if (mix_hc * sizeof(float) > mix->bytes) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > rhc->bytes) return 0;
+    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    const uint64_t hc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (out_row_bytes == 0 || split_row_bytes == 0 || hc_row_bytes == 0) return 0;
+    uint64_t rows = out->bytes / out_row_bytes;
+    rows = std::min(rows, split->bytes / split_row_bytes);
+    rows = std::min(rows, mix->bytes / split_row_bytes);
+    rows = std::min(rows, rhc->bytes / hc_row_bytes);
+    if (rows == 0) return 0;
     if (so > ms || 3ull * sizeof(float) > ms - so) return 0;
     if (bo > ms || mix_hc * sizeof(float) > ms - bo) return 0;
 
     const float *scale = (const float *)((const char *)mm + so);
     const float *base = (const float *)((const char *)mm + bo);
-    float *sp = (float *)split->ptr;
-    ds4_hc_split_sinkhorn(sp, (const float *)mix->ptr, scale, base, n_hc, si, eps);
-    ds4_hc_weighted_sum((float *)out->ptr, (const float *)rhc->ptr, sp, n_embd, n_hc);
+    for (uint64_t row = 0; row < rows; row++) {
+        float *sp = (float *)split->ptr + row * mix_hc;
+        const float *mix_row = (const float *)mix->ptr + row * mix_hc;
+        const float *hc_row = (const float *)rhc->ptr + row * n_hc * n_embd;
+        float *out_row = (float *)out->ptr + row * n_embd;
+        ds4_hc_split_sinkhorn(sp, mix_row, scale, base, n_hc, si, eps);
+        ds4_hc_weighted_sum(out_row, hc_row, sp, n_embd, n_hc);
+    }
     return 1;
 }
 
@@ -2873,14 +2883,25 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     uint32_t n_embd, uint32_t n_hc)
 {
     if (!out_hc || !block_out || !residual_hc || !split) return 0;
-    float *o = (float*)out_hc->ptr;
-    const float *bo = (const float*)block_out->ptr;
-    const float *rh = (const float*)residual_hc->ptr;
-    const float *sp = (const float*)split->ptr;
-    for (uint32_t h = 0; h < n_hc; h++) {
-        float w = sp[n_hc + h];
-        for (uint32_t i = 0; i < n_embd; i++)
-            o[h * n_embd + i] = w * bo[i] + rh[h * n_embd + i];
+    const uint64_t hc_values = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_values == 0 || mix_hc == 0) return 0;
+    uint64_t rows = out_hc->bytes / (hc_values * sizeof(float));
+    rows = std::min(rows, block_out->bytes / ((uint64_t)n_embd * sizeof(float)));
+    rows = std::min(rows, residual_hc->bytes / (hc_values * sizeof(float)));
+    rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
+    if (rows == 0) return 0;
+    for (uint64_t row = 0; row < rows; row++) {
+        float *o = (float *)out_hc->ptr + row * hc_values;
+        const float *bo = (const float *)block_out->ptr + row * n_embd;
+        const float *rh = (const float *)residual_hc->ptr + row * hc_values;
+        const float *sp = (const float *)split->ptr + row * mix_hc;
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const float w = sp[n_hc + h];
+            for (uint32_t i = 0; i < n_embd; i++)
+                o[(uint64_t)h * n_embd + i] =
+                    w * bo[i] + rh[(uint64_t)h * n_embd + i];
+        }
     }
     return 1;
 }
@@ -3114,20 +3135,24 @@ int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
     const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
     const uint64_t half_bytes = (uint64_t)n_embd * sizeof(uint16_t);
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if (hc_bytes > out_hc->bytes) return 0;
-    if (half_bytes > block_out_h->bytes) return 0;
-    if (hc_bytes > residual_hc->bytes) return 0;
-    if (mix_hc * sizeof(float) > split->bytes) return 0;
-
-    float *o = (float *)out_hc->ptr;
-    const uint16_t *bo = (const uint16_t *)block_out_h->ptr;
-    const float *rh = (const float *)residual_hc->ptr;
-    const float *sp = (const float *)split->ptr;
-    for (uint32_t h = 0; h < n_hc; h++) {
-        const float w = sp[n_hc + h];
-        for (uint32_t i = 0; i < n_embd; i++)
-            o[(uint64_t)h * n_embd + i] =
-                w * ds4_half_to_float(bo[i]) + rh[(uint64_t)h * n_embd + i];
+    const uint64_t split_bytes = mix_hc * sizeof(float);
+    if (hc_bytes == 0 || half_bytes == 0 || split_bytes == 0) return 0;
+    uint64_t rows = out_hc->bytes / hc_bytes;
+    rows = std::min(rows, block_out_h->bytes / half_bytes);
+    rows = std::min(rows, residual_hc->bytes / hc_bytes);
+    rows = std::min(rows, split->bytes / split_bytes);
+    if (rows == 0) return 0;
+    for (uint64_t row = 0; row < rows; row++) {
+        float *o = (float *)out_hc->ptr + row * n_hc * n_embd;
+        const uint16_t *bo = (const uint16_t *)block_out_h->ptr + row * n_embd;
+        const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
+        const float *sp = (const float *)split->ptr + row * mix_hc;
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const float w = sp[n_hc + h];
+            for (uint32_t i = 0; i < n_embd; i++)
+                o[(uint64_t)h * n_embd + i] =
+                    w * ds4_half_to_float(bo[i]) + rh[(uint64_t)h * n_embd + i];
+        }
     }
     return 1;
 }
@@ -3152,22 +3177,37 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
     const uint64_t embd_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t half_bytes = (uint64_t)n_embd * sizeof(uint16_t);
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if (hc_bytes > out_hc->bytes) return 0;
-    if (embd_bytes > block_out->bytes) return 0;
-    if (half_bytes > block_add_h->bytes) return 0;
-    if (hc_bytes > residual_hc->bytes) return 0;
-    if (mix_hc * sizeof(float) > split->bytes) return 0;
-
-    float *o = (float *)out_hc->ptr;
-    const float *bo = (const float *)block_out->ptr;
-    const uint16_t *ba = (const uint16_t *)block_add_h->ptr;
-    const float *rh = (const float *)residual_hc->ptr;
-    const float *sp = (const float *)split->ptr;
-    for (uint32_t h = 0; h < n_hc; h++) {
-        const float w = sp[n_hc + h];
-        for (uint32_t i = 0; i < n_embd; i++)
-            o[(uint64_t)h * n_embd + i] =
-                w * (bo[i] + ds4_half_to_float(ba[i])) + rh[(uint64_t)h * n_embd + i];
+    const uint64_t split_bytes = mix_hc * sizeof(float);
+    if (hc_bytes == 0 || embd_bytes == 0 || half_bytes == 0 || split_bytes == 0) return 0;
+    uint64_t rows = out_hc->bytes / hc_bytes;
+    rows = std::min(rows, block_out->bytes / embd_bytes);
+    rows = std::min(rows, block_add_h->bytes / half_bytes);
+    rows = std::min(rows, residual_hc->bytes / hc_bytes);
+    rows = std::min(rows, split->bytes / split_bytes);
+    if (rows == 0) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr,
+                    "ds4: [dbg] hc_expand_add_split_half_add has no complete row "
+                    "out=%llu block=%llu half=%llu residual=%llu split=%llu\n",
+                    (unsigned long long)out_hc->bytes,
+                    (unsigned long long)block_out->bytes,
+                    (unsigned long long)block_add_h->bytes,
+                    (unsigned long long)residual_hc->bytes,
+                    (unsigned long long)split->bytes);
+        return 0;
+    }
+    for (uint64_t row = 0; row < rows; row++) {
+        float *o = (float *)out_hc->ptr + row * n_hc * n_embd;
+        const float *bo = (const float *)block_out->ptr + row * n_embd;
+        const uint16_t *ba = (const uint16_t *)block_add_h->ptr + row * n_embd;
+        const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
+        const float *sp = (const float *)split->ptr + row * mix_hc;
+        for (uint32_t h = 0; h < n_hc; h++) {
+            const float w = sp[n_hc + h];
+            for (uint32_t i = 0; i < n_embd; i++)
+                o[(uint64_t)h * n_embd + i] =
+                    w * (bo[i] + ds4_half_to_float(ba[i])) + rh[(uint64_t)h * n_embd + i];
+        }
     }
     return 1;
 }
@@ -3207,11 +3247,16 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out,
 {
     if (!out || !norm_out || !split || !mix || !residual_hc || !model_map) return 0;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if ((uint64_t)n_embd * sizeof(float) > out->bytes) return 0;
-    if ((uint64_t)n_embd * sizeof(float) > norm_out->bytes) return 0;
-    if (mix_hc * sizeof(float) > split->bytes) return 0;
-    if (mix_hc * sizeof(float) > mix->bytes) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > residual_hc->bytes) return 0;
+    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    const uint64_t hc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (out_row_bytes == 0 || split_row_bytes == 0 || hc_row_bytes == 0) return 0;
+    uint64_t rows = out->bytes / out_row_bytes;
+    rows = std::min(rows, norm_out->bytes / out_row_bytes);
+    rows = std::min(rows, split->bytes / split_row_bytes);
+    rows = std::min(rows, mix->bytes / split_row_bytes);
+    rows = std::min(rows, residual_hc->bytes / hc_row_bytes);
+    if (rows == 0) return 0;
     if (scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset) return 0;
     if (base_offset > model_size || mix_hc * sizeof(float) > model_size - base_offset) return 0;
     if (norm_weight_offset > model_size ||
@@ -3220,18 +3265,19 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out,
     const float *scale = (const float *)((const char *)model_map + scale_offset);
     const float *base = (const float *)((const char *)model_map + base_offset);
     const float *norm_w = (const float *)((const char *)model_map + norm_weight_offset);
-    float *sp = (float *)split->ptr;
-    float *op = (float *)out->ptr;
-    float *np = (float *)norm_out->ptr;
-
-    ds4_hc_split_sinkhorn(sp, (const float *)mix->ptr, scale, base, n_hc, sinkhorn_iters, eps);
-    ds4_hc_weighted_sum(op, (const float *)residual_hc->ptr, sp, n_embd, n_hc);
-
-    /* rms_norm_weight(out) - matches ds4_gpu_rms_norm_weight_tensor. */
-    double ss = 0.0;
-    for (uint32_t i = 0; i < n_embd; i++) ss += (double)op[i] * op[i];
-    const float rcp = 1.0f / sqrtf((float)(ss / (double)n_embd) + norm_eps);
-    for (uint32_t i = 0; i < n_embd; i++) np[i] = op[i] * rcp * norm_w[i];
+    for (uint64_t row = 0; row < rows; row++) {
+        float *sp = (float *)split->ptr + row * mix_hc;
+        float *op = (float *)out->ptr + row * n_embd;
+        float *np = (float *)norm_out->ptr + row * n_embd;
+        const float *mix_row = (const float *)mix->ptr + row * mix_hc;
+        const float *hc_row = (const float *)residual_hc->ptr + row * n_hc * n_embd;
+        ds4_hc_split_sinkhorn(sp, mix_row, scale, base, n_hc, sinkhorn_iters, eps);
+        ds4_hc_weighted_sum(op, hc_row, sp, n_embd, n_hc);
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n_embd; i++) ss += (double)op[i] * op[i];
+        const float rcp = 1.0f / sqrtf((float)(ss / (double)n_embd) + norm_eps);
+        for (uint32_t i = 0; i < n_embd; i++) np[i] = op[i] * rcp * norm_w[i];
+    }
     return 1;
 }
 

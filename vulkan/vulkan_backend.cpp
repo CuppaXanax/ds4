@@ -815,7 +815,7 @@ int ds4_gpu_set_model_map(const void *m, uint64_t s) {
     set_model_map_identity(m, s);
     return 1;
 }
-int ds4_gpu_set_model_fd(int fd) { (void)fd; return 1; }
+int ds4_gpu_set_model_fd(int fd) { (void)fd; return 0; }
 int ds4_gpu_set_model_fd_for_map(int fd, const void *m) {
     (void)fd;
     if (!m) return 0;
@@ -974,7 +974,7 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
 
 int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes,
                                  uint64_t idim, uint64_t odim, const char *label) {
-    (void)m; (void)s; (void)off; (void)bytes; (void)idim; (void)odim; (void)label; return 1; }
+    (void)m; (void)s; (void)off; (void)bytes; (void)idim; (void)odim; (void)label; return 0; }
 
 void ds4_gpu_release_q8_f16_cache(void) {}
 int ds4_gpu_pro_q4_expert_table_auto_available(void) { return 0; }
@@ -5973,7 +5973,7 @@ extern "C" int ds4_gpu_set_decode_score_vec4(int enabled) {
 
 extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size,
                                              uint64_t bias) {
-    (void)map; (void)size; (void)bias; return 1;
+    (void)map; (void)size; (void)bias; return 0;
 }
 
 extern "C" int ds4_gpu_device_cache_tensors(int device_id,

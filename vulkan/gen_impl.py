@@ -6,8 +6,8 @@ vulkan/vulkan_backend.cpp.  Everything else must still be defined so the
 engine links; this generator emits no-op placeholder definitions for every
 function NOT implemented by the backend.
 
-Return-value convention (matching the original PR's _impl_gen.cpp):
-  int / unsigned -> 1, pointer -> NULL, bool -> false, void -> {}
+Return-value convention for unsupported implementations:
+    integer / bool-like -> 0, pointer -> NULL, void -> {}
 
 Usage:
     python3 vulkan/gen_impl.py
@@ -54,6 +54,11 @@ COMPAT_IMPL = {
     "ds4_gpu_lookup_cache_device",
     "ds4_gpu_q8_cache_suppressed",
     "ds4_gpu_set_q8_cache_suppressed",
+}
+
+# Status queries whose honest unsupported value is nonzero.
+SCALAR_RETURNS = {
+    "ds4_gpu_tp_failed": "1",
 }
 
 
@@ -121,8 +126,7 @@ def main():
     lines = [
         "/* AUTO-GENERATED from ds4_gpu.h / ds4_gpu_mgpu.h - do not edit.",
         " * Regenerate with: python3 vulkan/gen_impl.py",
-        " * No-op placeholders for ds4_gpu_* functions not implemented by the",
-        " * Vulkan backend: int -> 1, pointer -> NULL, bool -> false, void -> {}. */",
+        " * Vulkan backend: integer/bool-like -> 0, pointer -> NULL, void -> {}. */",
     ]
     for name in missing:
         ret, params = funcs[name]
@@ -131,12 +135,12 @@ def main():
             body = f"{{ {log} }}"
         elif ret.endswith("*"):
             body = f"{{ {log} return NULL; }}"
-        elif "bool" in ret:
-            body = f"{{ {log} return false; }}"
-        elif "uint" in ret or ret == "size_t":
+        elif name in SCALAR_RETURNS:
+            body = f"{{ {log} return {SCALAR_RETURNS[name]}; }}"
+        elif "bool" in ret or "uint" in ret or ret == "size_t":
             body = f"{{ {log} return 0; }}"
         else:
-            body = f"{{ {log} return 1; }}"
+            body = f"{{ {log} return 0; }}"
         lines.append(f"{ret} {name}({params}) {body}")
     OUT.write_text("\n".join(lines) + "\n")
     print(f"generated {len(missing)} placeholders -> {OUT}")

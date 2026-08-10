@@ -26384,6 +26384,7 @@ static int metal_graph_decode_test(
     float *cpu_qr = xmalloc((size_t)q_rank * sizeof(float));
     float *cpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
     float *cpu_q_raw = xmalloc((size_t)q_dim * sizeof(float));
+    float *cpu_q_raw_gpu_input = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_q = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *cpu_heads = xmalloc((size_t)q_dim * sizeof(float));
@@ -26592,8 +26593,9 @@ static int metal_graph_decode_test(
     }
 
     if (ok) {
+        matvec_q8_0(cpu_q_raw_gpu_input, model, layer->attn_q_b, gpu_qr_norm);
         fprintf(stderr,
-                "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_lora=%g q_lora_norm=%g q_b_raw=%g/%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
+            "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_lora=%g q_lora_norm=%g q_b_raw=%g/%g q_b_exact_input=%g/%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
                 max_abs_diff(cpu_hc, gpu_hc, hc_dim),
                 max_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD),
                 max_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD),
@@ -26601,6 +26603,8 @@ static int metal_graph_decode_test(
             max_abs_diff(cpu_qr_norm, gpu_qr_norm, q_rank),
                 max_abs_diff(cpu_q_raw, gpu_q_raw, q_dim),
                 rms_abs_diff(cpu_q_raw, gpu_q_raw, q_dim),
+                max_abs_diff(cpu_q_raw_gpu_input, gpu_q_raw, q_dim),
+                rms_abs_diff(cpu_q_raw_gpu_input, gpu_q_raw, q_dim),
                 max_abs_diff(cpu_q, gpu_q, q_dim),
                 max_abs_diff(cpu_kv, gpu_kv, DS4_N_HEAD_DIM),
                 max_abs_diff(cpu_kv, gpu_raw, DS4_N_HEAD_DIM),
@@ -26664,6 +26668,7 @@ static int metal_graph_decode_test(
     free(gpu_hc);
     free(cpu_kv);
     free(cpu_q);
+    free(cpu_q_raw_gpu_input);
     free(cpu_q_raw);
     free(cpu_attn_out);
     free(cpu_heads);

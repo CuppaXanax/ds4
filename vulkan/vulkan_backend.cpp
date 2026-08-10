@@ -854,7 +854,8 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
  * Evicts least-recently-used ranges when g_vk.weight_budget is exceeded. */
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
     for (auto &[base, e] : g_vk.weight_cache) {
-        if (offset >= base && offset < base + e.size) {
+        if (offset >= base && offset - base <= e.size &&
+            needed_bytes <= e.size - (offset - base)) {
             e.last_used = ++g_vk.lru_counter;
             e.last_gen = g_vk.cmd_gen;
             return 1;
@@ -1186,6 +1187,7 @@ int ds4_gpu_matmul_q8_0_tensor(
 
     (void)model_map; (void)model_size;
     uint64_t n_blocks = (in_dim + 31) / 32;
+    const uint64_t weight_bytes = (uint64_t)out_dim * n_blocks * 34u;
 
     /* Get shader */
     auto si = g_vk.shader_map.find("matmul_q8_0");
@@ -1212,7 +1214,8 @@ int ds4_gpu_matmul_q8_0_tensor(
     VkBuffer wbuf; uint64_t wbuf_off;
     auto wit = g_vk.weight_cache.end();
     for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
-        if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
+        if (weight_offset >= it->first && weight_offset - it->first <= it->second.size &&
+            weight_bytes <= it->second.size - (weight_offset - it->first)) {
             wit = it; break;
         }
     }
@@ -1222,7 +1225,7 @@ int ds4_gpu_matmul_q8_0_tensor(
         wbuf_off = weight_offset - wit->first;
     } else {
         /* Q8_0 (GGUF) block = 34 bytes: f16 scale + 32 x int8, same as ds4.c. */
-        if (!ensure_weight(weight_offset, (uint64_t)out_dim * n_blocks * 34u)) return 0;
+        if (!ensure_weight(weight_offset, weight_bytes)) return 0;
         wit = g_vk.weight_cache.find(weight_offset);
         if (wit == g_vk.weight_cache.end()) return 0;
         wbuf = wit->second.buffer;
@@ -1240,7 +1243,7 @@ int ds4_gpu_matmul_q8_0_tensor(
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * n_blocks * 34u);
+        weight_bytes);
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size},
@@ -1370,10 +1373,12 @@ int ds4_gpu_matmul_f16_tensor(
     }
     /* Lazy weight upload with LRU eviction: find the range in the cache or
      * upload it from the model mmap on first use. */
+    const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * 2u;
     VkBuffer wbuf; uint64_t wbuf_off;
     auto wit = g_vk.weight_cache.end();
     for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
-        if (weight_offset >= it->first && weight_offset < it->first + it->second.size) {
+        if (weight_offset >= it->first && weight_offset - it->first <= it->second.size &&
+            weight_bytes <= it->second.size - (weight_offset - it->first)) {
             wit = it; break;
         }
     }
@@ -1383,7 +1388,7 @@ int ds4_gpu_matmul_f16_tensor(
         wbuf_off = weight_offset - wit->first;
     } else {
         /* W_f16 is a half-precision matrix: 2 bytes per element. */
-        if (!ensure_weight(weight_offset, (uint64_t)out_dim * in_dim * 2u)) {
+        if (!ensure_weight(weight_offset, weight_bytes)) {
             if (getenv("DS4_VULKAN_DEBUG"))
                 fprintf(stderr,
                         "ds4: [dbg] matmul_f16 weight upload failed "
@@ -1423,7 +1428,7 @@ int ds4_gpu_matmul_f16_tensor(
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
-        (uint64_t)out_dim * in_dim * 2u);  /* f16 weights: 2 bytes per element */
+        weight_bytes);  /* f16 weights: 2 bytes per element */
     VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
     VkDescriptorBufferInfo bufs[3] = {
         {xbuf, xoff, x_size}, {wbuf, wbuf_off, w_size}, {obuf, ooff, o_size},

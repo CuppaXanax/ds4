@@ -27,6 +27,7 @@ void main() {
     if (gid >= total) return;
     uint t = gid / pc.width;
     uint j = gid - t * pc.width;
+    if (t + pc.ratio < pc.n_tokens) return;
     uint phase = (pc.pos0 + t) % pc.ratio;
     uint state_row = pc.ratio == 4u ? pc.ratio + phase : phase;
     uint ape_index = phase * pc.width + j;

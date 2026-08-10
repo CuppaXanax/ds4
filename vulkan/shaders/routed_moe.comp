@@ -194,7 +194,8 @@ void main() {
             for (uint i = 0u; i < q8_count; i += 4u) {
                 uint packed = 0u;
                 for (uint j = 0u; j < 4u; ++j)
-                    packed |= (uint(clamp(roundEven(q8_values[i + j] * inv), -128.0, 127.0)) & 255u) << (8u * j);
+                    packed |= (uint(int(clamp(roundEven(q8_values[i + j] * inv),
+                                              -128.0, 127.0))) & 255u) << (8u * j);
                 b4[base / 4u + 1u + i / 4u] = packed;
             }
             if (pc.gate_type != 8u) {

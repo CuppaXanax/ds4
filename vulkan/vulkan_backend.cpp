@@ -1179,12 +1179,16 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                n_tok)
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
-    if (!out || !x) return 0;
+    if (!out || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
 
-    /* Wide model projections are sensitive to Q8 activation rounding. Keep
-     * them on the exact host reference until the GPU path consumes a shared,
-     * prequantized activation instead of re-quantizing independently. */
-    if (in_dim == 4096u && out_dim <= 4096u) {
+    /* Wide model projections are sensitive to Q8 activation rounding. Large
+     * batched projections also create watchdog-scale single dispatches on
+     * RADV (Flash prefill Q_B is 32 * 32768 output rows). Keep both on the
+     * exact host reference until the GPU path is split into bounded launches
+     * that consume a shared, prequantized activation. */
+    const bool large_batch =
+        n_tok <= UINT64_MAX / out_dim && n_tok * out_dim > 262144u;
+    if ((in_dim == 4096u && out_dim <= 4096u) || large_batch) {
         auto &commands = get_cmd_ctx();
         if (commands.recording && commands.command_count != 0 && !submit_and_wait()) return 0;
         if (!model_map || !out->ptr || !x->ptr) return 0;

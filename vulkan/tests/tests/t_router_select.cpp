@@ -1,8 +1,8 @@
 /* Kernel test: ds4_gpu_router_select_tensor (host-side MoE router).
  *
- * Single-token MoE router: biased logits -> full softmax (probs), top-k
- * expert ids sorted by logit desc (selected), and softmax-over-chosen
- * weights scaled by expert_weight_scale.  The kernel is CPU-hosted over
+ * DeepSeek V4 routing uses sqrt(softplus(logit)) probabilities, optional
+ * bias only for top-k selection, and normalized unbiased selected weights.
+ * The kernel is CPU-hosted over
  * the host-mapped tensor memory (like ds4_gpu_add_tensor), so no
  * begin_commands/end_commands are needed to read back the output; the
  * reference below is computed inline in double precision.
@@ -16,44 +16,35 @@
 #include <vector>
 #include <algorithm>
 
-/* Full softmax over one logit row (double precision reference). */
-static void ref_softmax_all(const float *l, uint32_t n, double *p) {
-    double maxv = (double)l[0];
-    for (uint32_t i = 1; i < n; i++) maxv = fmax(maxv, (double)l[i]);
-    if (std::isinf(maxv) && maxv < 0.0) {            /* all -inf: undefined */
-        for (uint32_t i = 0; i < n; i++) p[i] = 1.0 / n;
-        return;
-    }
-    double sum = 0.0;
-    for (uint32_t i = 0; i < n; i++) sum += std::exp((double)l[i] - maxv);
-    for (uint32_t i = 0; i < n; i++) p[i] = std::exp((double)l[i] - maxv) / sum;
+static float ref_router_prob(float logit) {
+    float softplus;
+    if (logit > 20.0f) softplus = logit;
+    else if (logit < -20.0f) softplus = std::exp(logit);
+    else softplus = std::log1p(std::exp(logit));
+    return std::sqrt(softplus);
 }
 
-/* Top-k of a logit row: ids sorted by logit desc, tie -> lower id. */
-static void ref_topk(const float *l, uint32_t n, uint32_t k, int32_t *sel) {
+static void ref_topk(const float *prob, const float *bias,
+                     uint32_t n, uint32_t k, int32_t *sel) {
     std::vector<int32_t> idx(n);
     for (uint32_t i = 0; i < n; i++) idx[i] = (int32_t)i;
     std::stable_sort(idx.begin(), idx.end(), [&](int32_t a, int32_t b) {
-        if (l[a] != l[b]) return l[a] > l[b];
+        const float av = prob[a] + (bias ? bias[a] : 0.0f);
+        const float bv = prob[b] + (bias ? bias[b] : 0.0f);
+        if (av != bv) return av > bv;
         return a < b;
     });
     for (uint32_t i = 0; i < k; i++) sel[i] = idx[i];
 }
 
-/* Reference weights: softmax over the CHOSEN logits * scale; all -inf
- * chosen -> fallback 1/k (no scale), matching the kernel contract. */
-static void ref_weights(const float *l, const int32_t *sel, uint32_t k,
+/* Reference weights: normalize selected router probabilities, then scale. */
+static void ref_weights(const float *prob, const int32_t *sel, uint32_t k,
                         double scale, float *w) {
-    double maxv = (double)l[sel[0]];
-    for (uint32_t i = 1; i < k; i++) maxv = fmax(maxv, (double)l[sel[i]]);
-    if (std::isinf(maxv) && maxv < 0.0) {
-        for (uint32_t i = 0; i < k; i++) w[i] = 1.0f / k;
-        return;
-    }
     double sum = 0.0;
-    for (uint32_t i = 0; i < k; i++) sum += std::exp((double)l[sel[i]] - maxv);
+    for (uint32_t i = 0; i < k; i++) sum += prob[sel[i]];
+    if (sum < 6.103515625e-5) sum = 6.103515625e-5;
     for (uint32_t i = 0; i < k; i++)
-        w[i] = (float)(std::exp((double)l[sel[i]] - maxv) / sum * scale);
+        w[i] = (float)(prob[sel[i]] / sum * scale);
 }
 
 /* Runs one router case end-to-end and compares against the CPU reference.
@@ -82,18 +73,19 @@ static int run_router_case(const float *logits, uint32_t token,
     if (ds4_gpu_tensor_write(l_t, 0, logits, logits_bytes) == 0) { free_tensors(); return 1; }
 
     /* Synthetic model buffer: junk header + f32 bias at bias_offset. */
-    unsigned char *model = nullptr;
-    uint64_t model_size = 0, bias_offset = 0;
+    uint64_t model_size = 16, bias_offset = 0;
     if (has_bias && bias) {
         bias_offset = 16;
         model_size = bias_offset + (uint64_t)n_expert * sizeof(float);
-        model = (unsigned char*)malloc(model_size);
-        if (!model) { free_tensors(); return 1; }
-        std::memset(model, 0xAA, bias_offset);
+    }
+    unsigned char *model = (unsigned char*)malloc(model_size);
+    if (!model) { free_tensors(); return 1; }
+    std::memset(model, 0xAA, model_size);
+    if (has_bias && bias) {
         std::memcpy(model + bias_offset, bias, (uint64_t)n_expert * sizeof(float));
-        if (ds4_gpu_set_model_map(model, model_size) == 0) {
-            free(model); free_tensors(); return 1;
-        }
+    }
+    if (ds4_gpu_set_model_map(model, model_size) == 0) {
+        free(model); free_tensors(); return 1;
     }
 
     int rc = 1;
@@ -118,18 +110,15 @@ static int run_router_case(const float *logits, uint32_t token,
         if (!ok) {
             fprintf(stderr, "router_select[%s]: tensor read failed\n", label);
         } else {
-            /* Biased logit row for the reference. */
-            std::vector<float> l(n_expert);
+            std::vector<float> ref_prob(n_expert);
             for (uint32_t i = 0; i < n_expert; i++)
-                l[i] = logits[i] + (bias ? bias[i] : 0.0f);
+                ref_prob[i] = ref_router_prob(logits[i]);
 
             /* Reference outputs. */
             std::vector<int32_t> ref_sel(n_expert_used);
-            std::vector<double>  ref_p(n_expert);
             std::vector<float>   ref_w(n_expert_used);
-            ref_topk(l.data(), n_expert, n_expert_used, ref_sel.data());
-            ref_softmax_all(l.data(), n_expert, ref_p.data());
-            ref_weights(l.data(), ref_sel.data(), n_expert_used,
+            ref_topk(ref_prob.data(), bias, n_expert, n_expert_used, ref_sel.data());
+            ref_weights(ref_prob.data(), ref_sel.data(), n_expert_used,
                         (double)scale, ref_w.data());
 
             /* Compare (tolerance 1e-4). */
@@ -137,15 +126,15 @@ static int run_router_case(const float *logits, uint32_t token,
             for (uint32_t k = 0; k < n_expert_used && ok; k++)
                 if (got_sel[k] != ref_sel[k]) ok = false;
             for (uint32_t i = 0; i < n_expert && ok; i++)
-                if (!(std::fabsf(got_p[i] - (float)ref_p[i]) <= 1e-4f)) ok = false;
+                if (!(std::fabsf(got_p[i] - ref_prob[i]) <= 1e-4f)) ok = false;
             for (uint32_t k = 0; k < n_expert_used && ok; k++)
                 if (!(std::fabsf(got_w[k] - ref_w[k]) <= 1e-4f)) ok = false;
 
             if (!ok) {
                 fprintf(stderr, "--- router_select[%s] diagnostic (token=%u, bias=%d) ---\n",
                         label, token, has_bias ? 1 : 0);
-                fprintf(stderr, "l: ");
-                for (uint32_t i = 0; i < n_expert; i++) fprintf(stderr, "%.4f ", l[i]);
+                fprintf(stderr, "prob: ");
+                for (uint32_t i = 0; i < n_expert; i++) fprintf(stderr, "%.4f ", ref_prob[i]);
                 fprintf(stderr, "\nselected got:");
                 for (uint32_t k = 0; k < n_expert_used; k++) fprintf(stderr, " %d", got_sel[k]);
                 fprintf(stderr, " want:");
@@ -157,7 +146,7 @@ static int run_router_case(const float *logits, uint32_t token,
                 fprintf(stderr, "\nprobs got:");
                 for (uint32_t i = 0; i < n_expert; i++) fprintf(stderr, " %.6f", got_p[i]);
                 fprintf(stderr, " want:");
-                for (uint32_t i = 0; i < n_expert; i++) fprintf(stderr, " %.6f", (float)ref_p[i]);
+                for (uint32_t i = 0; i < n_expert; i++) fprintf(stderr, " %.6f", ref_prob[i]);
                 fprintf(stderr, "\n");
             }
             rc = ok ? 0 : 1;
@@ -178,34 +167,26 @@ static int test_router_select(void) {
     };
     int rc = 0;
 
-    /* Case 1: no bias.  n_expert_groups=2 exercises the documented group
-     * fallback (still a global top-k in this first verified version). */
+    /* Case 1: no bias. */
     rc |= run_router_case(logits, token, nullptr, scale,
-                          n_expert, n_expert_used, 2, 1, false, false,
-                          "no-bias groups-fallback");
+                          n_expert, n_expert_used, 0, 0, false, false,
+                          "no-bias");
 
-    /* Case 2: hash_mode=true must not crash; output is the global top-k
-     * (hash path is a documented no-op, the engine overrides it later). */
-    rc |= run_router_case(logits, token, nullptr, scale,
-                          n_expert, n_expert_used, 0, 0, false, true,
-                          "hash-mode-ignored");
-
-    /* Case 3: has_bias with a synthetic model buffer registered via
+    /* Case 2: has_bias with a synthetic model buffer registered via
      * ds4_gpu_set_model_map. */
     float bias[n_expert] = { -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f };
     rc |= run_router_case(logits, token, bias, scale,
                           n_expert, n_expert_used, 0, 0, true, false,
                           "has-bias");
 
-    /* Case 4: all -inf logits -> weights fallback 1/n_expert_used and
-     * probs 1/n_expert. */
+    /* Case 3: all -inf logits -> zero probabilities and zero weights. */
     float ninf_logits[n_expert];
     for (uint32_t i = 0; i < n_expert; i++) ninf_logits[i] = -INFINITY;
     rc |= run_router_case(ninf_logits, token, nullptr, scale,
                           n_expert, n_expert_used, 0, 0, false, false,
                           "all-ninf");
 
-    /* Case 5: error path - null pointers must return 0. */
+    /* Case 4: error path - null pointers must return 0. */
     if (ds4_gpu_router_select_tensor(nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0,
                                      0, n_expert, n_expert_used, scale,
                                      0, 0, false, false, nullptr) != 0) {
@@ -216,3 +197,107 @@ static int test_router_select(void) {
     return rc;
 }
 REGISTER_TEST(router_select, test_router_select);
+
+static int test_router_select_batch(void) {
+    const uint32_t n_expert = 8, n_expert_used = 2, n_tokens = 2;
+    const float scale = 1.5f;
+    const float logits[n_tokens * n_expert] = {
+        0.1f, 0.5f, -0.2f, 2.0f, 1.0f, -1.0f, 0.0f, 3.0f,
+        1.2f, -0.4f, 2.5f, 0.3f, 1.8f, 0.1f, -2.0f, 0.7f,
+    };
+    const int32_t tokens[n_tokens] = {3, 7};
+    const float bias[n_expert] = {
+        -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f,
+    };
+    const uint32_t hash_rows = 8;
+    const uint64_t bias_offset = 16;
+    const uint64_t hash_offset = bias_offset + sizeof(bias);
+    const uint64_t model_size = hash_offset +
+        (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
+    std::vector<unsigned char> model(model_size, 0);
+    std::memcpy(model.data() + bias_offset, bias, sizeof(bias));
+    int32_t *hash = (int32_t *)(model.data() + hash_offset);
+    for (uint32_t row = 0; row < hash_rows; row++) {
+        hash[(uint64_t)row * n_expert_used] = (int32_t)((row + 1u) % n_expert);
+        hash[(uint64_t)row * n_expert_used + 1u] = (int32_t)((row + 4u) % n_expert);
+    }
+
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * n_expert_used * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * n_expert_used * sizeof(float));
+    ds4_gpu_tensor *probs = ds4_gpu_tensor_alloc(
+        (uint64_t)n_tokens * n_expert * sizeof(float));
+    ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(sizeof(logits));
+    ds4_gpu_tensor *tokens_t = ds4_gpu_tensor_alloc(sizeof(tokens));
+    auto cleanup = [&]() {
+        if (tokens_t) ds4_gpu_tensor_free(tokens_t);
+        if (logits_t) ds4_gpu_tensor_free(logits_t);
+        if (probs) ds4_gpu_tensor_free(probs);
+        if (weights) ds4_gpu_tensor_free(weights);
+        if (selected) ds4_gpu_tensor_free(selected);
+    };
+    if (!selected || !weights || !probs || !logits_t || !tokens_t ||
+        !ds4_gpu_tensor_write(logits_t, 0, logits, sizeof(logits)) ||
+        !ds4_gpu_tensor_write(tokens_t, 0, tokens, sizeof(tokens))) {
+        cleanup();
+        return 1;
+    }
+
+    auto run_case = [&](bool hash_mode, const char *label) -> int {
+        if (!ds4_gpu_router_select_batch_tensor(
+                selected, weights, probs, model.data(), model.size(),
+                bias_offset, hash_offset, hash_rows, 0, 0,
+                !hash_mode, hash_mode, logits_t, tokens_t,
+                n_expert, n_expert_used, scale, n_tokens)) {
+            fprintf(stderr, "router_select_batch[%s]: kernel returned error\n", label);
+            return 1;
+        }
+        std::vector<int32_t> got_selected((uint64_t)n_tokens * n_expert_used);
+        std::vector<float> got_weights((uint64_t)n_tokens * n_expert_used);
+        std::vector<float> got_probs((uint64_t)n_tokens * n_expert);
+        float got_logits[n_tokens * n_expert];
+        if (!ds4_gpu_tensor_read(selected, 0, got_selected.data(),
+                                 got_selected.size() * sizeof(int32_t)) ||
+            !ds4_gpu_tensor_read(weights, 0, got_weights.data(),
+                                 got_weights.size() * sizeof(float)) ||
+            !ds4_gpu_tensor_read(probs, 0, got_probs.data(),
+                                 got_probs.size() * sizeof(float)) ||
+            !ds4_gpu_tensor_read(logits_t, 0, got_logits, sizeof(got_logits)) ||
+            std::memcmp(got_logits, logits, sizeof(logits)) != 0) {
+            fprintf(stderr, "router_select_batch[%s]: read or immutability failure\n", label);
+            return 1;
+        }
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            float ref_probs[n_expert];
+            int32_t ref_selected[n_expert_used];
+            float expected_weights[n_expert_used];
+            for (uint32_t i = 0; i < n_expert; i++)
+                ref_probs[i] = ref_router_prob(logits[(uint64_t)t * n_expert + i]);
+            if (hash_mode) {
+                std::memcpy(ref_selected,
+                            hash + (uint64_t)tokens[t] * n_expert_used,
+                            sizeof(ref_selected));
+            } else {
+                ref_topk(ref_probs, bias, n_expert, n_expert_used, ref_selected);
+            }
+            ref_weights(ref_probs, ref_selected, n_expert_used, scale, expected_weights);
+            for (uint32_t i = 0; i < n_expert; i++) {
+                if (std::fabs(got_probs[(uint64_t)t * n_expert + i] - ref_probs[i]) > 1e-4f)
+                    return 1;
+            }
+            for (uint32_t i = 0; i < n_expert_used; i++) {
+                if (got_selected[(uint64_t)t * n_expert_used + i] != ref_selected[i] ||
+                    std::fabs(got_weights[(uint64_t)t * n_expert_used + i] - expected_weights[i]) > 1e-4f)
+                    return 1;
+            }
+        }
+        return 0;
+    };
+
+    const int rc = run_case(false, "biased") | run_case(true, "hash");
+    cleanup();
+    return rc;
+}
+
+REGISTER_TEST(router_select_batch, test_router_select_batch);

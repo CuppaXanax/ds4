@@ -3364,34 +3364,70 @@ int ds4_gpu_output_hc_weights_tensor(ds4_gpu_tensor *out,
     return 1;
 }
 
-/* ---- ds4_gpu_router_select_tensor (CPU-hosted) ----
- *
- * MoE router for a single decode token.  Computed on the host over the
- * host-mapped tensor memory (same pattern as ds4_gpu_add_tensor): the
- * router output is tiny (n_expert ~ 256, n_expert_used ~ 6) and produced
- * once per decode step, so a GPU dispatch would only add submit latency
- * without a compute win.  A shader can replace this later without changing
- * the contract.
- *
- * Semantics (matches the engine's layer_hash_router_weights_from_probs):
- *   l[i]      = logits[token*n_expert + i] + (has_bias ? bias[i] : 0)
- *   probs     = softmax(l) over ALL experts                    (per token)
- *   selected  = top n_expert_used of l, sorted by l desc (ties: lower id)
- *   weights   = softmax over the CHOSEN l (exp/sum) * expert_weight_scale
- *   fallback  : if every chosen l is -inf, weights = 1/n_expert_used
- *               (exactly, no scale, per the kernel contract)
- *
- * Simplifications for the first verified version (documented):
- *   - n_expert_groups/n_group_used are ignored: n_expert_groups > 1 still
- *     performs a plain global top-k (no group pre-selection).  The engine
- *     currently passes 0/0 on the DeepSeek path, so this is unused.
- *   - hash_mode is ignored (no crash): the engine overwrites the selection
- *     with the hash-based override right after this call, so the hash path
- *     here is intentionally a no-op; hash_offset/hash_rows are unused.
- *   - probs with all -inf logits uses 1/n_expert per entry (natural
- *     degenerate-case extension of the weights fallback).
- *   - NaN logits are treated as -inf so the top-k stays well-defined.
- */
+static float ds4_router_probability(float logit) {
+    float softplus;
+    if (logit > 20.0f) softplus = logit;
+    else if (logit < -20.0f) softplus = expf(logit);
+    else softplus = log1pf(expf(logit));
+    return sqrtf(softplus);
+}
+
+static int ds4_router_select_row(
+        int32_t       *selected,
+        float         *weights,
+        float         *probs,
+        const float   *logits,
+        const float   *bias,
+        const int32_t *hash,
+        uint32_t       hash_rows,
+        int32_t        token,
+        uint32_t       n_expert,
+        uint32_t       n_expert_used,
+        float          expert_weight_scale,
+        bool           hash_mode) {
+    for (uint32_t i = 0; i < n_expert; i++) {
+        probs[i] = ds4_router_probability(logits[i]);
+    }
+
+    if (hash_mode) {
+        if (!hash || hash_rows == 0) return 0;
+        if (token < 0 || (uint32_t)token >= hash_rows) token = 0;
+        const int32_t *row = hash + (uint64_t)(uint32_t)token * n_expert_used;
+        for (uint32_t i = 0; i < n_expert_used; i++) selected[i] = row[i];
+    } else {
+        for (uint32_t i = 0; i < n_expert_used; i++) selected[i] = -1;
+        for (uint32_t expert = 0; expert < n_expert; expert++) {
+            const float score = probs[expert] + (bias ? bias[expert] : 0.0f);
+            for (uint32_t rank = 0; rank < n_expert_used; rank++) {
+                const int32_t current = selected[rank];
+                const float current_score = current >= 0
+                    ? probs[(uint32_t)current] + (bias ? bias[(uint32_t)current] : 0.0f)
+                    : -INFINITY;
+                if (current < 0 || score > current_score ||
+                    (score == current_score && expert < (uint32_t)current)) {
+                    for (uint32_t tail = n_expert_used - 1; tail > rank; tail--)
+                        selected[tail] = selected[tail - 1];
+                    selected[rank] = (int32_t)expert;
+                    break;
+                }
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_expert_used; i++) {
+        const int32_t expert = selected[i];
+        const float value = expert >= 0 && (uint32_t)expert < n_expert
+            ? probs[(uint32_t)expert] : 0.0f;
+        weights[i] = value;
+        sum += value;
+    }
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t i = 0; i < n_expert_used; i++)
+        weights[i] = weights[i] / sum * expert_weight_scale;
+    return 1;
+}
+
 int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
     ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size,
     uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows,
@@ -3399,9 +3435,9 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
     float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used,
     bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits)
 {
-    (void)hash_offset; (void)hash_rows; (void)n_expert_groups; (void)n_group_used;
-    (void)token; (void)hash_mode;
-    if (!selected || !weights || !probs || !logits || !logits->ptr) return 0;
+    if (n_expert_groups > 1u || n_group_used > 0u) return 0;
+    if (!selected || !weights || !probs || !logits || !model_map ||
+        !selected->ptr || !weights->ptr || !probs->ptr || !logits->ptr) return 0;
     if (n_expert == 0 || n_expert_used == 0 || n_expert_used > n_expert) return 0;
 
     /* Decode supplies one router-logits row. The token ID is only relevant
@@ -3410,67 +3446,25 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
     if ((uint64_t)n_expert_used * sizeof(int32_t) > selected->bytes) return 0;
     if ((uint64_t)n_expert_used * sizeof(float) > weights->bytes) return 0;
     if ((uint64_t)n_expert * sizeof(float) > probs->bytes) return 0;
-    if (has_bias) {
-        if (!model_map || model_size < sizeof(float)) return 0;
+    const float *bias = NULL;
+    const int32_t *hash = NULL;
+    if (has_bias && !hash_mode) {
+        if (model_size < sizeof(float)) return 0;
         if (bias_offset > model_size ||
             (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) return 0;
+        bias = (const float *)((const char *)model_map + bias_offset);
     }
-
-    /* Copy the decode logits row, folding in the bias.  The input tensor is
-     * never mutated (the old batch fallback used to clobber it). */
-    const float *lp = (const float*)logits->ptr;
-    const float *bias = has_bias ? (const float*)((const char*)model_map + bias_offset) : nullptr;
-    std::vector<float> l(n_expert);
-    for (uint32_t i = 0; i < n_expert; i++) {
-        float v = lp[i];
-        if (bias) v += bias[i];
-        l[i] = std::isnan(v) ? -INFINITY : v;
+    if (hash_mode) {
+        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
+        if (hash_offset > model_size || hash_bytes > model_size - hash_offset)
+            return 0;
+        hash = (const int32_t *)((const char *)model_map + hash_offset);
     }
-
-    /* Full softmax over all experts (numerically stable, double acc). */
-    float max_l = l[0];
-    for (uint32_t i = 1; i < n_expert; i++) if (l[i] > max_l) max_l = l[i];
-    float *pp = (float*)probs->ptr;
-    if (std::isinf(max_l) && max_l < 0) {              /* all -inf: undefined */
-        for (uint32_t i = 0; i < n_expert; i++) pp[i] = 1.0f / n_expert;
-    } else {
-        double sum = 0.0;
-        for (uint32_t i = 0; i < n_expert; i++) sum += std::exp((double)l[i] - max_l);
-        for (uint32_t i = 0; i < n_expert; i++)
-            pp[i] = (float)(std::exp((double)l[i] - max_l) / sum);
-    }
-
-    /* Top-k insertion sort by l desc, tie -> lower expert id. */
-    std::vector<int32_t> topk(n_expert_used, -1);
-    for (uint32_t i = 0; i < n_expert; i++) {
-        for (uint32_t j = 0; j < n_expert_used; j++) {
-            if (topk[j] < 0 || l[i] > l[topk[j]] || (l[i] == l[topk[j]] && i < (uint32_t)topk[j])) {
-                for (uint32_t m = n_expert_used - 1; m > j; m--) topk[m] = topk[m - 1];
-                topk[j] = (int32_t)i;
-                break;
-            }
-        }
-    }
-
-    /* Weights: softmax over the chosen logits, scaled. */
-    int32_t *sel = (int32_t*)selected->ptr;
-    float *wp = (float*)weights->ptr;
-    float max_sel = l[topk[0]];
-    for (uint32_t k = 1; k < n_expert_used; k++) if (l[topk[k]] > max_sel) max_sel = l[topk[k]];
-    if (std::isinf(max_sel) && max_sel < 0) {          /* chosen are all -inf */
-        for (uint32_t k = 0; k < n_expert_used; k++) {
-            sel[k] = topk[k];
-            wp[k] = 1.0f / n_expert_used;              /* contract fallback, no scale */
-        }
-    } else {
-        double sum = 0.0;
-        for (uint32_t k = 0; k < n_expert_used; k++) sum += std::exp((double)l[topk[k]] - max_sel);
-        for (uint32_t k = 0; k < n_expert_used; k++) {
-            sel[k] = topk[k];
-            wp[k] = (float)(std::exp((double)l[topk[k]] - max_sel) / sum) * expert_weight_scale;
-        }
-    }
-    return 1;
+    return ds4_router_select_row((int32_t *)selected->ptr, (float *)weights->ptr,
+                                 (float *)probs->ptr, (const float *)logits->ptr,
+                                 bias, hash, hash_rows, (int32_t)token,
+                                 n_expert, n_expert_used, expert_weight_scale,
+                                 hash_mode);
 }
 
 int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
@@ -3479,27 +3473,46 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
     const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens,
     uint32_t ne, uint32_t neu, float ws, uint32_t nt)
 {
-    (void)mm; (void)ms; (void)bo; (void)ho; (void)hr; (void)ng; (void)ngu;
-    (void)hb; (void)hm; (void)tokens; (void)ws;
-    if (!selected || !weights || !probs || !logits) return 0;
+    if (ng > 1u || ngu > 0u) return 0;
+    if (!selected || !weights || !probs || !logits || !tokens || !mm || nt == 0 ||
+        ne == 0 || neu == 0 || neu > ne ||
+        !selected->ptr || !weights->ptr || !probs->ptr ||
+        !logits->ptr || !tokens->ptr) return 0;
+    const uint64_t logits_count = (uint64_t)nt * ne;
+    const uint64_t selected_count = (uint64_t)nt * neu;
+    if (logits_count > UINT64_MAX / sizeof(float) ||
+        selected_count > UINT64_MAX / sizeof(int32_t) ||
+        (uint64_t)nt > UINT64_MAX / sizeof(int32_t)) return 0;
+    if (logits->bytes < logits_count * sizeof(float) ||
+        probs->bytes < logits_count * sizeof(float) ||
+        selected->bytes < selected_count * sizeof(int32_t) ||
+        weights->bytes < selected_count * sizeof(float) ||
+        tokens->bytes < (uint64_t)nt * sizeof(int32_t)) return 0;
+    const float *bias = NULL;
+    const int32_t *hash = NULL;
+    if (hb && !hm) {
+        if (bo > ms || (uint64_t)ne * sizeof(float) > ms - bo) return 0;
+        bias = (const float *)((const char *)mm + bo);
+    }
+    if (hm) {
+        const uint64_t hash_count = (uint64_t)hr * neu;
+        if (hash_count > UINT64_MAX / sizeof(int32_t)) return 0;
+        const uint64_t hash_bytes = hash_count * sizeof(int32_t);
+        if (ho > ms || hash_bytes > ms - ho) return 0;
+        hash = (const int32_t *)((const char *)mm + ho);
+    }
     const float *lp = (const float*)logits->ptr;
-    int *sel = (int*)selected->ptr;
+    const int32_t *token_ids = (const int32_t *)tokens->ptr;
+    int32_t *sel = (int32_t*)selected->ptr;
     float *wp = (float*)weights->ptr;
-    memset(probs->ptr, 0, (uint64_t)nt * ne * sizeof(float));
+    float *pp = (float *)probs->ptr;
     for (uint32_t t = 0; t < nt; t++) {
-        for (uint32_t e = 0; e < neu; e++) {
-            int best = 0; float bv = -1e30f;
-            for (uint32_t i = 0; i < ne; i++) {
-                float v = lp[t * ne + i];
-                if (v > bv) { bv = v; best = i; }
-            }
-            lp = (const float*)logits->ptr + t * ne; /* reset */
-            /* Mark best as used */
-            float *lp_mut = (float*)logits->ptr + t * ne;
-            lp_mut[best] = -1e30f;
-            sel[t * neu + e] = best;
-            wp[t * neu + e] = 1.0f / neu;
-        }
+        if (!ds4_router_select_row(sel + (uint64_t)t * neu,
+                                   wp + (uint64_t)t * neu,
+                                   pp + (uint64_t)t * ne,
+                                   lp + (uint64_t)t * ne,
+                                   bias, hash, hr, token_ids[t], ne, neu, ws, hm))
+            return 0;
     }
     return 1;
 }

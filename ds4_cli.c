@@ -1988,21 +1988,21 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.first_token_test = true;
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD)
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
             c.engine.backend = DS4_BACKEND_METAL;
 #endif
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD)
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
             c.engine.backend = DS4_BACKEND_METAL;
 #endif
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD)
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
             c.engine.backend = DS4_BACKEND_METAL;

@@ -57,16 +57,17 @@ static void ref_weights(const float *l, const int32_t *sel, uint32_t k,
 }
 
 /* Runs one router case end-to-end and compares against the CPU reference.
- * `logits` holds n_tok rows of n_expert floats; `token` selects the row.
+ * Decode supplies one row of n_expert logits; token is the vocabulary token
+ * ID and must not be interpreted as a row offset.
  * `bias` (may be NULL) is stored in a synthetic model buffer registered
  * with ds4_gpu_set_model_map, mimicking the engine's model mmap. */
-static int run_router_case(const float *logits, uint32_t n_tok, uint32_t token,
+static int run_router_case(const float *logits, uint32_t token,
                            const float *bias, float scale,
                            uint32_t n_expert, uint32_t n_expert_used,
                            uint32_t n_expert_groups, uint32_t n_group_used,
                            bool has_bias, bool hash_mode, const char *label)
 {
-    const uint64_t logits_bytes = (uint64_t)n_tok * n_expert * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_expert * sizeof(float);
     ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)n_expert_used * sizeof(int32_t));
     ds4_gpu_tensor *w_t   = ds4_gpu_tensor_alloc((uint64_t)n_expert_used * sizeof(float));
     ds4_gpu_tensor *p_t   = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
@@ -119,9 +120,8 @@ static int run_router_case(const float *logits, uint32_t n_tok, uint32_t token,
         } else {
             /* Biased logit row for the reference. */
             std::vector<float> l(n_expert);
-            const float *lrow = logits + (uint64_t)token * n_expert;
             for (uint32_t i = 0; i < n_expert; i++)
-                l[i] = lrow[i] + (bias ? bias[i] : 0.0f);
+                l[i] = logits[i] + (bias ? bias[i] : 0.0f);
 
             /* Reference outputs. */
             std::vector<int32_t> ref_sel(n_expert_used);
@@ -170,33 +170,30 @@ static int run_router_case(const float *logits, uint32_t n_tok, uint32_t token,
 }
 
 static int test_router_select(void) {
-    const uint32_t n_expert = 8, n_expert_used = 2, n_tok = 2;
+    const uint32_t n_expert = 8, n_expert_used = 2;
+    const uint32_t token = 12345;
     const float scale = 1.5f;
-    /* Two rows so token=1 exercises the row offset; row 0 is filler. */
-    float logits[n_tok * n_expert] = {
-        /* token 0: filler */
-        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-        /* token 1: the real test row */
+    float logits[n_expert] = {
         0.1f, 0.5f, -0.2f, 2.0f, 1.0f, -1.0f, 0.0f, 3.0f,
     };
     int rc = 0;
 
     /* Case 1: no bias.  n_expert_groups=2 exercises the documented group
      * fallback (still a global top-k in this first verified version). */
-    rc |= run_router_case(logits, n_tok, 1, nullptr, scale,
+    rc |= run_router_case(logits, token, nullptr, scale,
                           n_expert, n_expert_used, 2, 1, false, false,
                           "no-bias groups-fallback");
 
     /* Case 2: hash_mode=true must not crash; output is the global top-k
      * (hash path is a documented no-op, the engine overrides it later). */
-    rc |= run_router_case(logits, n_tok, 1, nullptr, scale,
+    rc |= run_router_case(logits, token, nullptr, scale,
                           n_expert, n_expert_used, 0, 0, false, true,
                           "hash-mode-ignored");
 
     /* Case 3: has_bias with a synthetic model buffer registered via
      * ds4_gpu_set_model_map. */
     float bias[n_expert] = { -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f };
-    rc |= run_router_case(logits, n_tok, 1, bias, scale,
+    rc |= run_router_case(logits, token, bias, scale,
                           n_expert, n_expert_used, 0, 0, true, false,
                           "has-bias");
 
@@ -204,7 +201,7 @@ static int test_router_select(void) {
      * probs 1/n_expert. */
     float ninf_logits[n_expert];
     for (uint32_t i = 0; i < n_expert; i++) ninf_logits[i] = -INFINITY;
-    rc |= run_router_case(ninf_logits, 1, 0, nullptr, scale,
+    rc |= run_router_case(ninf_logits, token, nullptr, scale,
                           n_expert, n_expert_used, 0, 0, false, false,
                           "all-ninf");
 

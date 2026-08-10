@@ -317,8 +317,8 @@ static int load_spirv(const std::string &path, std::vector<uint32_t> &out) {
 }
 
 static int create_compute_pipeline(ShaderEntry &entry) {
-    VkDescriptorSetLayoutBinding bindings[3] = {};
-    for (int i = 0; i < 3; i++) {
+    VkDescriptorSetLayoutBinding bindings[6] = {};
+    for (int i = 0; i < 6; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -326,7 +326,7 @@ static int create_compute_pipeline(ShaderEntry &entry) {
     }
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 3; dslci.pBindings = bindings;
+    dslci.bindingCount = 6; dslci.pBindings = bindings;
     VK_CHECK_RAW(vkCreateDescriptorSetLayout(g_vk.device, &dslci, nullptr, &entry.desc_layout));
 
     VkPushConstantRange pr{};
@@ -362,6 +362,8 @@ static int load_all_shaders(void) {
         {"rms_norm_weight_rows", 12},
         {"head_rms_norm", 16},  /* n_tok + n_head + head_dim + eps */
         {"rope_tail", 44},     /* 11 x uint32 */
+        {"hc_weighted_sum", 16}, /* n_embd, n_hc, rows, reserved */
+        {"hc_expand", 36}, /* shape, strides, add/split/half flags */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -3029,18 +3031,117 @@ static void ds4_hc_weighted_sum(float *out, const float *x, const float *w,
     }
 }
 
+static int dispatch_hc_weighted_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *rhc,
+    const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
+    if (!out || !rhc || !weights || n_embd == 0 || n_hc == 0 || rows == 0 ||
+        rows > 65535u) return 0;
+    auto si = g_vk.shader_map.find("hc_weighted_sum");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer obuf, rbuf, wbuf; VkDeviceSize ooff, roff, woff;
+    if (!find_tensor_buffer(out, obuf, ooff) ||
+        !find_tensor_buffer(rhc, rbuf, roff) ||
+        !find_tensor_buffer(weights, wbuf, woff)) return 0;
+    const VkDeviceSize out_bytes = (VkDeviceSize)rows * n_embd * sizeof(float);
+    const VkDeviceSize residual_bytes = (VkDeviceSize)rows * n_hc * n_embd * sizeof(float);
+    const VkDeviceSize weight_bytes = (VkDeviceSize)rows * n_hc * sizeof(float);
+    VkDescriptorBufferInfo buffers[3] = {
+        {obuf, ooff, out_bytes}, {rbuf, roff, residual_bytes}, {wbuf, woff, weight_bytes}
+    };
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 3, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n_embd, n_hc, n_rows, reserved; } push = {n_embd, n_hc, rows, 0};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, (n_embd + 255u) / 256u, rows, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
+}
+
+static int dispatch_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+    const ds4_gpu_tensor *add, const ds4_gpu_tensor *residual,
+    const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
+    uint32_t n_embd, uint32_t n_hc, uint32_t rows, bool split_layout,
+    bool block_is_half, bool add_is_half) {
+    if (!out || !block || !residual || !post || !comb ||
+        n_embd == 0 || n_hc == 0 || rows == 0 ||
+        (block_is_half && (n_embd & 1u) != 0) ||
+        (add_is_half && (n_embd & 1u) != 0) ||
+        n_hc > UINT32_MAX / n_hc ||
+        2ull * n_hc + (uint64_t)n_hc * n_hc > UINT32_MAX ||
+        rows > 65535u / n_hc) return 0;
+    auto si = g_vk.shader_map.find("hc_expand");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer obuf, bbuf, abuf, rbuf, pbuf, cbuf;
+    VkDeviceSize ooff, boff, aoff, roff, poff, coff;
+    if (!find_tensor_buffer(out, obuf, ooff) ||
+        !find_tensor_buffer(block, bbuf, boff) ||
+        !find_tensor_buffer(residual, rbuf, roff) ||
+        !find_tensor_buffer(post, pbuf, poff) ||
+        !find_tensor_buffer(comb, cbuf, coff)) return 0;
+    if (add) {
+        if (!find_tensor_buffer(add, abuf, aoff)) return 0;
+    } else {
+        abuf = bbuf; aoff = boff;
+    }
+    const uint64_t block_elem = block_is_half ? sizeof(uint16_t) : sizeof(float);
+    const uint64_t add_elem = add_is_half ? sizeof(uint16_t) : sizeof(float);
+    const uint32_t post_stride = split_layout ?
+        (uint32_t)(2ull * n_hc + (uint64_t)n_hc * n_hc) : n_hc;
+    const uint32_t comb_stride = post_stride;
+    VkDescriptorBufferInfo buffers[6] = {
+        {obuf, ooff, (VkDeviceSize)rows * n_hc * n_embd * sizeof(float)},
+        {bbuf, boff, (VkDeviceSize)rows * n_embd * block_elem},
+        {abuf, aoff, (VkDeviceSize)rows * n_embd * add_elem},
+        {rbuf, roff, (VkDeviceSize)rows * n_hc * n_embd * sizeof(float)},
+        {pbuf, poff, (VkDeviceSize)rows * post_stride * sizeof(float)},
+        {cbuf, coff, (VkDeviceSize)rows * comb_stride * sizeof(float)},
+    };
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 6, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct {
+        uint32_t n_embd, n_hc, n_rows, post_stride, comb_stride;
+        uint32_t has_add, has_add2, split_layout, block_is_half;
+    } push = {n_embd, n_hc, rows, post_stride, comb_stride,
+              add ? 1u : 0u, add && add_is_half ? 1u : 0u,
+              split_layout ? 1u : 0u, block_is_half ? 1u : 0u};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, (n_embd + 255u) / 256u, rows * n_hc, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
+}
+
 int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rhc,
     const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc)
 {
-    if (!out || !rhc || !split) return 0;
-    const float *sp = (const float*)split->ptr;
-    const float *rp = (const float*)rhc->ptr;
-    float *op = (float*)out->ptr;
-    memset(op, 0, n_embd * sizeof(float));
-    for (uint32_t h = 0; h < n_hc; h++)
-        for (uint32_t i = 0; i < n_embd; i++)
-            op[i] += rp[h * n_embd + i] * sp[h];
-    return 1;
+    if (!out || !rhc || !split || n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t hc_row = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t weight_row = (uint64_t)n_hc * sizeof(float);
+    uint64_t rows = std::min(out->bytes / ((uint64_t)n_embd * sizeof(float)),
+                             rhc->bytes / hc_row);
+    rows = std::min(rows, split->bytes / weight_row);
+    return rows > UINT32_MAX ? 0 : dispatch_hc_weighted_sum(out, rhc, split,
+                                                             n_embd, n_hc, (uint32_t)rows);
 }
 
 int ds4_gpu_hc_split_weighted_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *split,
@@ -3079,7 +3180,7 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
     uint32_t n_embd, uint32_t n_hc)
 {
-    if (!out_hc || !block_out || !residual_hc || !split) return 0;
+    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) return 0;
     const uint64_t hc_values = (uint64_t)n_hc * n_embd;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     if (hc_values == 0 || mix_hc == 0) return 0;
@@ -3087,26 +3188,8 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     rows = std::min(rows, block_out->bytes / ((uint64_t)n_embd * sizeof(float)));
     rows = std::min(rows, residual_hc->bytes / (hc_values * sizeof(float)));
     rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
-    if (rows == 0) return 0;
-    for (uint64_t row = 0; row < rows; row++) {
-        float *o = (float *)out_hc->ptr + row * hc_values;
-        const float *bo = (const float *)block_out->ptr + row * n_embd;
-        const float *rh = (const float *)residual_hc->ptr + row * hc_values;
-        const float *sp = (const float *)split->ptr + row * mix_hc;
-        const float *post = sp + n_hc;
-        const float *comb = post + n_hc;
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            for (uint32_t i = 0; i < n_embd; i++) {
-                float acc = post[dst] * bo[i];
-                for (uint32_t src = 0; src < n_hc; src++) {
-                    acc += comb[dst + src * n_hc] *
-                           rh[(uint64_t)src * n_embd + i];
-                }
-                o[(uint64_t)dst * n_embd + i] = acc;
-            }
-        }
-    }
-    return 1;
+    return rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out, nullptr,
+        residual_hc, split, split, n_embd, n_hc, (uint32_t)rows, true, false, false);
 }
 
 int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc,
@@ -3114,7 +3197,8 @@ int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc,
     const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
     uint32_t n_embd, uint32_t n_hc)
 {
-    if (!out_hc || !block_out || !block_add || !residual_hc || !split) return 0;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !split ||
+        n_embd == 0 || n_hc == 0) return 0;
     const uint64_t hc_values = (uint64_t)n_hc * n_embd;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
     if (hc_values == 0 || mix_hc == 0) return 0;
@@ -3126,27 +3210,8 @@ int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc,
     rows = std::min(rows, block_add->bytes / embd_row_bytes);
     rows = std::min(rows, residual_hc->bytes / hc_row_bytes);
     rows = std::min(rows, split->bytes / split_row_bytes);
-    if (rows == 0) return 0;
-
-    for (uint64_t row = 0; row < rows; row++) {
-        float *out = (float *)out_hc->ptr + row * hc_values;
-        const float *block = (const float *)block_out->ptr + row * n_embd;
-        const float *add = (const float *)block_add->ptr + row * n_embd;
-        const float *residual = (const float *)residual_hc->ptr + row * hc_values;
-        const float *post = (const float *)split->ptr + row * mix_hc + n_hc;
-        const float *comb = post + n_hc;
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            for (uint32_t i = 0; i < n_embd; i++) {
-                float acc = post[dst] * (block[i] + add[i]);
-                for (uint32_t src = 0; src < n_hc; src++) {
-                    acc += comb[dst + src * n_hc] *
-                           residual[(uint64_t)src * n_embd + i];
-                }
-                out[(uint64_t)dst * n_embd + i] = acc;
-            }
-        }
-    }
-    return 1;
+    return rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out, block_add,
+        residual_hc, split, split, n_embd, n_hc, (uint32_t)rows, true, false, false);
 }
 
 /* ---- HC expand (single-token) ----
@@ -3162,28 +3227,19 @@ int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc,
     const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
     uint32_t n_embd, uint32_t n_hc)
 {
-    if (!out_hc || !block_out || !residual_hc || !post || !comb) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > out_hc->bytes) return 0;
-    if ((uint64_t)n_embd * sizeof(float) > block_out->bytes) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > residual_hc->bytes) return 0;
-    if ((uint64_t)n_hc * sizeof(float) > post->bytes) return 0;
-    if ((uint64_t)n_hc * n_hc * sizeof(float) > comb->bytes) return 0;
-
-    const float *bo = (const float *)block_out->ptr;
-    const float *rh = (const float *)residual_hc->ptr;
-    const float *po = (const float *)post->ptr;
-    const float *co = (const float *)comb->ptr;
-    float *o = (float *)out_hc->ptr;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        const float post_w = po[dst];
-        for (uint32_t d = 0; d < n_embd; d++) {
-            float acc = bo[d] * post_w;
-            for (uint32_t src = 0; src < n_hc; src++)
-                acc += co[(size_t)dst + (size_t)src * n_hc] * rh[(uint64_t)src * n_embd + d];
-            o[(uint64_t)dst * n_embd + d] = acc;
-        }
-    }
-    return 1;
+    if (!out_hc || !block_out || !residual_hc || !post || !comb ||
+        n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t out_row = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t block_row = (uint64_t)n_embd * sizeof(float);
+    const uint64_t residual_row = out_row;
+    const uint64_t post_row = (uint64_t)n_hc * sizeof(float);
+    const uint64_t comb_row = (uint64_t)n_hc * n_hc * sizeof(float);
+    uint64_t rows = std::min(out_hc->bytes / out_row, block_out->bytes / block_row);
+    rows = std::min(rows, residual_hc->bytes / residual_row);
+    rows = std::min(rows, post->bytes / post_row);
+    rows = std::min(rows, comb->bytes / comb_row);
+    return rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out, nullptr,
+        residual_hc, post, comb, n_embd, n_hc, (uint32_t)rows, false, false, false);
 }
 
 /* ---- Fused Q8_0 matmul + HC expand (host-side) ----
@@ -3334,30 +3390,19 @@ int ds4_gpu_hc_expand_add_tensor(ds4_gpu_tensor *out_hc,
     const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post,
     const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc)
 {
-    if (!out_hc || !block_out || !block_add || !residual_hc || !post || !comb) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > out_hc->bytes) return 0;
-    if ((uint64_t)n_embd * sizeof(float) > block_out->bytes) return 0;
-    if ((uint64_t)n_embd * sizeof(float) > block_add->bytes) return 0;
-    if ((uint64_t)n_hc * n_embd * sizeof(float) > residual_hc->bytes) return 0;
-    if ((uint64_t)n_hc * sizeof(float) > post->bytes) return 0;
-    if ((uint64_t)n_hc * n_hc * sizeof(float) > comb->bytes) return 0;
-
-    const float *bo = (const float *)block_out->ptr;
-    const float *ba = (const float *)block_add->ptr;
-    const float *rh = (const float *)residual_hc->ptr;
-    const float *po = (const float *)post->ptr;
-    const float *co = (const float *)comb->ptr;
-    float *o = (float *)out_hc->ptr;
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        const float post_w = po[dst];
-        for (uint32_t d = 0; d < n_embd; d++) {
-            float acc = (bo[d] + ba[d]) * post_w;
-            for (uint32_t src = 0; src < n_hc; src++)
-                acc += co[(size_t)dst + (size_t)src * n_hc] * rh[(uint64_t)src * n_embd + d];
-            o[(uint64_t)dst * n_embd + d] = acc;
-        }
-    }
-    return 1;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !post || !comb ||
+        n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t out_row = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t block_row = (uint64_t)n_embd * sizeof(float);
+    const uint64_t post_row = (uint64_t)n_hc * sizeof(float);
+    const uint64_t comb_row = (uint64_t)n_hc * n_hc * sizeof(float);
+    uint64_t rows = std::min(out_hc->bytes / out_row, block_out->bytes / block_row);
+    rows = std::min(rows, block_add->bytes / block_row);
+    rows = std::min(rows, residual_hc->bytes / out_row);
+    rows = std::min(rows, post->bytes / post_row);
+    rows = std::min(rows, comb->bytes / comb_row);
+    return rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out, block_add,
+        residual_hc, post, comb, n_embd, n_hc, (uint32_t)rows, false, false, false);
 }
 
 /* ---- HC expand-split, f16 block (batch fast path) ----
@@ -3380,26 +3425,8 @@ int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
     rows = std::min(rows, block_out_h->bytes / half_bytes);
     rows = std::min(rows, residual_hc->bytes / hc_bytes);
     rows = std::min(rows, split->bytes / split_bytes);
-    if (rows == 0) return 0;
-    for (uint64_t row = 0; row < rows; row++) {
-        float *o = (float *)out_hc->ptr + row * n_hc * n_embd;
-        const uint16_t *bo = (const uint16_t *)block_out_h->ptr + row * n_embd;
-        const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
-        const float *sp = (const float *)split->ptr + row * mix_hc;
-        const float *post = sp + n_hc;
-        const float *comb = post + n_hc;
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            for (uint32_t i = 0; i < n_embd; i++) {
-                float acc = post[dst] * ds4_half_to_float(bo[i]);
-                for (uint32_t src = 0; src < n_hc; src++) {
-                    acc += comb[dst + src * n_hc] *
-                           rh[(uint64_t)src * n_embd + i];
-                }
-                o[(uint64_t)dst * n_embd + i] = acc;
-            }
-        }
-    }
-    return 1;
+    return rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out_h, nullptr,
+        residual_hc, split, split, n_embd, n_hc, (uint32_t)rows, true, true, false);
 }
 
 /* ---- HC expand-add-split, f16 add block (batch fast path) ----
@@ -3458,30 +3485,14 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
                     (unsigned long long)split->bytes);
         return 0;
     }
-    for (uint64_t row = 0; row < rows; row++) {
-        float *o = (float *)out_hc->ptr + row * n_hc * n_embd;
-        const float *bo = (const float *)block_out->ptr + row * n_embd;
-        const uint16_t *ba = (const uint16_t *)block_add_h->ptr + row * n_embd;
-        const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
-        const float *sp = (const float *)split->ptr + row * mix_hc;
-        const float *post = sp + n_hc;
-        const float *comb = post + n_hc;
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            for (uint32_t i = 0; i < n_embd; i++) {
-                float acc = post[dst] * (bo[i] + ds4_half_to_float(ba[i]));
-                for (uint32_t src = 0; src < n_hc; src++) {
-                    acc += comb[dst + src * n_hc] *
-                           rh[(uint64_t)src * n_embd + i];
-                }
-                o[(uint64_t)dst * n_embd + i] = acc;
-            }
-        }
-    }
+    int result = rows > UINT32_MAX ? 0 : dispatch_hc_expand(out_hc, block_out,
+        block_add_h, residual_hc, split, split, n_embd, n_hc, (uint32_t)rows,
+        true, false, true);
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr,
                 "ds4: [dbg] hc_expand_add_split_half_add complete rows=%llu\n",
                 (unsigned long long)rows);
-    return 1;
+    return result;
 }
 
 /* ---- HC weighted sum (single-token) ----
@@ -3497,9 +3508,7 @@ int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out,
     if ((uint64_t)n_embd * sizeof(float) > out->bytes) return 0;
     if ((uint64_t)n_hc * n_embd * sizeof(float) > residual_hc->bytes) return 0;
     if ((uint64_t)n_hc * sizeof(float) > weights->bytes) return 0;
-    ds4_hc_weighted_sum((float *)out->ptr, (const float *)residual_hc->ptr,
-                        (const float *)weights->ptr, n_embd, n_hc);
-    return 1;
+    return dispatch_hc_weighted_sum(out, residual_hc, weights, n_embd, n_hc, 1);
 }
 
 /* ---- HC split + weighted sum + RMSNorm (fused, single-token) ----

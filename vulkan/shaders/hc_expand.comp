@@ -1,0 +1,61 @@
+#version 460 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer OutBlock { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer BlockBlock { uint block_val[]; };
+layout(set = 0, binding = 2) readonly buffer AddBlock { uint add_val[]; };
+layout(set = 0, binding = 3) readonly buffer ResidualBlock { float residual_val[]; };
+layout(set = 0, binding = 4) readonly buffer PostBlock { float post_val[]; };
+layout(set = 0, binding = 5) readonly buffer CombBlock { float comb_val[]; };
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint n_hc;
+    uint n_rows;
+    uint post_stride;
+    uint comb_stride;
+    uint has_add;
+    uint has_add2;
+    uint split_layout;
+    uint block_is_half;
+} pc;
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint tmp = gl_GlobalInvocationID.y;
+    uint row = tmp / pc.n_hc;
+    uint dst = tmp - row * pc.n_hc;
+    if (d >= pc.n_embd || row >= pc.n_rows || dst >= pc.n_hc) return;
+
+    uint block_index = row * pc.n_embd + d;
+    float block;
+    if (pc.block_is_half != 0u) {
+        vec2 pair = unpackHalf2x16(block_val[block_index >> 1u]);
+        block = (block_index & 1u) == 0u ? pair.x : pair.y;
+    } else {
+        block = uintBitsToFloat(block_val[block_index]);
+    }
+    if (pc.has_add != 0u) {
+        if (pc.has_add2 != 0u) {
+            vec2 pair = unpackHalf2x16(add_val[block_index >> 1u]);
+            block += (block_index & 1u) == 0u ? pair.x : pair.y;
+        } else {
+            block += uintBitsToFloat(add_val[block_index]);
+        }
+    }
+
+    uint post_index = row * pc.post_stride + dst;
+    uint comb_base = row * pc.comb_stride;
+    if (pc.split_layout != 0u) {
+        post_index += pc.n_hc;
+        comb_base += 2u * pc.n_hc;
+    }
+
+    float acc = block * post_val[post_index];
+    uint residual_base = row * pc.n_hc * pc.n_embd + d;
+    for (uint src = 0; src < pc.n_hc; ++src)
+        acc += comb_val[comb_base + dst + src * pc.n_hc] *
+               residual_val[residual_base + src * pc.n_embd];
+    out_val[row * pc.n_hc * pc.n_embd + dst * pc.n_embd + d] = acc;
+}

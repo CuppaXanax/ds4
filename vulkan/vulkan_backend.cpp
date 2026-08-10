@@ -4826,7 +4826,11 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        bool                    state_already_stored) {
+        bool                    state_already_stored,
+        bool                    decode_one_token,
+        bool                    defer_finalize) {
+    (void)decode_one_token;
+    (void)defer_finalize;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -5296,6 +5300,58 @@ extern "C" {
 extern "C" {
 #include "_stubs.gen.cpp"
 }
+
+extern "C" int ds4_gpu_build_derived_artifacts(
+        const void *model_map, uint64_t model_size, const char *model_path) {
+    (void)model_map;
+    (void)model_size;
+    (void)model_path;
+    return 0;
+}
+
+extern "C" int ds4_gpu_model_range_replaced(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    (void)model_map;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_matmul_f16_rms_fold_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok,
+        float                 norm_eps) {
+    (void)out;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)in_dim;
+    (void)out_dim;
+    (void)x;
+    (void)n_tok;
+    (void)norm_eps;
+    return 0;
+}
+
+extern "C" int ds4_gpu_decode_graphs_supported(void) { return 0; }
+extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
+    (void)key;
+    return -1;
+}
+extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
+    (void)key;
+    return -1;
+}
+extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
+    (void)key;
+}
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
 
 /* =====================================================================
  * Multi-GPU plumbing compatibility shims (single logical device).

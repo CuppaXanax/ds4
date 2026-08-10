@@ -18,7 +18,9 @@ int main(void) {
         return 1;
     }
     int pass = 0, fail = 0;
+    const char *filter = getenv("DS4_TEST_FILTER");
     for (auto &t : kernel_test_registry()) {
+        if (filter && !strstr(t.name, filter)) continue;
         int r = t.fn();
         printf("[%s] %s\n", r == 0 ? "PASS" : "FAIL", t.name);
         fflush(stdout);

@@ -4675,6 +4675,15 @@ static bool ds4gk_routed_common(
         ok = ds4gk_routed_dispatch("quantize_mid", pc,
             mid_quantize_buffers,
             mid_blocks, n_tokens * n_expert, 1);
+        if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            uint32_t words[3] = {};
+            float scale = 0.0f;
+            if (ds4_gpu_tensor_read(&q8, 0, words, sizeof(words))) {
+                memcpy(&scale, &words[0], sizeof(scale));
+                fprintf(stderr, "ds4: [dbg] routed mid_q d=%g q=%08x/%08x\n",
+                        (double)scale, words[1], words[2]);
+            }
+        }
     }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
@@ -4683,6 +4692,11 @@ static bool ds4gk_routed_common(
         ok = ds4gk_routed_dispatch("down", pc,
             down_buffers,
             out_dim, n_tokens, n_expert);
+        if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            float value = 0.0f;
+            if (ds4_gpu_tensor_read(experts, 0, &value, sizeof(value)))
+                fprintf(stderr, "ds4: [dbg] routed down[0]=%g\n", (double)value);
+        }
     }
     if (ok) {
         pc.mode = 4; pc.add_enabled = add_in ? 1u : 0u;

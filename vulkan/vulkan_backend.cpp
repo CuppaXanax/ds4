@@ -1123,49 +1123,6 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
  * ========================================================================= */
 
-extern "C" {
-static float ds4_half_to_float(uint16_t h);
-}
-
-static void ds4_q8_exact_quantize(const float *x, int8_t *xq,
-                                  float *scale, uint64_t n) {
-    const uint64_t blocks = (n + 31u) / 32u;
-    for (uint64_t b = 0; b < blocks; b++) {
-        const uint64_t i0 = b * 32u;
-        const uint64_t count = n - i0 < 32u ? n - i0 : 32u;
-        float amax = 0.0f;
-        for (uint64_t i = 0; i < count; i++) amax = fmaxf(amax, fabsf(x[i0 + i]));
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        scale[b] = d;
-        for (uint64_t i = 0; i < count; i++) {
-            int value = (int)lrintf(x[i0 + i] * id);
-            if (value > 127) value = 127;
-            if (value < -128) value = -128;
-            xq[i0 + i] = (int8_t)value;
-        }
-        for (uint64_t i = count; i < 32u; i++) xq[i0 + i] = 0;
-    }
-}
-
-static float ds4_q8_exact_dot(const uint8_t *row, const int8_t *xq,
-                              const float *xscale, uint64_t in_dim,
-                              uint64_t blocks) {
-    float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
-        const int8_t *weights = (const int8_t *)(row + b * 34u + 2u);
-        const uint64_t i0 = b * 32u;
-        const uint64_t count = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        int32_t dot = 0;
-        for (uint64_t i = 0; i < count; i++)
-            dot += (int32_t)weights[i] * (int32_t)xq[i0 + i];
-        acc += ds4_half_to_float(scale_bits) * xscale[b] * (float)dot;
-    }
-    return acc;
-}
-
 /* ---- matmul_q8_0 dispatch (host-side fallback for huge output rows) ---- */
 
 int ds4_gpu_matmul_q8_0_tensor(
@@ -1180,41 +1137,6 @@ int ds4_gpu_matmul_q8_0_tensor(
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
     if (!out || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-
-    /* Wide model projections are sensitive to Q8 activation rounding. Large
-     * batched projections also create watchdog-scale single dispatches on
-     * RADV (Flash prefill Q_B is 32 * 32768 output rows). Keep both on the
-     * exact host reference until the GPU path is split into bounded launches
-     * that consume a shared, prequantized activation. */
-    const bool large_batch =
-        n_tok <= UINT64_MAX / out_dim && n_tok * out_dim > 262144u;
-    if ((in_dim == 4096u && out_dim <= 4096u) || large_batch) {
-        auto &commands = get_cmd_ctx();
-        if (commands.recording && commands.command_count != 0 && !submit_and_wait()) return 0;
-        if (!model_map || !out->ptr || !x->ptr) return 0;
-        const uint64_t blocks = (in_dim + 31u) / 32u;
-        const uint64_t row_bytes = blocks * 34u;
-        if (weight_offset > model_size ||
-            out_dim > (model_size - weight_offset) / row_bytes ||
-            n_tok > UINT64_MAX / in_dim ||
-            in_dim * n_tok * sizeof(float) > x->bytes ||
-            n_tok > UINT64_MAX / out_dim ||
-            out_dim * n_tok * sizeof(float) > out->bytes) return 0;
-        const uint8_t *base = (const uint8_t *)model_map + weight_offset;
-        const float *xp = (const float *)x->ptr;
-        float *op = (float *)out->ptr;
-        std::vector<int8_t> xq(blocks * 32u);
-        std::vector<float> xscale(blocks);
-        for (uint64_t t = 0; t < n_tok; t++) {
-            ds4_q8_exact_quantize(xp + t * in_dim,
-                                  xq.data(), xscale.data(), in_dim);
-            for (uint64_t o = 0; o < out_dim; o++) {
-                op[t * out_dim + o] = ds4_q8_exact_dot(
-                    base + o * row_bytes, xq.data(), xscale.data(), in_dim, blocks);
-            }
-        }
-        return 1;
-    }
 
     /* The GPU dispatch is pathological for very wide output rows (the vocab
      * head, out_dim = 129280): RADV stalls for minutes and blocks the next

@@ -50,8 +50,8 @@ DS4_VULKAN_DEBUG=1 ./run-test.sh ...       # verbose begin/end/submit trace
 
 1. ✅ `ds4_gpu_matmul_f16_tensor` — f16 element size + reduction fixed,
    verified by `vulkan/tests/tests/t_matmul_f16.cpp`.
-2. ✅ `ds4_gpu_router_select_tensor` (decode) — host-side top-k + softmax,
-   verified by `vulkan/tests/tests/t_router_select.cpp`.
+2. ✅ `ds4_gpu_router_select_tensor` (decode) — canonical Vulkan top-k,
+   probabilities, and weights, verified by `vulkan/tests/tests/t_router_select.cpp`.
 3. ✅ `ds4_gpu_routed_moe_one_tensor` (decode) — MoE FFN host-side con
    dequant Q8_0/Q2_K/IQ2_XXS, verified by
    `vulkan/tests/tests/t_routed_moe_one.cpp` (interno-coerente col reference

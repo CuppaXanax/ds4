@@ -386,6 +386,7 @@ static int load_all_shaders(void) {
         {"hc_expand", 36, 6}, /* shape, strides, add/split/half flags */
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
         {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
+        {"router_select", 24, 7}, /* n_tokens, hash_rows, token, bias/hash, scale */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -831,7 +832,8 @@ static void clear_weight_cache(void) {
 }
 
 static void set_model_map_identity(const void *model_map, uint64_t model_size) {
-    if (g_vk.model_map != model_map) clear_weight_cache();
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        clear_weight_cache();
     g_vk.model_map = model_map;
     g_vk.model_size = model_size;
 }
@@ -3509,68 +3511,57 @@ int ds4_gpu_output_hc_weights_tensor(ds4_gpu_tensor *out,
                                       n_hc, (uint32_t)n_tokens, eps);
 }
 
-static float ds4_router_probability(float logit) {
-    float softplus;
-    if (logit > 20.0f) softplus = logit;
-    else if (logit < -20.0f) softplus = expf(logit);
-    else softplus = log1pf(expf(logit));
-    return sqrtf(softplus);
-}
-
-static int ds4_router_select_row(
-        int32_t       *selected,
-        float         *weights,
-        float         *probs,
-        const float   *logits,
-        const float   *bias,
-        const int32_t *hash,
-        uint32_t       hash_rows,
-        int32_t        token,
-        uint32_t       n_expert,
-        uint32_t       n_expert_used,
-        float          expert_weight_scale,
-        bool           hash_mode) {
-    for (uint32_t i = 0; i < n_expert; i++) {
-        probs[i] = ds4_router_probability(logits[i]);
+static int dispatch_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+    ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens,
+    VkBuffer bias_buf, VkDeviceSize bias_off, VkDeviceSize bias_bytes,
+    VkBuffer hash_buf, VkDeviceSize hash_off, VkDeviceSize hash_bytes,
+    uint32_t hash_rows, uint32_t token, bool has_bias, bool hash_mode,
+    float scale, uint32_t n_tokens) {
+    auto si = g_vk.shader_map.find("router_select");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer selected_buf, weights_buf, probs_buf, logits_buf, tokens_buf;
+    VkDeviceSize selected_off, weights_off, probs_off, logits_off, tokens_off;
+    if (!find_tensor_buffer(selected, selected_buf, selected_off) ||
+        !find_tensor_buffer(weights, weights_buf, weights_off) ||
+        !find_tensor_buffer(probs, probs_buf, probs_off) ||
+        !find_tensor_buffer(logits, logits_buf, logits_off) ||
+        !find_tensor_buffer(tokens, tokens_buf, tokens_off)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    for (auto &[base, entry] : g_vk.weight_cache) {
+        (void)base;
+        if (entry.buffer == bias_buf || entry.buffer == hash_buf)
+            entry.last_gen = g_vk.cmd_gen;
     }
-
-    if (hash_mode) {
-        if (!hash || hash_rows == 0) return 0;
-        if (token < 0 || (uint32_t)token >= hash_rows) token = 0;
-        const int32_t *row = hash + (uint64_t)(uint32_t)token * n_expert_used;
-        for (uint32_t i = 0; i < n_expert_used; i++) selected[i] = row[i];
-    } else {
-        for (uint32_t i = 0; i < n_expert_used; i++) selected[i] = -1;
-        for (uint32_t expert = 0; expert < n_expert; expert++) {
-            const float score = probs[expert] + (bias ? bias[expert] : 0.0f);
-            for (uint32_t rank = 0; rank < n_expert_used; rank++) {
-                const int32_t current = selected[rank];
-                const float current_score = current >= 0
-                    ? probs[(uint32_t)current] + (bias ? bias[(uint32_t)current] : 0.0f)
-                    : -INFINITY;
-                if (current < 0 || score > current_score ||
-                    (score == current_score && expert < (uint32_t)current)) {
-                    for (uint32_t tail = n_expert_used - 1; tail > rank; tail--)
-                        selected[tail] = selected[tail - 1];
-                    selected[rank] = (int32_t)expert;
-                    break;
-                }
-            }
-        }
-    }
-
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < n_expert_used; i++) {
-        const int32_t expert = selected[i];
-        const float value = expert >= 0 && (uint32_t)expert < n_expert
-            ? probs[(uint32_t)expert] : 0.0f;
-        weights[i] = value;
-        sum += value;
-    }
-    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
-    for (uint32_t i = 0; i < n_expert_used; i++)
-        weights[i] = weights[i] / sum * expert_weight_scale;
-    return 1;
+    const VkDeviceSize dummy_bytes = (VkDeviceSize)logits->bytes;
+    VkDescriptorBufferInfo buffers[7] = {
+        {selected_buf, selected_off, (VkDeviceSize)selected->bytes},
+        {weights_buf, weights_off, (VkDeviceSize)weights->bytes},
+        {probs_buf, probs_off, (VkDeviceSize)probs->bytes},
+        {logits_buf, logits_off, dummy_bytes},
+        {has_bias ? bias_buf : logits_buf, has_bias ? bias_off : logits_off,
+         has_bias ? bias_bytes : dummy_bytes},
+        {hash_mode ? hash_buf : logits_buf, hash_mode ? hash_off : logits_off,
+         hash_mode ? hash_bytes : dummy_bytes},
+        {tokens_buf, tokens_off, (VkDeviceSize)tokens->bytes},
+    };
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 7, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n_tokens, hash_rows, token, has_bias, hash_mode; float scale; } push = {
+        n_tokens, hash_rows, token, has_bias ? 1u : 0u, hash_mode ? 1u : 0u, scale};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, n_tokens, 1, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
@@ -3580,36 +3571,39 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
     float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used,
     bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits)
 {
-    if (n_expert_groups > 1u || n_group_used > 0u) return 0;
+    if (n_expert != 256u || n_expert_used != 6u ||
+        fabsf(expert_weight_scale - 1.5f) > 1.0e-6f ||
+        n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (!selected || !weights || !probs || !logits || !model_map ||
         !selected->ptr || !weights->ptr || !probs->ptr || !logits->ptr) return 0;
-    if (n_expert == 0 || n_expert_used == 0 || n_expert_used > n_expert) return 0;
-
-    /* Decode supplies one router-logits row. The token ID is only relevant
-     * to hash routing, which the engine applies immediately after this call. */
-    if ((uint64_t)n_expert * sizeof(float) > logits->bytes) return 0;
-    if ((uint64_t)n_expert_used * sizeof(int32_t) > selected->bytes) return 0;
-    if ((uint64_t)n_expert_used * sizeof(float) > weights->bytes) return 0;
-    if ((uint64_t)n_expert * sizeof(float) > probs->bytes) return 0;
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
-    if (has_bias && !hash_mode) {
-        if (model_size < sizeof(float)) return 0;
-        if (bias_offset > model_size ||
-            (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) return 0;
-        bias = (const float *)((const char *)model_map + bias_offset);
+    /* Decode supplies one router-logits row; hash routing uses the token ID. */
+    const uint64_t prob_bytes = 256u * sizeof(float);
+    const uint64_t selected_bytes = 6u * sizeof(int32_t);
+    const uint64_t hash_bytes = (uint64_t)hash_rows * selected_bytes;
+    if ((hash_mode && hash_rows == 0) || logits->bytes < prob_bytes ||
+        probs->bytes < prob_bytes || selected->bytes < selected_bytes ||
+        weights->bytes < 6u * sizeof(float)) return 0;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    VkBuffer bias_buf = VK_NULL_HANDLE, hash_buf = VK_NULL_HANDLE;
+    VkDeviceSize bias_off = 0, hash_off = 0;
+    if (has_bias && !hash_mode &&
+        (bias_offset > model_size || prob_bytes > model_size - bias_offset ||
+         !hc_cached_weight(bias_offset, prob_bytes, bias_buf, bias_off))) return 0;
+    if (hash_mode &&
+        (hash_offset > model_size || hash_bytes > model_size - hash_offset ||
+         !hc_cached_weight(hash_offset, hash_bytes, hash_buf, hash_off))) return 0;
+    ds4_gpu_tensor *token_tensor = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    if (!token_tensor || !ds4_gpu_tensor_write(token_tensor, 0, &token, sizeof(token))) {
+        if (token_tensor) ds4_gpu_tensor_free(token_tensor);
+        return 0;
     }
-    if (hash_mode) {
-        const uint64_t hash_bytes = (uint64_t)hash_rows * n_expert_used * sizeof(int32_t);
-        if (hash_offset > model_size || hash_bytes > model_size - hash_offset)
-            return 0;
-        hash = (const int32_t *)((const char *)model_map + hash_offset);
-    }
-    return ds4_router_select_row((int32_t *)selected->ptr, (float *)weights->ptr,
-                                 (float *)probs->ptr, (const float *)logits->ptr,
-                                 bias, hash, hash_rows, (int32_t)token,
-                                 n_expert, n_expert_used, expert_weight_scale,
-                                 hash_mode);
+    int ok = dispatch_router_select(selected, weights, probs, logits, token_tensor,
+        bias_buf, bias_off, prob_bytes, hash_buf, hash_off, hash_bytes,
+        hash_rows, token, has_bias && !hash_mode, hash_mode,
+        expert_weight_scale, 1);
+    ds4_gpu_tensor_free(token_tensor);
+    return ok;
 }
 
 int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
@@ -3618,48 +3612,30 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
     const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens,
     uint32_t ne, uint32_t neu, float ws, uint32_t nt)
 {
-    if (ng > 1u || ngu > 0u) return 0;
-    if (!selected || !weights || !probs || !logits || !tokens || !mm || nt == 0 ||
-        ne == 0 || neu == 0 || neu > ne ||
+    if (ne != 256u || neu != 6u || fabsf(ws - 1.5f) > 1.0e-6f ||
+        ng > 1u || ngu > 0u) return 0;
+    if (!selected || !weights || !probs || !logits || !tokens || !mm ||
+        nt == 0 || nt > 65535u ||
         !selected->ptr || !weights->ptr || !probs->ptr ||
         !logits->ptr || !tokens->ptr) return 0;
-    const uint64_t logits_count = (uint64_t)nt * ne;
-    const uint64_t selected_count = (uint64_t)nt * neu;
-    if (logits_count > UINT64_MAX / sizeof(float) ||
-        selected_count > UINT64_MAX / sizeof(int32_t) ||
-        (uint64_t)nt > UINT64_MAX / sizeof(int32_t)) return 0;
-    if (logits->bytes < logits_count * sizeof(float) ||
-        probs->bytes < logits_count * sizeof(float) ||
-        selected->bytes < selected_count * sizeof(int32_t) ||
-        weights->bytes < selected_count * sizeof(float) ||
+    const uint64_t prob_bytes = 256u * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)nt * 256u * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)nt * 6u * sizeof(int32_t);
+    const uint64_t hash_bytes = (uint64_t)hr * 6u * sizeof(int32_t);
+    if (logits_bytes > logits->bytes || logits_bytes > probs->bytes ||
+        selected_bytes > selected->bytes || selected_bytes > weights->bytes ||
+        (uint64_t)nt * sizeof(int32_t) > tokens->bytes || (hm && hr == 0) ||
         tokens->bytes < (uint64_t)nt * sizeof(int32_t)) return 0;
-    const float *bias = NULL;
-    const int32_t *hash = NULL;
-    if (hb && !hm) {
-        if (bo > ms || (uint64_t)ne * sizeof(float) > ms - bo) return 0;
-        bias = (const float *)((const char *)mm + bo);
-    }
-    if (hm) {
-        const uint64_t hash_count = (uint64_t)hr * neu;
-        if (hash_count > UINT64_MAX / sizeof(int32_t)) return 0;
-        const uint64_t hash_bytes = hash_count * sizeof(int32_t);
-        if (ho > ms || hash_bytes > ms - ho) return 0;
-        hash = (const int32_t *)((const char *)mm + ho);
-    }
-    const float *lp = (const float*)logits->ptr;
-    const int32_t *token_ids = (const int32_t *)tokens->ptr;
-    int32_t *sel = (int32_t*)selected->ptr;
-    float *wp = (float*)weights->ptr;
-    float *pp = (float *)probs->ptr;
-    for (uint32_t t = 0; t < nt; t++) {
-        if (!ds4_router_select_row(sel + (uint64_t)t * neu,
-                                   wp + (uint64_t)t * neu,
-                                   pp + (uint64_t)t * ne,
-                                   lp + (uint64_t)t * ne,
-                                   bias, hash, hr, token_ids[t], ne, neu, ws, hm))
-            return 0;
-    }
-    return 1;
+    if (g_vk.model_map != mm || g_vk.model_size != ms) set_model_map_identity(mm, ms);
+    VkBuffer bias_buf = VK_NULL_HANDLE, hash_buf = VK_NULL_HANDLE;
+    VkDeviceSize bias_off = 0, hash_off = 0;
+    if (hb && !hm && (bo > ms || prob_bytes > ms - bo ||
+        !hc_cached_weight(bo, prob_bytes, bias_buf, bias_off))) return 0;
+    if (hm && (ho > ms || hash_bytes > ms - ho ||
+        !hc_cached_weight(ho, hash_bytes, hash_buf, hash_off))) return 0;
+    return dispatch_router_select(selected, weights, probs, logits, tokens,
+        bias_buf, bias_off, prob_bytes, hash_buf, hash_off, hash_bytes,
+        hr, 0, hb && !hm, hm, ws, nt);
 }
 
 /* ---- DS4 indexer: compressed-row selection (Vulkan compute) ----

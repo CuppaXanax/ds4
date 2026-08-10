@@ -30116,7 +30116,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_exp_probs_b != NULL,
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       metal_graph_batch_router_logits(g),
-                                                      metal_graph_prefill_tokens(g),
+                                                      router_tokens,
                                                       DS4_N_EXPERT,
                                                       DS4_N_EXPERT_USED,
                                                       DS4_EXPERT_WEIGHT_SCALE,

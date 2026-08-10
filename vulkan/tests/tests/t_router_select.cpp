@@ -1,11 +1,8 @@
-/* Kernel test: ds4_gpu_router_select_tensor (host-side MoE router).
+/* Kernel test: ds4_gpu_router_select_tensor (canonical Vulkan MoE router).
  *
  * DeepSeek V4 routing uses sqrt(softplus(logit)) probabilities, optional
  * bias only for top-k selection, and normalized unbiased selected weights.
- * The kernel is CPU-hosted over
- * the host-mapped tensor memory (like ds4_gpu_add_tensor), so no
- * begin_commands/end_commands are needed to read back the output; the
- * reference below is computed inline in double precision.
+ * The reference below is computed inline in double precision.
  */
 #include "../tests.h"
 #include "../../ds4_gpu.h"
@@ -38,13 +35,15 @@ static void ref_topk(const float *prob, const float *bias,
 }
 
 /* Reference weights: normalize selected router probabilities, then scale. */
-static void ref_weights(const float *prob, const int32_t *sel, uint32_t k,
-                        double scale, float *w) {
+static void ref_weights(const float *prob, const int32_t *sel, uint32_t n_expert,
+                        uint32_t k, double scale, float *w) {
     double sum = 0.0;
-    for (uint32_t i = 0; i < k; i++) sum += prob[sel[i]];
+    for (uint32_t i = 0; i < k; i++)
+        if (sel[i] >= 0 && (uint32_t)sel[i] < n_expert) sum += prob[sel[i]];
     if (sum < 6.103515625e-5) sum = 6.103515625e-5;
     for (uint32_t i = 0; i < k; i++)
-        w[i] = (float)(prob[sel[i]] / sum * scale);
+        w[i] = sel[i] >= 0 && (uint32_t)sel[i] < n_expert
+            ? (float)(prob[sel[i]] / sum * scale) : 0.0f;
 }
 
 /* Runs one router case end-to-end and compares against the CPU reference.
@@ -118,7 +117,7 @@ static int run_router_case(const float *logits, uint32_t token,
             std::vector<int32_t> ref_sel(n_expert_used);
             std::vector<float>   ref_w(n_expert_used);
             ref_topk(ref_prob.data(), bias, n_expert, n_expert_used, ref_sel.data());
-            ref_weights(ref_prob.data(), ref_sel.data(), n_expert_used,
+            ref_weights(ref_prob.data(), ref_sel.data(), n_expert, n_expert_used,
                         (double)scale, ref_w.data());
 
             /* Compare (tolerance 1e-4). */
@@ -159,7 +158,7 @@ static int run_router_case(const float *logits, uint32_t token,
 }
 
 static int test_router_select(void) {
-    const uint32_t n_expert = 8, n_expert_used = 2;
+    const uint32_t n_expert = 256, n_expert_used = 6;
     const uint32_t token = 12345;
     const float scale = 1.5f;
     float logits[n_expert] = {
@@ -199,13 +198,13 @@ static int test_router_select(void) {
 REGISTER_TEST(router_select, test_router_select);
 
 static int test_router_select_batch(void) {
-    const uint32_t n_expert = 8, n_expert_used = 2, n_tokens = 2;
+    const uint32_t n_expert = 256, n_expert_used = 6, n_tokens = 2;
     const float scale = 1.5f;
     const float logits[n_tokens * n_expert] = {
         0.1f, 0.5f, -0.2f, 2.0f, 1.0f, -1.0f, 0.0f, 3.0f,
         1.2f, -0.4f, 2.5f, 0.3f, 1.8f, 0.1f, -2.0f, 0.7f,
     };
-    const int32_t tokens[n_tokens] = {3, 7};
+    const int32_t tokens[n_tokens] = {3, 99};
     const float bias[n_expert] = {
         -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f,
     };
@@ -221,6 +220,7 @@ static int test_router_select_batch(void) {
         hash[(uint64_t)row * n_expert_used] = (int32_t)((row + 1u) % n_expert);
         hash[(uint64_t)row * n_expert_used + 1u] = (int32_t)((row + 4u) % n_expert);
     }
+    hash[1] = -1;
 
     ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
         (uint64_t)n_tokens * n_expert_used * sizeof(int32_t));
@@ -275,13 +275,16 @@ static int test_router_select_batch(void) {
             for (uint32_t i = 0; i < n_expert; i++)
                 ref_probs[i] = ref_router_prob(logits[(uint64_t)t * n_expert + i]);
             if (hash_mode) {
+                const uint32_t hash_token = tokens[t] >= 0 &&
+                    (uint32_t)tokens[t] < hash_rows ? (uint32_t)tokens[t] : 0u;
                 std::memcpy(ref_selected,
-                            hash + (uint64_t)tokens[t] * n_expert_used,
+                            hash + (uint64_t)hash_token * n_expert_used,
                             sizeof(ref_selected));
             } else {
                 ref_topk(ref_probs, bias, n_expert, n_expert_used, ref_selected);
             }
-            ref_weights(ref_probs, ref_selected, n_expert_used, scale, expected_weights);
+            ref_weights(ref_probs, ref_selected, n_expert, n_expert_used,
+                        scale, expected_weights);
             for (uint32_t i = 0; i < n_expert; i++) {
                 if (std::fabs(got_probs[(uint64_t)t * n_expert + i] - ref_probs[i]) > 1e-4f)
                     return 1;

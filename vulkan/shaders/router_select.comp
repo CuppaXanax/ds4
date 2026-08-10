@@ -1,0 +1,83 @@
+#version 460 core
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Selected { uint selected[]; };
+layout(set = 0, binding = 1) buffer Weights { float weights[]; };
+layout(set = 0, binding = 2) buffer Probs { float probs[]; };
+layout(set = 0, binding = 3) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 4) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 5) readonly buffer Hash { int hash_ids[]; };
+layout(set = 0, binding = 6) readonly buffer Tokens { int tokens[]; };
+
+layout(push_constant) uniform PC {
+    uint n_tokens;
+    uint hash_rows;
+    uint token;
+    uint has_bias;
+    uint hash_mode;
+    float scale;
+} pc;
+
+const uint N_EXPERT = 256u;
+const uint N_USED = 6u;
+const float MIN_SUM = 6.103515625e-5;
+
+float router_probability(float logit) {
+    float softplus = logit > 20.0 ? logit :
+        (logit < -20.0 ? exp(logit) : log(1.0 + exp(logit)));
+    return sqrt(softplus);
+}
+
+bool better(float score, uint expert, float current, uint current_expert) {
+    return current_expert == 0xffffffffu || score > current ||
+           (score == current && expert < current_expert);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.n_tokens) return;
+
+    uint token = pc.n_tokens == 1u ? pc.token : uint(tokens[row]);
+    for (uint expert = 0u; expert < N_EXPERT; ++expert)
+        probs[row * N_EXPERT + expert] = router_probability(logits[row * N_EXPERT + expert]);
+
+    if (pc.hash_mode != 0u) {
+        uint hash_row = token < pc.hash_rows ? token : 0u;
+        for (uint rank = 0u; rank < N_USED; ++rank)
+            selected[row * N_USED + rank] = uint(hash_ids[hash_row * N_USED + rank]);
+    } else {
+        for (uint rank = 0u; rank < N_USED; ++rank)
+            selected[row * N_USED + rank] = 0xffffffffu;
+        for (uint expert = 0u; expert < N_EXPERT; ++expert) {
+            float score = probs[row * N_EXPERT + expert];
+            if (pc.has_bias != 0u) score += bias[expert];
+            uint at = N_USED;
+            for (uint rank = 0u; rank < N_USED; ++rank) {
+                uint current_expert = selected[row * N_USED + rank];
+                float current = current_expert < N_EXPERT
+                    ? probs[row * N_EXPERT + current_expert] +
+                      (pc.has_bias != 0u ? bias[current_expert] : 0.0) : -1.0 / 0.0;
+                if (better(score, expert, current, current_expert)) {
+                    at = rank;
+                    break;
+                }
+            }
+            if (at < N_USED) {
+                for (uint rank = N_USED - 1u; rank > at; --rank)
+                    selected[row * N_USED + rank] = selected[row * N_USED + rank - 1u];
+                selected[row * N_USED + at] = expert;
+            }
+        }
+    }
+
+    float sum = 0.0;
+    for (uint rank = 0u; rank < N_USED; ++rank) {
+        uint expert = selected[row * N_USED + rank];
+        float value = expert < N_EXPERT ? probs[row * N_EXPERT + expert] : 0.0;
+        weights[row * N_USED + rank] = value;
+        sum += value;
+    }
+    sum = max(sum, MIN_SUM);
+    for (uint rank = 0u; rank < N_USED; ++rank)
+        weights[row * N_USED + rank] *= pc.scale / sum;
+}

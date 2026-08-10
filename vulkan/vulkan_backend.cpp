@@ -4649,6 +4649,15 @@ static bool ds4gk_routed_common(
             x_info, x_info, x_info, x_info, q8_info, q8_info};
         ok = ds4gk_routed_dispatch("quantize_input", pc,
             quantize_buffers, gate_blocks, n_tokens, 1);
+        if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            uint32_t words[3] = {};
+            float scale = 0.0f;
+            if (ds4_gpu_tensor_read(&q8, 0, words, sizeof(words))) {
+                memcpy(&scale, &words[0], sizeof(scale));
+                fprintf(stderr, "ds4: [dbg] routed input_q d=%g q=%08x/%08x\n",
+                        (double)scale, words[1], words[2]);
+            }
+        }
     }
     if (ok) {
         pc.mode = 1;

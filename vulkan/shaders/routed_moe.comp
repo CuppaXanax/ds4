@@ -212,7 +212,7 @@ void main() {
     if (pc.mode == 1u) {
         uint row = gl_WorkGroupID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim || lid != 0u) return;
         uint expert = b3[token * pc.n_selected + rank];
         if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; b5[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; return; }
         uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
@@ -230,7 +230,7 @@ void main() {
     if (pc.mode == 2u) {
         uint row = gl_WorkGroupID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim || lid != 0u) return;
         uint at = (token * pc.n_selected + rank) * pc.mid_dim + row;
         float g = uintBitsToFloat(b0[at]);
         float u = uintBitsToFloat(b1[at]);
@@ -242,7 +242,7 @@ void main() {
     if (pc.mode == 3u) {
         uint row = gl_WorkGroupID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim || lid != 0u) return;
         uint expert = b3[token * pc.n_selected + rank];
         if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u; return; }
         uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;

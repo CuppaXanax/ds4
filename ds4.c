@@ -26383,6 +26383,7 @@ static int metal_graph_decode_test(
     float *cpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *cpu_qr = xmalloc((size_t)q_rank * sizeof(float));
     float *cpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
+    float *cpu_q_raw = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_q = xmalloc((size_t)q_dim * sizeof(float));
     float *cpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *cpu_heads = xmalloc((size_t)q_dim * sizeof(float));
@@ -26402,6 +26403,7 @@ static int metal_graph_decode_test(
     float *gpu_attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *gpu_qr = xmalloc((size_t)q_rank * sizeof(float));
     float *gpu_qr_norm = xmalloc((size_t)q_rank * sizeof(float));
+    float *gpu_q_raw = xmalloc((size_t)q_dim * sizeof(float));
     float *gpu_q = xmalloc((size_t)q_dim * sizeof(float));
     float *gpu_kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     float *gpu_raw = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -26437,7 +26439,8 @@ static int metal_graph_decode_test(
     matvec_q8_0(cpu_qr, model, layer->attn_q_a, cpu_attn_norm);
     rms_norm_weight(cpu_qr_norm, cpu_qr,
                     tensor_data(model, layer->attn_q_a_norm), q_rank, DS4_RMS_EPS);
-    matvec_q8_0(cpu_q, model, layer->attn_q_b, cpu_qr_norm);
+    matvec_q8_0(cpu_q_raw, model, layer->attn_q_b, cpu_qr_norm);
+    memcpy(cpu_q, cpu_q_raw, (size_t)q_dim * sizeof(float));
     head_rms_norm_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
     layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
     rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
@@ -26534,6 +26537,25 @@ static int metal_graph_decode_test(
         if (!ok) fprintf(stderr, "ds4: graph test phase failed: end_commands\n");
     }
 
+    ds4_gpu_tensor *q_raw_test = NULL;
+    if (ok) {
+        q_raw_test = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
+        ok = q_raw_test != NULL && ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = ds4_gpu_matmul_quant_tensor(q_raw_test,
+                                              model->map,
+                                              model->size,
+                                              layer->attn_q_b->abs_offset,
+                                              layer->attn_q_b->type,
+                                              q_rank,
+                                              q_dim,
+                                              metal_graph_qr_norm(&g),
+                                              1) != 0 &&
+                 ds4_gpu_end_commands() != 0;
+        }
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: q_b_raw_probe\n");
+    }
+
     if (ok) {
 #define DS4_GRAPH_TEST_READ(label_, tensor_, dst_, bytes_) do { \
             if (ok && ds4_gpu_tensor_read((tensor_), 0, (dst_), (bytes_)) == 0) { \
@@ -26550,6 +26572,7 @@ static int metal_graph_decode_test(
         DS4_GRAPH_TEST_READ("attn_norm", metal_graph_attn_norm(&g), gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float));
         DS4_GRAPH_TEST_READ("q_lora", metal_graph_qr(&g), gpu_qr, q_rank * sizeof(float));
         DS4_GRAPH_TEST_READ("q_lora_norm", metal_graph_qr_norm(&g), gpu_qr_norm, q_rank * sizeof(float));
+        DS4_GRAPH_TEST_READ("q_b_raw", q_raw_test, gpu_q_raw, q_dim * sizeof(float));
         DS4_GRAPH_TEST_READ("q", metal_graph_q(&g), gpu_q, q_dim * sizeof(float));
         DS4_GRAPH_TEST_READ("kv", metal_graph_kv(&g), gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
         DS4_GRAPH_TEST_READ("raw_cache", g.layer_raw_cache[0], gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -26570,12 +26593,14 @@ static int metal_graph_decode_test(
 
     if (ok) {
         fprintf(stderr,
-            "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_lora=%g q_lora_norm=%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
+                "ds4: Metal graph test layer0 diffs: embed_hc=%g hc_pre=%g attn_norm=%g q_lora=%g q_lora_norm=%g q_b_raw=%g/%g q_rope=%g kv_rope=%g raw_cache=%g attn_out=%g after_attn_hc=%g ffn_cur=%g ffn_norm=%g shared=%g router_w=%g routed=%g ffn_out=%g after_ffn_hc=%g logits=%g\n",
                 max_abs_diff(cpu_hc, gpu_hc, hc_dim),
                 max_abs_diff(cpu_attn_cur, gpu_attn_cur, DS4_N_EMBD),
                 max_abs_diff(cpu_attn_norm, gpu_attn_norm, DS4_N_EMBD),
             max_abs_diff(cpu_qr, gpu_qr, q_rank),
             max_abs_diff(cpu_qr_norm, gpu_qr_norm, q_rank),
+                max_abs_diff(cpu_q_raw, gpu_q_raw, q_dim),
+                rms_abs_diff(cpu_q_raw, gpu_q_raw, q_dim),
                 max_abs_diff(cpu_q, gpu_q, q_dim),
                 max_abs_diff(cpu_kv, gpu_kv, DS4_N_HEAD_DIM),
                 max_abs_diff(cpu_kv, gpu_raw, DS4_N_HEAD_DIM),
@@ -26592,6 +26617,8 @@ static int metal_graph_decode_test(
             fprintf(stderr,
                 "ds4: Metal graph Q tensor types: q_a=%d q_b=%d\n",
                 (int)layer->attn_q_a->type, (int)layer->attn_q_b->type);
+            print_vec_stats("metal graph q_b_raw cpu", cpu_q_raw, q_dim);
+            print_vec_stats("metal graph q_b_raw gpu", gpu_q_raw, q_dim);
         if (memcmp(selected, gpu_selected, sizeof(gpu_selected)) != 0) {
             fprintf(stderr,
                     "ds4: Metal graph router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
@@ -26609,6 +26636,7 @@ static int metal_graph_decode_test(
     }
 
     metal_graph_free(&g);
+    if (q_raw_test) ds4_gpu_tensor_free(q_raw_test);
     free(routed_q8_midscale);
     free(routed_q8_midq);
     free(routed_q8_xscale);
@@ -26628,6 +26656,7 @@ static int metal_graph_decode_test(
     free(gpu_raw);
     free(gpu_kv);
     free(gpu_q);
+    free(gpu_q_raw);
     free(gpu_qr_norm);
     free(gpu_qr);
     free(gpu_attn_norm);
@@ -26635,6 +26664,7 @@ static int metal_graph_decode_test(
     free(gpu_hc);
     free(cpu_kv);
     free(cpu_q);
+    free(cpu_q_raw);
     free(cpu_attn_out);
     free(cpu_heads);
     free(cpu_ffn_norm);

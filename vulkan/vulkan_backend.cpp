@@ -851,6 +851,7 @@ static void set_model_map_identity(const void *model_map, uint64_t model_size) {
 
 int ds4_gpu_set_model_map(const void *m, uint64_t s) {
     if (!m) return 0;
+    if (g_vk.model_map == m && g_vk.model_size == s) clear_weight_cache();
     set_model_map_identity(m, s);
     return 1;
 }

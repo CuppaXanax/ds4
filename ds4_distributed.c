@@ -3049,7 +3049,7 @@ static int dist_write_logprobs_dump(
         }
         fputs("]}", fp);
 
-        if (token == eos) break;
+        if (token == eos || generated + 1 >= max_tokens) break;
         const uint32_t token_pos = (uint32_t)prompt->len + (uint32_t)generated;
         ds4_tokens_push(&transcript, token);
         if (dist_coordinator_eval_span(state, session, plan,

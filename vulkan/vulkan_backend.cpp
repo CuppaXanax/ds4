@@ -2990,7 +2990,7 @@ static int dispatch_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
     const uint64_t add_elem = add_is_half ? sizeof(uint16_t) : sizeof(float);
     const uint32_t post_stride = split_layout ?
         (uint32_t)(2ull * n_hc + (uint64_t)n_hc * n_hc) : n_hc;
-    const uint32_t comb_stride = post_stride;
+    const uint32_t comb_stride = split_layout ? post_stride : n_hc * n_hc;
     VkDescriptorBufferInfo buffers[6] = {
         {obuf, ooff, (VkDeviceSize)rows * n_hc * n_embd * sizeof(float)},
         {bbuf, boff, (VkDeviceSize)rows * n_embd * block_elem},

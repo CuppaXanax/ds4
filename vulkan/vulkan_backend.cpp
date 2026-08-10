@@ -758,6 +758,7 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t doff,
 /* ---- Commands ---- */
 
 int ds4_gpu_begin_commands(void) { return begin_cmd(); }
+int ds4_gpu_commands_active(void) { return get_cmd_ctx().recording ? 1 : 0; }
 int ds4_gpu_flush_commands(void) {
     /* The engine keeps recording after a flush (e.g. SSD streaming async
      * loads), so start a fresh command buffer like Metal's next encoder. */
@@ -1090,6 +1091,27 @@ int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_g
     if (!out || !a || !b) return 0;
     float *op = (float*)out->ptr; const float *ap = (const float*)a->ptr; const float *bp = (const float*)b->ptr;
     for (uint32_t i = 0; i < n; i++) op[i] = ap[i] + bp[i];
+    return 1;
+}
+
+int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
+                          const ds4_gpu_tensor *logits,
+                          uint32_t n_vocab) {
+    if (!out_idx || !logits || !out_idx->ptr || !logits->ptr || n_vocab == 0 ||
+        out_idx->bytes < sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_vocab * sizeof(float)) {
+        return 0;
+    }
+    const float *values = (const float *)logits->ptr;
+    uint32_t best = 0;
+    float best_value = values[0];
+    for (uint32_t i = 1; i < n_vocab; i++) {
+        if (values[i] > best_value) {
+            best = i;
+            best_value = values[i];
+        }
+    }
+    *(int32_t *)out_idx->ptr = (int32_t)best;
     return 1;
 }
 

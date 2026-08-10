@@ -16,9 +16,6 @@ int ds4_gpu_add_rms_norm_weight_tensor(ds4_gpu_tensor       *norm_out,
         uint64_t                weight_offset,
         uint32_t                n,
         float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_add_rms_norm_weight_tensor\n"); return 1; }
-int ds4_gpu_argmax_tensor(ds4_gpu_tensor       *out_idx,
-        const ds4_gpu_tensor *logits,
-        uint32_t                n_vocab) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_argmax_tensor\n"); return 1; }
 int ds4_gpu_attention_decode_heads_rope_tensor(ds4_gpu_tensor       *heads,
         const void             *model_map,
         uint64_t                model_size,
@@ -205,7 +202,6 @@ int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(ds4_gpu_tensor    
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_static_mixed_heads_range_tensor\n"); return 1; }
-int ds4_gpu_commands_active(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_commands_active\n"); return 1; }
 int ds4_gpu_compressor_prefill_ratio4_replay_tensor(ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
         ds4_gpu_tensor       *state_score,

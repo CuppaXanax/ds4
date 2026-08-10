@@ -85,16 +85,17 @@ static int test_dispatch_order(void) {
     const float inverse_rms = 1.0f / std::sqrt((float)(squares / out_dim) + 1e-6f);
     for (uint32_t i = 0; i < out_dim; i++) reference_norm[i] = reference0[i] * inverse_rms;
 
-    if (!ds4_gpu_set_model_map(model, model_size) ||
+    if (ds4_gpu_commands_active() ||
+        !ds4_gpu_set_model_map(model, model_size) ||
         !ds4_gpu_tensor_write(input0, 0, values0, sizeof(values0)) ||
         !ds4_gpu_tensor_write(input1, 0, values1, sizeof(values1)) ||
-        !ds4_gpu_begin_commands() ||
+        !ds4_gpu_begin_commands() || !ds4_gpu_commands_active() ||
         !ds4_gpu_matmul_f16_tensor(out0, model, model_size, weight0_offset,
                                    in_dim, out_dim, input0, 1) ||
         !ds4_gpu_matmul_f16_tensor(out1, model, model_size, weight1_offset,
                                    in_dim, out_dim, input1, 1) ||
         !ds4_gpu_rms_norm_plain_tensor(normalized, out0, out_dim, 1e-6f) ||
-        !ds4_gpu_end_commands()) {
+        !ds4_gpu_end_commands() || ds4_gpu_commands_active()) {
         cleanup();
         return 1;
     }

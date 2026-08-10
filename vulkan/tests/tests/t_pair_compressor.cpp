@@ -1,6 +1,6 @@
 /* Kernel test: ds4_gpu_matmul_f16_pair_compressor_store_tensor.
  *
- * Fused host-side pair:
+ * Fused Vulkan pair:
  *   out_kv[o]    = sum_i W_kv[o][i] * x[i]      (f16 weights, [width][in_dim])
  *   out_score[o] = sum_i W_score[o][i] * x[i]
  *   state_kv / state_score row = out_kv / out_score + APE(phase = pos % ratio)
@@ -8,9 +8,8 @@
  * with the rolling compressor state store at
  *   dst_row = (ratio == 4) ? ratio + pos % ratio : pos % ratio
  * exactly like ds4_gpu_compressor_store_batch_tensor / the CUDA
- * compressor_store_kernel.  The implementation is host-side in the
- * backend (operates on tensor->ptr directly), so this test does NOT wrap
- * the call in begin/end_commands.
+ * compressor_store_kernel.  The test wraps the call in command recording so
+ * it covers both projection dispatches and the state-store dispatch.
  */
 #include "../tests.h"
 #include "../../ds4_gpu.h"
@@ -230,12 +229,13 @@ static int run_pair_case(const char *what, uint64_t in_dim, uint32_t head_dim,
                    m.ape_off, ape_type, in_dim, width, ratio, pos, xv.data());
 
     int rc = 1;
-    if (ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+    if (ds4_gpu_begin_commands() != 0 &&
+        ds4_gpu_matmul_f16_pair_compressor_store_tensor(
             okv, osc, skv, ssc, m.data.data(), m.data.size(),
             m.kv_off, m.score_off, m.ape_off, ape_type,
-            in_dim, width, x, ratio, pos) != 1) {
-        fprintf(stderr, "--- %s: fused store returned != 1\n", what);
-    } else {
+            in_dim, width, x, ratio, pos) == 1 &&
+        ds4_gpu_end_commands() != 0) {
+        ds4_gpu_synchronize();
         std::vector<float> gokv(width), gosc(width);
         std::vector<float> gskv((uint64_t)state_rows * width), gssc((uint64_t)state_rows * width);
         if (ds4_gpu_tensor_read(okv, 0, gokv.data(), gokv.size() * sizeof(float)) != 0 &&
@@ -248,6 +248,8 @@ static int run_pair_case(const char *what, uint64_t in_dim, uint32_t head_dim,
             else if (check_f32("pair/state_score", gssc.data(), wssc.data(), (uint32_t)gssc.size()) != 0) rc = 1;
             else rc = 0;
         }
+    } else {
+        fprintf(stderr, "--- %s: fused store returned != 1\n", what);
     }
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(okv); ds4_gpu_tensor_free(osc);
     ds4_gpu_tensor_free(skv); ds4_gpu_tensor_free(ssc);
@@ -293,9 +295,17 @@ static int test_matmul_f16_pair_compressor_store_bounds(void) {
         return 1;
     }
     int rc = 0;
-    const int good = ds4_gpu_matmul_f16_pair_compressor_store_tensor(
-        okv, osc, skv_ok, ssc_ok, m.data.data(), m.data.size(),
-        m.kv_off, m.score_off, m.ape_off, ape_type, in_dim, width, x, ratio, pos);
+    int good = 0;
+    if (ds4_gpu_begin_commands() != 0) {
+        good = ds4_gpu_matmul_f16_pair_compressor_store_tensor(
+            okv, osc, skv_ok, ssc_ok, m.data.data(), m.data.size(),
+            m.kv_off, m.score_off, m.ape_off, ape_type, in_dim, width, x, ratio, pos);
+        if (good == 1 && ds4_gpu_end_commands() != 0) {
+            ds4_gpu_synchronize();
+        } else {
+            good = 0;
+        }
+    }
     if (good != 1) {
         fprintf(stderr, "--- bounds: happy path returned %d, expected 1\n", good);
         rc = 1;

@@ -1,0 +1,43 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_buf[]; };
+layout(push_constant) uniform PC {
+    uint n_tok; uint head_dim; uint n_rot; uint pos0;
+    uint pos_stride; uint n_ctx_orig; int inverse;
+    float freq_base; float freq_scale; float ext_factor; float attn_factor;
+    float beta_fast; float beta_slow;
+} pc;
+
+void main() {
+    uint pair_count = pc.n_rot / 2u;
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = pc.n_tok * pair_count;
+    if (gid >= total) return;
+    uint pair = gid % pair_count;
+    uint row = gid / pair_count;
+    uint i = pair * 2u;
+    uint off = row * pc.head_dim + (pc.head_dim - pc.n_rot);
+    uint pos = pc.pos0 + row * pc.pos_stride;
+    float theta_extrap = float(pos) * pow(pc.freq_base, -float(i) / float(pc.n_rot));
+    float theta_interp = pc.freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = pc.attn_factor;
+    if (pc.ext_factor != 0.0) {
+        float denom = 2.0 * log(pc.freq_base);
+        float corr0 = max(0.0, floor(float(pc.n_rot) *
+            log(float(pc.n_ctx_orig) / (pc.beta_fast * 2.0 * 3.141592653589793)) / denom));
+        float corr1 = min(float(pc.n_rot - 1u), ceil(float(pc.n_rot) *
+            log(float(pc.n_ctx_orig) / (pc.beta_slow * 2.0 * 3.141592653589793)) / denom));
+        float y = (float(pair) - corr0) / max(0.001, corr1 - corr0);
+        float mix = (1.0 - clamp(y, 0.0, 1.0)) * pc.ext_factor;
+        theta = theta_interp * (1.0 - mix) + theta_extrap * mix;
+        mscale *= 1.0 + 0.1 * log(1.0 / pc.freq_scale);
+    }
+    float c = cos(theta) * mscale;
+    float s = sin(theta) * mscale;
+    if (pc.inverse != 0) s = -s;
+    float v0 = x_buf[off + i];
+    float v1 = x_buf[off + i + 1u];
+    x_buf[off + i] = v0 * c - v1 * s;
+    x_buf[off + i + 1u] = v0 * s + v1 * c;
+}

@@ -1,0 +1,35 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer StateKV { float state_kv[]; };
+layout(set = 0, binding = 1) buffer StateScore { float state_score[]; };
+layout(set = 0, binding = 2) readonly buffer KV { float kv[]; };
+layout(set = 0, binding = 3) readonly buffer Score { float score[]; };
+layout(set = 0, binding = 4) readonly buffer Ape { uint ape[]; };
+layout(push_constant) uniform PC {
+    uint width;
+    uint ratio;
+    uint pos0;
+    uint n_tokens;
+    uint ape_type;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+} pc;
+
+float ape_value(uint index) {
+    if (pc.ape_type == 0u) return uintBitsToFloat(ape[index]);
+    return unpackHalf2x16(ape[index >> 1u])[index & 1u];
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = pc.n_tokens * pc.width;
+    if (gid >= total) return;
+    uint t = gid / pc.width;
+    uint j = gid - t * pc.width;
+    uint phase = (pc.pos0 + t) % pc.ratio;
+    uint state_row = pc.ratio == 4u ? pc.ratio + phase : phase;
+    uint ape_index = phase * pc.width + j;
+    state_kv[state_row * pc.width + j] = kv[t * pc.width + j];
+    state_score[state_row * pc.width + j] = score[t * pc.width + j] + ape_value(ape_index);
+}

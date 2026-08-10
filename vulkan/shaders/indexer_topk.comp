@@ -1,0 +1,57 @@
+#version 460 core
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Selected { uint selected[]; };
+layout(set = 0, binding = 1) readonly buffer Scores { float scores[]; };
+layout(push_constant) uniform PC { uint n_comp; uint n_tokens; uint top_k; } pc;
+
+bool score_better(float av, uint ai, float bv, uint bi) {
+    if (isnan(av)) return isnan(bv) && ai < bi;
+    if (isnan(bv)) return true;
+    return av > bv || (av == bv && ai < bi);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    const uint MAX_TOP_K = 512u;
+    if (t >= pc.n_tokens || pc.top_k > MAX_TOP_K) return;
+    float best_score[MAX_TOP_K];
+    uint best_index[MAX_TOP_K];
+    best_score[0] = scores[t * pc.n_comp];
+    best_index[0] = 0u;
+    for (uint c = 1u; c < pc.top_k; ++c) {
+        float value = scores[t * pc.n_comp + c];
+        uint at = c;
+        for (uint k = 0u; k < c; ++k) {
+            if (score_better(value, c, best_score[k], best_index[k])) {
+                at = k;
+                break;
+            }
+        }
+        for (uint k = c; k > at; --k) {
+            best_score[k] = best_score[k - 1u];
+            best_index[k] = best_index[k - 1u];
+        }
+        best_score[at] = value;
+        best_index[at] = c;
+    }
+    for (uint c = pc.top_k; c < pc.n_comp; ++c) {
+        float value = scores[t * pc.n_comp + c];
+        uint at = pc.top_k;
+        for (uint k = 0u; k < pc.top_k; ++k) {
+            if (score_better(value, c, best_score[k], best_index[k])) {
+                at = k;
+                break;
+            }
+        }
+        if (at < pc.top_k) {
+            for (uint k = pc.top_k - 1u; k > at; --k) {
+                best_score[k] = best_score[k - 1u];
+                best_index[k] = best_index[k - 1u];
+            }
+            best_score[at] = value;
+            best_index[at] = c;
+        }
+    }
+    for (uint k = 0u; k < pc.top_k; ++k)
+        selected[t * pc.top_k + k] = best_index[k];
+}

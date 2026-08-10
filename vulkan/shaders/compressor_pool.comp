@@ -1,0 +1,79 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out { float out_buf[]; };
+layout(set = 0, binding = 1) readonly buffer KV { float kv[]; };
+layout(set = 0, binding = 2) readonly buffer Score { float score[]; };
+layout(set = 0, binding = 3) readonly buffer StateKV { float state_kv[]; };
+layout(set = 0, binding = 4) readonly buffer StateScore { float state_score[]; };
+layout(set = 0, binding = 5) readonly buffer Ape { uint ape[]; };
+layout(push_constant) uniform PC {
+    uint head_dim;
+    uint ratio;
+    uint pos0;
+    uint n_comp;
+    uint ape_type;
+    uint replay;
+    uint reserved0;
+    uint reserved1;
+} pc;
+
+float ape_value(uint index) {
+    if (pc.ape_type == 0u) return uintBitsToFloat(ape[index]);
+    return unpackHalf2x16(ape[index >> 1u])[index & 1u];
+}
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    uint c = gl_WorkGroupID.y;
+    if (d >= pc.head_dim || c >= pc.n_comp) return;
+    uint width = pc.ratio == 4u ? 2u * pc.head_dim : pc.head_dim;
+    float values[8];
+    float scores[8];
+    uint count = 0u;
+    float max_score = -1.0 / 0.0;
+    if (pc.ratio == 4u) {
+        if (pc.replay != 0u && c == 0u) {
+            for (uint r = 0u; r < 4u; ++r) {
+                values[count] = state_kv[r * width + d];
+                scores[count] = state_score[r * width + d];
+                max_score = max(max_score, scores[count++]);
+            }
+        } else if (c > 0u) {
+            uint base = (c - 1u) * 4u;
+            for (uint r = 0u; r < 4u; ++r) {
+                uint t = base + r;
+                uint phase = (pc.pos0 + t) % 4u;
+                values[count] = kv[t * width + d];
+                scores[count] = score[t * width + d] + ape_value(phase * width + d);
+                max_score = max(max_score, scores[count++]);
+            }
+        }
+        uint base = c * 4u;
+        for (uint r = 0u; r < 4u; ++r) {
+            uint t = base + r;
+            uint phase = (pc.pos0 + t) % 4u;
+            values[count] = kv[t * width + pc.head_dim + d];
+            scores[count] = score[t * width + pc.head_dim + d] +
+                            ape_value(phase * width + pc.head_dim + d);
+            max_score = max(max_score, scores[count++]);
+        }
+    } else {
+        uint base = c * pc.ratio;
+        for (uint r = 0u; r < 4u; ++r) {
+            if (r >= pc.ratio) break;
+            uint t = base + r;
+            uint phase = (pc.pos0 + t) % pc.ratio;
+            values[count] = kv[t * width + d];
+            scores[count] = score[t * width + d] + ape_value(phase * width + d);
+            max_score = max(max_score, scores[count++]);
+        }
+    }
+    float denom = 0.0;
+    float accum = 0.0;
+    for (uint i = 0u; i < count; ++i) {
+        float weight = exp(scores[i] - max_score);
+        denom += weight;
+        accum += values[i] * weight;
+    }
+    out_buf[c * pc.head_dim + d] = denom > 0.0 ? accum / denom : 0.0;
+}

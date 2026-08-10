@@ -1,0 +1,15 @@
+#version 460 core
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Mask { float mask[]; };
+layout(set = 0, binding = 1) readonly buffer TopK { uint topk[]; };
+layout(push_constant) uniform PC { uint n_comp; uint n_tokens; uint top_k; } pc;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.n_tokens) return;
+    for (uint c = 0u; c < pc.n_comp; ++c) mask[t * pc.n_comp + c] = -1.0 / 0.0;
+    for (uint k = 0u; k < pc.top_k; ++k) {
+        uint c = topk[t * pc.top_k + k];
+        if (c < pc.n_comp) mask[t * pc.n_comp + c] = 0.0;
+    }
+}

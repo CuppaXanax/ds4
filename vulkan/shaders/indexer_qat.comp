@@ -1,0 +1,53 @@
+#version 460 core
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+
+shared float row[128];
+
+float e2m1(float value) {
+    float a = min(abs(value), 6.0);
+    const float values[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    uint best = 0u;
+    float diff = abs(a - values[0]);
+    for (uint i = 1u; i < 8u; ++i) {
+        float next = abs(a - values[i]);
+        if (next < diff || (next == diff && (i & 1u) == 0u && (best & 1u) != 0u)) {
+            best = i;
+            diff = next;
+        }
+    }
+    return (value < 0.0 ? -1.0 : 1.0) * values[best];
+}
+
+void main() {
+    uint row_id = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    row[lane] = x[row_id * 128u + lane];
+    barrier();
+
+    for (uint stride = 1u; stride < 128u; stride <<= 1u) {
+        uint group = lane / (stride * 2u);
+        uint i = lane % stride;
+        uint a = group * stride * 2u + i;
+        uint b = a + stride;
+        float va = row[a];
+        float vb = row[b];
+        barrier();
+        if (lane == a) row[a] = va + vb;
+        if (lane == b) row[b] = va - vb;
+        barrier();
+    }
+    row[lane] *= 0.08838834764831845;
+    barrier();
+
+    uint block = lane / 32u;
+    uint base = block * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; ++i) amax = max(amax, abs(row[base + i]));
+    amax = max(amax, 7.052966104933725e-38);
+    float scale = exp2(ceil(log2(amax / 6.0)));
+    float value = clamp(row[lane] / scale, -6.0, 6.0);
+    row[lane] = e2m1(value) * scale;
+    barrier();
+    x[row_id * 128u + lane] = row[lane];
+}

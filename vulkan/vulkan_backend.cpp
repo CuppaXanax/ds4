@@ -369,6 +369,17 @@ static int load_all_shaders(void) {
         {"attention_prefill_raw", 16, 4},
         {"attention_decode_mixed", 32, 6},
         {"attention_decode_raw_batch", 32, 4},
+        {"indexer_scores", 32, 4},
+        {"indexer_qat", 4, 1},
+        {"indexer_topk", 12, 2},
+        {"topk_mask", 12, 2},
+        {"compressor_store", 32, 5},
+        {"compressor_clear", 12, 2},
+        {"compressor_set_rows", 32, 5},
+        {"compressor_pool", 32, 6},
+        {"compressor_pool_state", 8, 3},
+        {"compressor_shift_ratio4", 4, 2},
+        {"compressor_rope_stride", 56, 1},
         {"hc_weighted_sum", 16, 6}, /* n_embd, n_hc, rows, reserved */
         {"hc_expand", 36, 6}, /* shape, strides, add/split/half flags */
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
@@ -2344,6 +2355,8 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         ext_factor, attn_factor, beta_fast, beta_slow);
 }
 
+extern "C" int ds4_gpu_kv_rope_fp8_fuse_available(void) { return 0; }
+
 /* Compose Vulkan FP8 quantization with the Vulkan raw-cache row store. */
 int ds4_gpu_kv_fp8_store_raw_tensor(
     ds4_gpu_tensor *kv,
@@ -3707,7 +3720,7 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
     return 1;
 }
 
-/* ---- DS4 indexer: compressed-row selection (host-side, CPU fallback) ----
+/* ---- DS4 indexer: compressed-row selection (Vulkan compute) ----
  *
  * Replicates the engine's CPU reference (ds4.c indexer_allowed_decode_one*
  * and the per-token score loop) and the Metal/CUDA indexer score kernels
@@ -3729,6 +3742,48 @@ int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor 
  * then ignores them).
  */
 
+static int record_indexer_scores(
+        ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *index_comp,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_head, uint32_t head_dim, uint32_t ratio,
+        float scale, uint32_t causal) {
+    if (!scores || !q || !weights || !index_comp || n_comp == 0 ||
+        n_tokens == 0 || n_head == 0 || head_dim == 0 || ratio == 0 ||
+        n_comp > 4096u || n_tokens > 65535u || n_head > 65535u ||
+        (causal && n_tokens > 1 && pos0 > UINT32_MAX - (n_tokens - 1u)) ||
+        head_dim > 128u || !shader_f32_domain(n_comp, n_tokens, 1) ||
+        !shader_f32_domain(n_tokens, n_head, head_dim) ||
+        !shader_f32_domain(n_comp, 1, head_dim)) return 0;
+    uint64_t score_bytes, q_bytes, weight_bytes, key_bytes;
+    if (!checked_f32_bytes(n_tokens, n_comp, 1, score_bytes) ||
+        !checked_f32_bytes(n_tokens, n_head, head_dim, q_bytes) ||
+        !checked_f32_bytes(n_tokens, n_head, 1, weight_bytes) ||
+        !checked_f32_bytes(n_comp, 1, head_dim, key_bytes) ||
+        scores->bytes < score_bytes || q->bytes < q_bytes ||
+        weights->bytes < weight_bytes || index_comp->bytes < key_bytes)
+        return 0;
+    VkBuffer sbuf, qbuf, wbuf, kbuf;
+    VkDeviceSize soff, qoff, woff, koff;
+    if (!find_tensor_buffer(scores, sbuf, soff) || !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(weights, wbuf, woff) || !find_tensor_buffer(index_comp, kbuf, koff))
+        return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((soff | qoff | woff | koff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[4] = {
+        {sbuf, soff, (VkDeviceSize)scores->bytes}, {qbuf, qoff, (VkDeviceSize)q->bytes},
+        {wbuf, woff, (VkDeviceSize)weights->bytes}, {kbuf, koff, (VkDeviceSize)index_comp->bytes}};
+    struct { uint32_t n_comp, n_tokens, pos0, n_head, head_dim, ratio, causal; float scale; }
+        pc = {n_comp, n_tokens, pos0, n_head, head_dim, ratio, causal, scale};
+    DS4_VK_TRACE_KERNEL("indexer_scores");
+    return record_simple_shader("indexer_scores", &pc, sizeof(pc), bufs, 4,
+                                n_comp, n_tokens, 1, resume_recording);
+}
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -3738,36 +3793,17 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale) {
-    if (!scores || !q || !weights || !index_comp ||
-        n_comp == 0 || n_head == 0 || head_dim == 0) {
-        return 0;
-    }
-    const uint64_t q_bytes    = (uint64_t)n_head * head_dim * sizeof(float);
-    const uint64_t w_bytes    = (uint64_t)n_head * sizeof(float);
-    const uint64_t k_bytes    = (uint64_t)n_comp * head_dim * sizeof(float);
-    const uint64_t s_bytes    = (uint64_t)n_comp * sizeof(float);
-    if (!scores->ptr || !q->ptr || !weights->ptr || !index_comp->ptr ||
-        q->bytes < q_bytes || weights->bytes < w_bytes ||
-        index_comp->bytes < k_bytes || scores->bytes < s_bytes) {
-        return 0;
-    }
-    const float *qp = (const float*)q->ptr;
-    const float *wp = (const float*)weights->ptr;
-    const float *kp = (const float*)index_comp->ptr;
-    float *sp = (float*)scores->ptr;
-    for (uint32_t c = 0; c < n_comp; c++) {
-        const float *kv = kp + (uint64_t)c * head_dim;
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = qp + (uint64_t)h * head_dim;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += kv[d] * qh[d];
-            if (dot < 0.0f) dot = 0.0f;          /* ReLU, as in ds4.c */
-            acc += dot * (wp[h] * scale);
-        }
-        sp[c] = acc;
-    }
-    return 1;
+    return record_indexer_scores(scores, q, weights, index_comp,
+                                 n_comp, 1, 0, n_head, head_dim, 1, scale, 0);
+}
+
+int ds4_gpu_indexer_scores_prefill_tensor(
+        ds4_gpu_tensor *scores, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *index_comp,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t n_head,
+        uint32_t head_dim, uint32_t ratio, float scale) {
+    return record_indexer_scores(scores, q, weights, index_comp, n_comp,
+                                 n_tokens, 0, n_head, head_dim, ratio, scale, 1);
 }
 
 int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -3782,48 +3818,9 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
-    if (!scores || !q || !weights || !index_comp ||
-        n_comp == 0 || n_tokens == 0 || n_head == 0 ||
-        head_dim == 0 || ratio == 0) {
-        return 0;
-    }
-    const uint64_t q_bytes    = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t w_bytes    = (uint64_t)n_tokens * n_head * sizeof(float);
-    const uint64_t k_bytes    = (uint64_t)n_comp * head_dim * sizeof(float);
-    const uint64_t s_bytes    = (uint64_t)n_comp * n_tokens * sizeof(float);
-    if (!scores->ptr || !q->ptr || !weights->ptr || !index_comp->ptr ||
-        q->bytes < q_bytes || weights->bytes < w_bytes ||
-        index_comp->bytes < k_bytes || scores->bytes < s_bytes) {
-        return 0;
-    }
-    const float *qp = (const float*)q->ptr;
-    const float *wp = (const float*)weights->ptr;
-    const float *kp = (const float*)index_comp->ptr;
-    float *sp = (float*)scores->ptr;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *qt = qp + (uint64_t)t * n_head * head_dim;
-        const float *wt = wp + (uint64_t)t * n_head;
-        float *st = sp + (uint64_t)t * n_comp;
-        const uint32_t visible = (uint32_t)(((uint64_t)pos0 + t + 1u) / ratio);
-        const uint32_t n_visible = visible < n_comp ? visible : n_comp;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (c >= n_visible) {
-                st[c] = -INFINITY;
-                continue;
-            }
-            const float *kv = kp + (uint64_t)c * head_dim;
-            float acc = 0.0f;
-            for (uint32_t h = 0; h < n_head; h++) {
-                const float *qh = qt + (uint64_t)h * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += kv[d] * qh[d];
-                if (dot < 0.0f) dot = 0.0f;      /* ReLU, as in ds4.c */
-                acc += dot * (wt[h] * scale);
-            }
-            st[c] = acc;
-        }
-    }
-    return 1;
+    return record_indexer_scores(scores, q, weights, index_comp,
+                                 n_comp, n_tokens, pos0, n_head, head_dim,
+                                 ratio, scale, 1);
 }
 
 int ds4_gpu_indexer_topk_tensor(
@@ -3833,32 +3830,48 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k) {
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 ||
-        top_k == 0 || top_k > n_comp) {
+        top_k == 0 || top_k > n_comp || top_k > 512u || n_comp > 4096u ||
+        n_tokens > 65535u) return 0;
+    const uint64_t score_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
+    if (scores->bytes < score_bytes || selected->bytes < selected_bytes) return 0;
+    VkBuffer obuf, sbuf; VkDeviceSize ooff, soff;
+    if (!find_tensor_buffer(selected, obuf, ooff) || !find_tensor_buffer(scores, sbuf, soff)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | soff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx(); const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[2] = {{obuf, ooff, (VkDeviceSize)selected->bytes},
+                                      {sbuf, soff, (VkDeviceSize)scores->bytes}};
+    struct { uint32_t n_comp, n_tokens, top_k; } pc = {n_comp, n_tokens, top_k};
+    DS4_VK_TRACE_KERNEL("indexer_topk");
+    return record_simple_shader("indexer_topk", &pc, sizeof(pc), bufs, 2,
+                                n_tokens, 1, 1, resume_recording);
+}
+
+int ds4_gpu_dsv4_topk_mask_tensor(
+        ds4_gpu_tensor *mask, const ds4_gpu_tensor *topk,
+        uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
+        top_k > n_comp || top_k > 512u || n_comp > 4096u || n_tokens > 65535u)
         return 0;
-    }
-    const uint64_t s_bytes    = (uint64_t)n_comp * n_tokens * sizeof(float);
-    const uint64_t sel_bytes  = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
-    if (!selected->ptr || !scores->ptr ||
-        scores->bytes < s_bytes || selected->bytes < sel_bytes) {
-        return 0;
-    }
-    const float *sp = (const float*)scores->ptr;
-    uint32_t *out = (uint32_t*)selected->ptr;
-    std::vector<uint32_t> idx(n_comp);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *row = sp + (uint64_t)t * n_comp;
-        for (uint32_t c = 0; c < n_comp; c++) idx[c] = c;
-        /* Descending score, tie -> lower index (matches ds4.c reference and
-         * CUDA topk_score_better).  NaN sorts last so masked -INF rows are
-         * never selected ahead of real scores. */
-        std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
-            if (std::isnan(row[a])) return false;
-            if (std::isnan(row[b])) return true;
-            return row[a] > row[b] || (row[a] == row[b] && a < b);
-        });
-        for (uint32_t k = 0; k < top_k; k++) out[(uint64_t)t * top_k + k] = idx[k];
-    }
-    return 1;
+    const uint64_t mask_bytes = (uint64_t)n_comp * n_tokens * sizeof(float);
+    const uint64_t topk_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
+    if (mask->bytes < mask_bytes || topk->bytes < topk_bytes) return 0;
+    VkBuffer mbuf, tbuf; VkDeviceSize moff, toff;
+    if (!find_tensor_buffer(mask, mbuf, moff) || !find_tensor_buffer(topk, tbuf, toff)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((moff | toff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx(); const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[2] = {{mbuf, moff, (VkDeviceSize)mask->bytes},
+                                      {tbuf, toff, (VkDeviceSize)topk->bytes}};
+    struct { uint32_t n_comp, n_tokens, top_k; } pc = {n_comp, n_tokens, top_k};
+    DS4_VK_TRACE_KERNEL("topk_mask");
+    return record_simple_shader("topk_mask", &pc, sizeof(pc), bufs, 2,
+                                n_tokens, 1, 1, resume_recording);
 }
 
 /* =========================================================================
@@ -3940,15 +3953,19 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
     DS4_VK_TRACE_KERNEL("dsv4_indexer_qat");
     if (!x || n_rows == 0 || head_dim != 128u) return 0;
     const uint64_t bytes = (uint64_t)n_rows * head_dim * sizeof(float);
-    if (!x->ptr || x->bytes < bytes) return 0;
-
-    float *xp = (float *)x->ptr;
-    for (uint32_t r = 0; r < n_rows; r++) {
-        float *row = xp + (uint64_t)r * head_dim;
-        dsv4_hadamard128_inplace_vk(row);
-        dsv4_fp4_act_quantize_row_inplace_vk(row, head_dim);
-    }
-    return 1;
+    if (x->bytes < bytes) return 0;
+    VkBuffer xbuf; VkDeviceSize xoff;
+    if (!find_tensor_buffer(x, xbuf, xoff)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && xoff % align != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[1] = {{xbuf, xoff, (VkDeviceSize)x->bytes}};
+    struct { uint32_t n_rows; } pc = {n_rows};
+    return record_simple_shader("indexer_qat", &pc, sizeof(pc), bufs, 1,
+                                n_rows, 1, 1, resume_recording);
 }
 
 } /* extern "C" close CPU fallbacks */
@@ -4970,174 +4987,6 @@ int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
  * The APE weight is added to the score rows (ape_type 0 = f32, 1 = f16).
  * ========================================================================= */
 
-/* Read one APE scalar from the mapped model. */
-static float compressor_ape_scalar(const void *model_map, uint64_t ape_offset,
-                                   uint32_t ape_type, uint64_t idx) {
-    const char *p = (const char *)model_map + ape_offset;
-    if (ape_type == 1u) {
-        const uint16_t *h = (const uint16_t *)p;
-        return ds4_half_to_float(h[idx]);
-    }
-    return ((const float *)p)[idx];
-}
-
-/* Host loop for CUDA compressor_set_rows_kernel: fill state rows
- * [dst0, dst0 + rows) from kv rows [src0, src0 + rows), adding the APE of
- * phase = (pos0 + src) % ratio to the score.  Used by prefill to initialize
- * the rolling state from the tail rows of the input window. */
-static void compressor_set_rows(
-        float *state_kv, float *state_score,
-        const float *kv, const float *sc,
-        const void *model_map, uint64_t ape_offset, uint32_t ape_type,
-        uint32_t width, uint32_t ratio, uint32_t pos0,
-        uint32_t src0, uint32_t dst0, uint32_t rows) {
-    for (uint32_t r = 0; r < rows; r++) {
-        const uint32_t src = src0 + r;
-        const uint32_t dst = dst0 + r;
-        const uint32_t phase = (pos0 + src) % ratio;
-        const uint64_t koff = (uint64_t)src * width;
-        const uint64_t doff = (uint64_t)dst * width;
-        for (uint32_t j = 0; j < width; j++) {
-            state_kv[doff + j] = kv[koff + j];
-            state_score[doff + j] = sc[koff + j] +
-                compressor_ape_scalar(model_map, ape_offset, ape_type,
-                                      (uint64_t)phase * width + j);
-        }
-    }
-}
-
-/* Host loop for CUDA compressor_update_pool_kernel: pool the current rolling
- * state (ratio-4: attention lane rows [0,4) at dim d + indexer lane rows
- * [4,8) at dim head_dim + d) into one comp row. */
-static void compressor_pool_state(float *out, const float *state_kv,
-                                  const float *state_score,
-                                  uint32_t head_dim, uint32_t ratio) {
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
-    float vals[128], scores[128];
-    for (uint32_t d = 0; d < head_dim; d++) {
-        uint32_t n_cand = 0;
-        float max_s = -INFINITY;
-        if (ratio == 4u) {
-            for (uint32_t r = 0; r < 4; r++) {
-                vals[n_cand] = state_kv[(uint64_t)r * width + d];
-                scores[n_cand] = state_score[(uint64_t)r * width + d];
-                if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                n_cand++;
-            }
-            for (uint32_t r = 0; r < 4; r++) {
-                vals[n_cand] = state_kv[(uint64_t)(4u + r) * width + head_dim + d];
-                scores[n_cand] = state_score[(uint64_t)(4u + r) * width + head_dim + d];
-                if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                n_cand++;
-            }
-        } else {
-            for (uint32_t r = 0; r < ratio; r++) {
-                vals[n_cand] = state_kv[(uint64_t)r * width + d];
-                scores[n_cand] = state_score[(uint64_t)r * width + d];
-                if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                n_cand++;
-            }
-        }
-        float den = 0.0f, acc = 0.0f;
-        for (uint32_t i = 0; i < n_cand; i++) {
-            const float w = expf(scores[i] - max_s);
-            den += w;
-            acc += vals[i] * w;
-        }
-        out[d] = den != 0.0f ? acc / den : 0.0f;
-    }
-}
-
-/* Host loop for CUDA compressor_prefill_pool_kernel: pool comp row c directly
- * from the kv/sc batch.  replay only matters for ratio-4 row 0 and is never
- * set by the prefill path (it belongs to the ratio4-replay sibling kernel). */
-static void compressor_prefill_pool(
-        float *comp,
-        const float *kv, const float *sc,
-        const float *state_kv, const float *state_score,
-        const void *model_map, uint64_t ape_offset, uint32_t ape_type,
-        uint32_t head_dim, uint32_t ratio, uint32_t pos0,
-        uint32_t n_comp, uint32_t replay) {
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
-    float vals[128], scores[128];
-    for (uint32_t c = 0; c < n_comp; c++) {
-        for (uint32_t d = 0; d < head_dim; d++) {
-            uint32_t n_cand = 0;
-            float max_s = -INFINITY;
-            if (ratio == 4u) {
-                if (replay && c == 0) {
-                    for (uint32_t r = 0; r < 4; r++) {
-                        vals[n_cand] = state_kv[(uint64_t)r * width + d];
-                        scores[n_cand] = state_score[(uint64_t)r * width + d];
-                        if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                        n_cand++;
-                    }
-                } else if (c > 0) {
-                    const uint32_t base = (c - 1u) * ratio;
-                    for (uint32_t r = 0; r < 4; r++) {
-                        const uint32_t t = base + r;
-                        const float ape = compressor_ape_scalar(
-                            model_map, ape_offset, ape_type,
-                            (uint64_t)((pos0 + t) % ratio) * width + d);
-                        vals[n_cand] = kv[(uint64_t)t * width + d];
-                        scores[n_cand] = sc[(uint64_t)t * width + d] + ape;
-                        if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                        n_cand++;
-                    }
-                }
-                const uint32_t base = c * ratio;
-                for (uint32_t r = 0; r < 4; r++) {
-                    const uint32_t t = base + r;
-                    const float ape = compressor_ape_scalar(
-                        model_map, ape_offset, ape_type,
-                        (uint64_t)((pos0 + t) % ratio) * width + head_dim + d);
-                    vals[n_cand] = kv[(uint64_t)t * width + head_dim + d];
-                    scores[n_cand] = sc[(uint64_t)t * width + head_dim + d] + ape;
-                    if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                    n_cand++;
-                }
-            } else {
-                const uint32_t base = c * ratio;
-                for (uint32_t r = 0; r < ratio; r++) {
-                    const uint32_t t = base + r;
-                    const float ape = compressor_ape_scalar(
-                        model_map, ape_offset, ape_type,
-                        (uint64_t)((pos0 + t) % ratio) * width + d);
-                    vals[n_cand] = kv[(uint64_t)t * width + d];
-                    scores[n_cand] = sc[(uint64_t)t * width + d] + ape;
-                    if (scores[n_cand] > max_s) max_s = scores[n_cand];
-                    n_cand++;
-                }
-            }
-            float den = 0.0f, acc = 0.0f;
-            for (uint32_t i = 0; i < n_cand; i++) {
-                const float w = expf(scores[i] - max_s);
-                den += w;
-                acc += vals[i] * w;
-            }
-            comp[(uint64_t)c * head_dim + d] = den != 0.0f ? acc / den : 0.0f;
-        }
-    }
-}
-
-/* Host loop for CUDA compressor_shift_ratio4_kernel: after emitting a comp
- * row, rows [4,8) (the new window) become both the attention and indexer
- * lanes for the next window. */
-static void compressor_shift_ratio4(float *state_kv, float *state_score,
-                                    uint32_t width) {
-    const uint64_t half = 4ull * width;
-    for (uint64_t i = 0; i < half; i++) {
-        const float v = state_kv[half + i];
-        const float s = state_score[half + i];
-        state_kv[i] = v;
-        state_score[i] = s;
-        state_kv[half + i] = v;
-        state_score[half + i] = s;
-    }
-}
-
 /* Store a batch of projected kv/score rows into the rolling compressor state.
  * Rows are mapped to state rows by (pos0 + t) % ratio; ratio-4 layers store
  * the window in the second lane (rows [ratio, 2*ratio)). */
@@ -5155,40 +5004,212 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
-        head_dim == 0 || ratio == 0 || n_tokens == 0 ||
-        (ape_type != 0u && ape_type != 1u)) {
-        return 0;
-    }
-    const uint32_t coff = ratio == 4u ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
-    const uint32_t state_rows = coff * ratio;
+        head_dim == 0 || ratio == 0 || ratio > 4u || n_tokens == 0 ||
+        (ape_type != 0u && ape_type != 1u) || n_tokens > 65535u) return 0;
+    const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
+    const uint32_t state_rows = (ratio == 4u ? 2u : 1u) * ratio;
     const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
     const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
     if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
-        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes)
         return 0;
-    }
+    VkBuffer skbuf, ssbuf, kvbuf, scbuf, abuf;
+    VkDeviceSize skoff, ssoff, kvoff, scoff, aoff, arange;
+    if (!find_tensor_buffer(state_kv, skbuf, skoff) ||
+        !find_tensor_buffer(state_score, ssbuf, ssoff) ||
+        !find_tensor_buffer(kv, kvbuf, kvoff) || !find_tensor_buffer(sc, scbuf, scoff) ||
+        !find_model_buffer(ape_offset, ape_bytes, abuf, aoff, arange)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((skoff | ssoff | kvoff | scoff | aoff) % align) != 0) return 0;
+    const uint64_t work = (uint64_t)n_tokens * width;
+    const uint32_t groups = (uint32_t)((work + 255u) / 256u);
+    if (groups == 0 || groups > 65535u) return 0;
+    auto &ctx = get_cmd_ctx(); const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[5] = {
+        {skbuf, skoff, (VkDeviceSize)state_kv->bytes},
+        {ssbuf, ssoff, (VkDeviceSize)state_score->bytes},
+        {kvbuf, kvoff, (VkDeviceSize)kv->bytes},
+        {scbuf, scoff, (VkDeviceSize)sc->bytes},
+        {abuf, aoff, (VkDeviceSize)ape_bytes}};
+    struct { uint32_t width, ratio, pos0, n_tokens, ape_type, r0, r1, r2; }
+        pc = {width, ratio, pos0, n_tokens, ape_type, 0, 0, 0};
+    DS4_VK_TRACE_KERNEL("compressor_store");
+    return record_simple_shader("compressor_store", &pc, sizeof(pc), bufs, 5,
+                                groups, 1, 1, resume_recording);
+}
 
-    float *skvp = (float *)state_kv->ptr;
-    float *sscp = (float *)state_score->ptr;
-    const float *kvp = (const float *)kv->ptr;
-    const float *scp = (const float *)sc->ptr;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint32_t pos_mod = (pos0 + t) % ratio;
-        const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
-        const uint64_t koff = (uint64_t)t * width;
-        const uint64_t doff = (uint64_t)dst_row * width;
-        for (uint32_t j = 0; j < width; j++) {
-            skvp[doff + j] = kvp[koff + j];
-            sscp[doff + j] = scp[koff + j] +
-                compressor_ape_scalar(model_map, ape_offset, ape_type,
-                                      (uint64_t)pos_mod * width + j);
-        }
-    }
-    return 1;
+static int compressor_clear_vk(ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score,
+                               uint32_t count, float kv_value, float score_value) {
+    if (!state_kv || !state_score || count == 0 || count > 0xffffffffu - 255u) return 0;
+    VkBuffer state_kv_buf, state_score_buf;
+    VkDeviceSize state_kv_off, state_score_off;
+    if (!find_tensor_buffer(state_kv, state_kv_buf, state_kv_off) ||
+        !find_tensor_buffer(state_score, state_score_buf, state_score_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((state_kv_off | state_score_off) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[2] = {
+        {state_kv_buf, state_kv_off, (VkDeviceSize)state_kv->bytes},
+        {state_score_buf, state_score_off, (VkDeviceSize)state_score->bytes}};
+    struct { uint32_t count; float kv_value; float score_value; }
+        pc = {count, kv_value, score_value};
+    return record_simple_shader("compressor_clear", &pc, sizeof(pc), bufs, 2,
+                                (count + 255u) / 256u, 1, 1, resume);
+}
+
+static int compressor_set_rows_vk(
+        const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc,
+        ds4_gpu_tensor *state_kv, ds4_gpu_tensor *state_score,
+        VkBuffer ape_buf, VkDeviceSize ape_off, uint32_t ape_type,
+        uint32_t width, uint32_t ratio, uint32_t pos0,
+        uint32_t src0, uint32_t dst0, uint32_t rows) {
+    if (rows == 0 || width == 0 || width > 4096u || ratio == 0 || ratio > 4u ||
+        rows > 65535u || !shader_f32_domain(rows, width, 1)) return 0;
+    VkBuffer kv_buf, sc_buf, state_kv_buf, state_score_buf;
+    VkDeviceSize kv_off, sc_off, state_kv_off, state_score_off;
+    if (!find_tensor_buffer(kv, kv_buf, kv_off) ||
+        !find_tensor_buffer(sc, sc_buf, sc_off) ||
+        !find_tensor_buffer(state_kv, state_kv_buf, state_kv_off) ||
+        !find_tensor_buffer(state_score, state_score_buf, state_score_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((kv_off | sc_off | state_kv_off | state_score_off | ape_off) % align) != 0)
+        return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[5] = {
+        {state_kv_buf, state_kv_off, (VkDeviceSize)state_kv->bytes},
+        {state_score_buf, state_score_off, (VkDeviceSize)state_score->bytes},
+        {kv_buf, kv_off, (VkDeviceSize)kv->bytes},
+        {sc_buf, sc_off, (VkDeviceSize)sc->bytes},
+        {ape_buf, ape_off, VK_WHOLE_SIZE}};
+    struct { uint32_t width, ratio, pos0, src0, dst0, rows, ape_type, reserved; }
+        pc = {width, ratio, pos0, src0, dst0, rows, ape_type, 0};
+    return record_simple_shader("compressor_set_rows", &pc, sizeof(pc), bufs, 5,
+                                (uint32_t)(((uint64_t)rows * width + 255u) / 256u),
+                                1, 1, resume);
+}
+
+static int compressor_pool_vk(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *sc,
+        const ds4_gpu_tensor *state_kv, const ds4_gpu_tensor *state_score,
+        VkBuffer ape_buf, VkDeviceSize ape_off, uint32_t ape_type,
+        uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_comp,
+        bool replay) {
+    VkBuffer out_buf, kv_buf, sc_buf, state_kv_buf, state_score_buf;
+    VkDeviceSize out_off, kv_off, sc_off, state_kv_off, state_score_off;
+    if (!find_tensor_buffer(out, out_buf, out_off) ||
+        !find_tensor_buffer(kv, kv_buf, kv_off) ||
+        !find_tensor_buffer(sc, sc_buf, sc_off) ||
+        !find_tensor_buffer(state_kv, state_kv_buf, state_kv_off) ||
+        !find_tensor_buffer(state_score, state_score_buf, state_score_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((out_off | kv_off | sc_off | state_kv_off | state_score_off | ape_off) % align) != 0)
+        return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[6] = {
+        {out_buf, out_off, (VkDeviceSize)out->bytes},
+        {kv_buf, kv_off, (VkDeviceSize)kv->bytes},
+        {sc_buf, sc_off, (VkDeviceSize)sc->bytes},
+        {state_kv_buf, state_kv_off, (VkDeviceSize)state_kv->bytes},
+        {state_score_buf, state_score_off, (VkDeviceSize)state_score->bytes},
+        {ape_buf, ape_off, VK_WHOLE_SIZE}};
+    struct { uint32_t head_dim, ratio, pos0, n_comp, ape_type, replay, r0, r1; }
+        pc = {head_dim, ratio, pos0, n_comp, ape_type, replay ? 1u : 0u, 0, 0};
+    return record_simple_shader("compressor_pool", &pc, sizeof(pc), bufs, 6,
+                                (head_dim + 255u) / 256u, n_comp, 1, resume);
+}
+
+static int compressor_pool_state_vk(ds4_gpu_tensor *out,
+                                    const ds4_gpu_tensor *state_kv,
+                                    const ds4_gpu_tensor *state_score,
+                                    uint32_t head_dim, uint32_t ratio) {
+    VkBuffer out_buf, state_kv_buf, state_score_buf;
+    VkDeviceSize out_off, state_kv_off, state_score_off;
+    if (!find_tensor_buffer(out, out_buf, out_off) ||
+        !find_tensor_buffer(state_kv, state_kv_buf, state_kv_off) ||
+        !find_tensor_buffer(state_score, state_score_buf, state_score_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((out_off | state_kv_off | state_score_off) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[3] = {
+        {out_buf, out_off, (VkDeviceSize)out->bytes},
+        {state_kv_buf, state_kv_off, (VkDeviceSize)state_kv->bytes},
+        {state_score_buf, state_score_off, (VkDeviceSize)state_score->bytes}};
+    struct { uint32_t head_dim, ratio; } pc = {head_dim, ratio};
+    return record_simple_shader("compressor_pool_state", &pc, sizeof(pc), bufs, 3,
+                                (head_dim + 255u) / 256u, 1, 1, resume);
+}
+
+static int compressor_shift_ratio4_vk(ds4_gpu_tensor *state_kv,
+                                      ds4_gpu_tensor *state_score,
+                                      uint32_t width) {
+    VkBuffer state_kv_buf, state_score_buf;
+    VkDeviceSize state_kv_off, state_score_off;
+    if (!find_tensor_buffer(state_kv, state_kv_buf, state_kv_off) ||
+        !find_tensor_buffer(state_score, state_score_buf, state_score_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((state_kv_off | state_score_off) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[2] = {
+        {state_kv_buf, state_kv_off, (VkDeviceSize)state_kv->bytes},
+        {state_score_buf, state_score_off, (VkDeviceSize)state_score->bytes}};
+    return record_simple_shader("compressor_shift_ratio4", &width, sizeof(width), bufs, 2,
+                                (uint32_t)(((uint64_t)width * 4u + 255u) / 256u),
+                                1, 1, resume);
+}
+
+static int compressor_rope_stride_vk(ds4_gpu_tensor *x, uint32_t n_tok,
+                                     uint32_t head_dim, uint32_t n_rot,
+                                     uint32_t pos0, uint32_t pos_stride,
+                                     uint32_t n_ctx_orig, float freq_base,
+                                     float freq_scale, float ext_factor,
+                                     float attn_factor, float beta_fast,
+                                     float beta_slow) {
+    if (!x || n_tok == 0 || head_dim == 0 || n_rot == 0 || n_rot > head_dim ||
+        (n_rot & 1u) != 0 || n_tok > 65535u || freq_base <= 0.0f ||
+        freq_scale <= 0.0f) return 0;
+    if ((uint64_t)n_tok > UINT64_MAX / head_dim ||
+        (uint64_t)n_tok * head_dim > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_tok * head_dim * sizeof(float) > x->bytes) return 0;
+    const uint64_t pairs = (uint64_t)n_tok * (n_rot / 2u);
+    if (pairs == 0 || pairs > UINT32_MAX - 255u ||
+        (pairs + 255u) / 256u > 65535u) return 0;
+    VkBuffer x_buf; VkDeviceSize x_off;
+    if (!find_tensor_buffer(x, x_buf, x_off)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && x_off % align != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[1] = {{x_buf, x_off, (VkDeviceSize)x->bytes}};
+    struct Push {
+        uint32_t n_tok, head_dim, n_rot, pos0, pos_stride, n_ctx_orig;
+        int32_t inverse;
+        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    } pc = {n_tok, head_dim, n_rot, pos0, pos_stride, n_ctx_orig, 0,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow};
+    return record_simple_shader("compressor_rope_stride", &pc, sizeof(pc), bufs, 1,
+                                (uint32_t)((pairs + 255u) / 256u), 1, 1, resume);
 }
 
 /* Streaming decode update for one token.  Stores the projected kv/score row
@@ -5224,6 +5245,51 @@ int ds4_gpu_compressor_update_tensor(
         bool                    state_already_stored,
         bool                    decode_one_token,
         bool                    defer_finalize) {
+    DS4_VK_TRACE_KERNEL("compressor_update");
+    if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache || !model_map ||
+        head_dim == 0 || ratio == 0 || ratio > 4u || n_rot > head_dim ||
+        (n_rot & 1u) != 0 || (ape_type != 0u && ape_type != 1u) || norm_type != 0u)
+        return 0;
+    const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
+    const uint32_t state_rows = (ratio == 4u ? 2u : 1u) * ratio;
+    const bool emit = ((pos + 1u) % ratio) == 0u;
+    const uint64_t ape_bytes = (uint64_t)width * ratio * (ape_type == 1u ? 2u : 4u);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || row_bytes > model_size - norm_offset ||
+        kv_cur->bytes < (uint64_t)width * sizeof(float) ||
+        sc_cur->bytes < (uint64_t)width * sizeof(float) ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
+        (emit && ((uint64_t)comp_row + 1u) * row_bytes > comp_cache->bytes)) return 0;
+    set_model_map_identity(model_map, model_size);
+    VkBuffer ape_buf; VkDeviceSize ape_off, ape_range;
+    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) return 0;
+    if (!state_already_stored && !ds4_gpu_compressor_store_batch_tensor(
+            kv_cur, sc_cur, state_kv, state_score, model_map, model_size,
+            ape_offset, ape_type, head_dim, ratio, pos, 1)) return 0;
+    if (!emit) return 1;
+    ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+        comp_cache, (uint64_t)comp_row * row_bytes, row_bytes);
+    if (!row) return 0;
+    int ok = compressor_pool_state_vk(row, state_kv, state_score, head_dim, ratio);
+    /* A successful update always leaves the emitted row and rolling state
+     * finalized, including when called by the fused projection path. */
+    if (ok)
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(row, row, model_map, model_size,
+                                                  norm_offset, head_dim, 1, rms_eps);
+    if (ok && n_rot != 0)
+        ok = ds4_gpu_rope_tail_tensor(row, 1, 1, head_dim, n_rot,
+                                      pos + 1u - ratio, n_ctx_orig, false,
+                                      freq_base, freq_scale, ext_factor, attn_factor,
+                                      beta_fast, beta_slow);
+    if (ok && ratio == 4u)
+        ok = compressor_shift_ratio4_vk(state_kv, state_score, width);
+    ds4_gpu_tensor_free(row);
+    (void)decode_one_token;
+    (void)defer_finalize;
+    return ok;
+#if 0
     (void)decode_one_token;
     (void)defer_finalize;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
@@ -5289,6 +5355,7 @@ int ds4_gpu_compressor_update_tensor(
                                 (float *)state_score->ptr, width);
     }
     return 1;
+#endif
 }
 
 /* Prefill compression: pool the kv/sc batch into comp_cache (n_comp = n_tokens
@@ -5321,6 +5388,63 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps) {
+    DS4_VK_TRACE_KERNEL("compressor_prefill");
+    if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
+        head_dim == 0 || ratio == 0 || ratio > 4u || n_tokens == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0 ||
+        (ape_type != 0u && ape_type != 1u) || norm_type != 0u || n_tokens > 65535u)
+        return 0;
+    const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
+    const uint32_t state_rows = (ratio == 4u ? 2u : 1u) * ratio;
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint32_t cutoff = n_comp * ratio;
+    const uint32_t rem = n_tokens - cutoff;
+    const uint64_t ape_bytes = (uint64_t)width * ratio * (ape_type == 1u ? 2u : 4u);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset ||
+        kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
+        (n_comp != 0 && comp_cache->bytes < comp_bytes)) return 0;
+    set_model_map_identity(model_map, model_size);
+    VkBuffer ape_buf; VkDeviceSize ape_off, ape_range;
+    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) return 0;
+    if (!compressor_clear_vk(state_kv, state_score, state_rows * width,
+                             0.0f, -INFINITY)) return 0;
+    int ok = 1;
+    if (ratio == 4u) {
+        if (cutoff >= ratio)
+            ok = compressor_set_rows_vk(kv, sc, state_kv, state_score, ape_buf, ape_off,
+                                        ape_type, width, ratio, pos0,
+                                        cutoff - ratio, 0, ratio);
+        if (ok && rem != 0)
+            ok = compressor_set_rows_vk(kv, sc, state_kv, state_score, ape_buf, ape_off,
+                                        ape_type, width, ratio, pos0,
+                                        cutoff, ratio, rem);
+    } else if (rem != 0) {
+        ok = compressor_set_rows_vk(kv, sc, state_kv, state_score, ape_buf, ape_off,
+                                    ape_type, width, ratio, pos0,
+                                    cutoff, 0, rem);
+    }
+    if (ok && n_comp != 0)
+        ok = compressor_pool_vk(comp_cache, kv, sc, state_kv, state_score,
+                                ape_buf, ape_off, ape_type, head_dim, ratio, pos0,
+                                n_comp, false);
+    if (ok && n_comp != 0)
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache, model_map,
+                                                  model_size, norm_offset, head_dim,
+                                                  n_comp, rms_eps);
+    if (ok && n_comp != 0 && n_rot != 0)
+        ok = compressor_rope_stride_vk(comp_cache, n_comp, head_dim, n_rot, pos0, ratio,
+                                       n_ctx_orig, freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow);
+    if (ok && n_comp != 0 && quantize_fp8)
+        ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot);
+    return ok;
+#if 0
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -5412,6 +5536,60 @@ int ds4_gpu_compressor_prefill_tensor(
         }
     }
     return 1;
+#endif
+}
+
+int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+        ds4_gpu_tensor *comp_cache, ds4_gpu_tensor *state_kv,
+        ds4_gpu_tensor *state_score, const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc, const void *model_map, uint64_t model_size,
+        uint64_t ape_offset, uint32_t ape_type, uint64_t norm_offset,
+        uint32_t norm_type, uint32_t head_dim, uint32_t pos0,
+        uint32_t n_tokens, uint32_t n_rot, uint32_t n_ctx_orig,
+        bool quantize_fp8, float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow, float rms_eps) {
+    DS4_VK_TRACE_KERNEL("compressor_prefill_ratio4_replay");
+    if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
+        head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 ||
+        (pos0 & 3u) != 0 || n_rot > head_dim || (n_rot & 1u) != 0 ||
+        (ape_type != 0u && ape_type != 1u) || norm_type != 0u || n_tokens > 65535u)
+        return 0;
+    const uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint32_t n_comp = n_tokens / ratio;
+    const uint64_t ape_bytes = (uint64_t)width * ratio * (ape_type == 1u ? 2u : 4u);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * width * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t norm_bytes = (uint64_t)head_dim * sizeof(float);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        norm_offset > model_size || norm_bytes > model_size - norm_offset ||
+        kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
+        comp_cache->bytes < comp_bytes) return 0;
+    set_model_map_identity(model_map, model_size);
+    VkBuffer ape_buf; VkDeviceSize ape_off, ape_range;
+    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) return 0;
+    int ok = compressor_pool_vk(comp_cache, kv, sc, state_kv, state_score,
+                                ape_buf, ape_off, ape_type, head_dim, ratio, pos0,
+                                n_comp, true);
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache, model_map,
+                                                      model_size, norm_offset, head_dim,
+                                                      n_comp, rms_eps);
+    if (ok && n_rot != 0)
+        ok = compressor_rope_stride_vk(comp_cache, n_comp, head_dim, n_rot, pos0, ratio,
+                                       n_ctx_orig, freq_base, freq_scale, ext_factor,
+                                       attn_factor, beta_fast, beta_slow);
+    if (ok && quantize_fp8)
+        ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot);
+    if (ok && !compressor_clear_vk(state_kv, state_score, state_rows * width,
+                                   0.0f, -INFINITY)) ok = 0;
+    if (ok)
+        ok = compressor_set_rows_vk(kv, sc, state_kv, state_score, ape_buf, ape_off,
+                                    ape_type, width, ratio, pos0,
+                                    n_tokens - ratio, 0, ratio);
+    return ok;
 }
 
 /* ---- matmul_f16_pair_compressor_store_tensor (host-side fused path) ----
@@ -5430,11 +5608,7 @@ int ds4_gpu_compressor_prefill_tensor(
  * ds4_gpu_compressor_store_batch_tensor: ratio-4 layers keep the current
  * window in the second lane (rows [ratio, 2*ratio)).
  *
- * This is host-side (tensor->ptr is host-mapped in this backend), so no
- * command buffer is involved.  Returns 1 when the fused store was
- * performed (the engine then skips the re-store in compressor_update),
- * -1 on an attempted-path error, 0 when the optimized path is
- * unavailable. */
+ * The projections and state update are composed from Vulkan dispatches. */
 int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         ds4_gpu_tensor       *out_kv,
         ds4_gpu_tensor       *out_score,
@@ -5451,16 +5625,19 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                ratio,
         uint32_t                pos) {
-    if (!out_kv || !out_score || !state_kv || !state_score ||
-        !model_map || !x ||
-        in_dim == 0 || width == 0 || ratio == 0 ||
+    if (!out_kv || !out_score || !state_kv || !state_score || !model_map || !x ||
+        in_dim == 0 || width == 0 || ratio == 0 || ratio > 4u ||
+        in_dim > UINT32_MAX || width > UINT32_MAX ||
         (ape_type != 0u && ape_type != 1u)) {
         return -1;
     }
+    if (in_dim > UINT64_MAX / width ||
+        in_dim * width > UINT64_MAX / 2u) return -1;
     const uint32_t coff = ratio == 4u ? 2u : 1u;
+    if (coff > UINT32_MAX / ratio) return -1;
     const uint32_t state_rows = coff * ratio;
     const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
-    const uint64_t weight_bytes = in_dim * (uint64_t)width * 2u; /* f16 */
+    const uint64_t weight_bytes = in_dim * (uint64_t)width * 2u;
     const uint64_t out_bytes = (uint64_t)width * sizeof(float);
     const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
     const uint64_t ape_bytes = (uint64_t)width * ratio * elem_ape;
@@ -5469,45 +5646,22 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         weight_score_offset > model_size ||
         weight_bytes > model_size - weight_score_offset ||
         ape_offset > model_size || ape_bytes > model_size - ape_offset ||
-        x->bytes < in_dim * sizeof(float) ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        in_dim * sizeof(float) > x->bytes ||
         out_kv->bytes < out_bytes || out_score->bytes < out_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes) {
         return -1;
     }
 
-    const uint16_t *wkv = (const uint16_t *)((const char *)model_map + weight_kv_offset);
-    const uint16_t *wsc = (const uint16_t *)((const char *)model_map + weight_score_offset);
-    const float *xp = (const float *)x->ptr;
-    float *okv = (float *)out_kv->ptr;
-    float *osc = (float *)out_score->ptr;
-    float *skv = (float *)state_kv->ptr;
-    float *ssc = (float *)state_score->ptr;
-
-    /* Paired F16 matvec: out[o] = sum_i W[o][i] * x[i], decoded as IEEE
-     * halves (same storage/order as the matmul_f16 shader). */
-    for (uint32_t o = 0; o < width; o++) {
-        const uint16_t *rk = wkv + (uint64_t)o * in_dim;
-        const uint16_t *rs = wsc + (uint64_t)o * in_dim;
-        double akv = 0.0, asc = 0.0;
-        for (uint64_t i = 0; i < in_dim; i++) {
-            akv += (double)ds4_half_to_float(rk[i]) * (double)xp[i];
-            asc += (double)ds4_half_to_float(rs[i]) * (double)xp[i];
-        }
-        okv[o] = (float)akv;
-        osc[o] = (float)asc;
-    }
-
-    /* Rolling state store (compressor_store_batch semantics, one token). */
-    const uint32_t pos_mod = pos % ratio;
-    const uint32_t dst_row = ratio == 4u ? ratio + pos_mod : pos_mod;
-    const uint64_t doff = (uint64_t)dst_row * width;
-    for (uint32_t j = 0; j < width; j++) {
-        skv[doff + j] = okv[j];
-        ssc[doff + j] = osc[j] +
-            compressor_ape_scalar(model_map, ape_offset, ape_type,
-                                  (uint64_t)pos_mod * width + j);
-    }
-    return 1;
+    set_model_map_identity(model_map, model_size);
+    if (!ds4_gpu_matmul_f16_tensor(out_kv, model_map, model_size,
+                                   weight_kv_offset, in_dim, width, x, 1) ||
+        !ds4_gpu_matmul_f16_tensor(out_score, model_map, model_size,
+                                   weight_score_offset, in_dim, width, x, 1))
+        return 0;
+    return ds4_gpu_compressor_store_batch_tensor(
+        out_kv, out_score, state_kv, state_score, model_map, model_size,
+        ape_offset, ape_type, width / coff, ratio, pos, 1) ? 1 : 0;
 }
 
 /* ---- matmul_q8_0_f16_out_tensor (host-side, f16 output) ----
@@ -5582,27 +5736,13 @@ int ds4_gpu_matmul_f16_pair_tensor(
         out_dim * n_tok * sizeof(float) > out_b->bytes)
         return -1;
 
-    const uint16_t *wa = (const uint16_t *)((const char *)model_map + weight_a_offset);
-    const uint16_t *wb = (const uint16_t *)((const char *)model_map + weight_b_offset);
-    const float *xp = (const float *)x->ptr;
-    float *oa = (float *)out_a->ptr;
-    float *ob = (float *)out_b->ptr;
-    for (uint64_t t = 0; t < n_tok; t++) {
-        const float *xt = xp + t * in_dim;
-        for (uint64_t o = 0; o < out_dim; o++) {
-            const uint16_t *ra = wa + o * in_dim;
-            const uint16_t *rb = wb + o * in_dim;
-            double acca = 0.0, accb = 0.0;
-            for (uint64_t i = 0; i < in_dim; i++) {
-                acca += (double)ds4_half_to_float(ra[i]) * (double)xt[i];
-                accb += (double)ds4_half_to_float(rb[i]) * (double)xt[i];
-            }
-                        oa[t * out_dim + o] = (float)acca;
-                        ob[t * out_dim + o] = (float)accb;
-                    }
-                }
-                return 1;
-            }
+    if (!ds4_gpu_matmul_f16_tensor(out_a, model_map, model_size,
+                                    weight_a_offset, in_dim, out_dim,
+                                    x, n_tok)) return 0;
+    return ds4_gpu_matmul_f16_tensor(out_b, model_map, model_size,
+                                     weight_b_offset, in_dim, out_dim,
+                                     x, n_tok);
+}
             
 /* =========================================================================
  * ds4_gpu_compressor_prefill_state_ratio4_tensor
@@ -5634,6 +5774,27 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                pos0) {
     DS4_VK_TRACE_KERNEL("compressor_prefill_state_ratio4");
     if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
+        head_dim == 0 || (ape_type != 0u && ape_type != 1u)) return 0;
+    const uint32_t ratio = 4u;
+    const uint32_t width = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint64_t ape_bytes = (uint64_t)ratio * width * (ape_type == 1u ? 2u : 4u);
+    const uint64_t state_bytes = (uint64_t)state_rows * width * sizeof(float);
+    const uint64_t tail_bytes = (uint64_t)ratio * width * sizeof(float);
+    if (ape_offset > model_size || ape_bytes > model_size - ape_offset ||
+        kv_tail->bytes < tail_bytes || sc_tail->bytes < tail_bytes ||
+        state_kv->bytes < state_bytes || state_score->bytes < state_bytes) return 0;
+    set_model_map_identity(model_map, model_size);
+    VkBuffer ape_buf; VkDeviceSize ape_off, ape_range;
+    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) return 0;
+    if (!compressor_clear_vk(state_kv, state_score, state_rows * width,
+                             0.0f, -INFINITY)) return 0;
+    return compressor_set_rows_vk(kv_tail, sc_tail, state_kv, state_score,
+                                  ape_buf, ape_off, ape_type, width, ratio, pos0,
+                                  0, 0, ratio);
+#if 0
+    DS4_VK_TRACE_KERNEL("compressor_prefill_state_ratio4");
+    if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
         head_dim == 0 || (ape_type != 0u && ape_type != 1u)) {
         return 0;
     }
@@ -5662,6 +5823,7 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
                         width, ratio, pos0,
                         0, 0, ratio);
     return 1;
+#endif
 }
 
 /* ---- AUTO-GENERATED CPU IMPLEMENTATIONS ---- */

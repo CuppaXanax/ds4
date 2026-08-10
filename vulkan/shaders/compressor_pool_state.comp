@@ -1,0 +1,43 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Out { float out_buf[]; };
+layout(set = 0, binding = 1) readonly buffer StateKV { float state_kv[]; };
+layout(set = 0, binding = 2) readonly buffer StateScore { float state_score[]; };
+layout(push_constant) uniform PC { uint head_dim; uint ratio; } pc;
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= pc.head_dim) return;
+    uint width = pc.ratio == 4u ? 2u * pc.head_dim : pc.head_dim;
+    float values[8];
+    float scores[8];
+    uint count = 0u;
+    float max_score = -1.0 / 0.0;
+    if (pc.ratio == 4u) {
+        for (uint r = 0u; r < 4u; ++r) {
+            values[count] = state_kv[r * width + d];
+            scores[count] = state_score[r * width + d];
+            max_score = max(max_score, scores[count++]);
+        }
+        for (uint r = 0u; r < 4u; ++r) {
+            values[count] = state_kv[(4u + r) * width + pc.head_dim + d];
+            scores[count] = state_score[(4u + r) * width + pc.head_dim + d];
+            max_score = max(max_score, scores[count++]);
+        }
+    } else {
+        for (uint r = 0u; r < 4u; ++r) {
+            if (r >= pc.ratio) break;
+            values[count] = state_kv[r * width + d];
+            scores[count] = state_score[r * width + d];
+            max_score = max(max_score, scores[count++]);
+        }
+    }
+    float denom = 0.0;
+    float accum = 0.0;
+    for (uint i = 0u; i < count; ++i) {
+        float weight = exp(scores[i] - max_score);
+        denom += weight;
+        accum += values[i] * weight;
+    }
+    out_buf[d] = denom > 0.0 ? accum / denom : 0.0;
+}

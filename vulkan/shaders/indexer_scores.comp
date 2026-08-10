@@ -1,0 +1,45 @@
+#version 460 core
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Scores { float scores[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 2) readonly buffer Weights { float weights[]; };
+layout(set = 0, binding = 3) readonly buffer IndexComp { float index_comp[]; };
+
+layout(push_constant) uniform PC {
+    uint n_comp;
+    uint n_tokens;
+    uint pos0;
+    uint n_head;
+    uint head_dim;
+    uint ratio;
+    uint causal;
+    float scale;
+} pc;
+
+void main() {
+    uint c = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (c >= pc.n_comp || t >= pc.n_tokens) return;
+
+    if (pc.causal != 0u) {
+            uint position = pc.pos0 + t;
+            uint visible = min(pc.n_comp, position / pc.ratio +
+                                      (position % pc.ratio + 1u) / pc.ratio);
+        if (c >= visible) {
+            scores[t * pc.n_comp + c] = -1.0 / 0.0;
+            return;
+        }
+    }
+
+    float total = 0.0;
+    for (uint h = 0u; h < pc.n_head; ++h) {
+        uint q_base = (t * pc.n_head + h) * pc.head_dim;
+        uint k_base = c * pc.head_dim;
+        float dot = 0.0;
+        for (uint d = 0u; d < pc.head_dim; ++d)
+            dot += q[q_base + d] * index_comp[k_base + d];
+        total += max(dot, 0.0) * weights[t * pc.n_head + h];
+    }
+    scores[t * pc.n_comp + c] = total * pc.scale;
+}

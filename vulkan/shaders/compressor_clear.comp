@@ -1,0 +1,16 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer StateKV { float state_kv[]; };
+layout(set = 0, binding = 1) buffer StateScore { float state_score[]; };
+layout(push_constant) uniform PC {
+    uint count;
+    float kv_value;
+    float score_value;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.count) return;
+    state_kv[gid] = pc.kv_value;
+    state_score[gid] = pc.score_value;
+}

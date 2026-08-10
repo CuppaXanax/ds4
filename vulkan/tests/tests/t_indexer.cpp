@@ -1,8 +1,7 @@
-/* Kernel tests: DS4 compressed-attention indexer (host-side CPU fallbacks).
+/* Kernel tests: DS4 compressed-attention indexer (real Vulkan dispatches).
  *
- * The three kernels under test are CPU-hosted over the host-mapped tensor
- * memory (same pattern as ds4_gpu_add_tensor / ds4_gpu_router_select_tensor),
- * so NO begin_commands/end_commands are needed to read back the outputs.
+ * The indexer score, top-k, and mask paths are GPU dispatches. Tensor reads
+ * below synchronize the recorded work before checking the results.
  *
  * Reference math, replicated from the engine CPU path (ds4.c
  * indexer_allowed_decode_one* score loop) and the Metal/CUDA indexer score
@@ -291,6 +290,57 @@ done:
     return rc;
 }
 REGISTER_TEST(indexer_topk, test_indexer_topk);
+
+/* The canonical indexer keeps up to 512 compressed rows.  This exercises the
+ * full output width without making the regular small ordering test expensive. */
+static int test_indexer_topk_512_masked(void) {
+    const uint32_t n_comp = 520, n_tokens = 1, top_k = 512;
+    std::vector<float> scores(n_comp);
+    const uint32_t finite_rows = 37;
+    for (uint32_t c = 0; c < finite_rows; c++) scores[c] = (float)(finite_rows - c);
+    for (uint32_t c = finite_rows; c < 437; c++) scores[c] = -INFINITY;
+    for (uint32_t c = 437; c < n_comp; c++) scores[c] = NAN;
+
+    std::vector<uint32_t> ref(top_k);
+    ref_topk_row(scores.data(), n_comp, top_k, ref.data());
+    ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(scores.size() * sizeof(float));
+    ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *mt = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    std::vector<uint32_t> got(top_k);
+    std::vector<float> mask(n_comp);
+    int rc = 1;
+    if (!st || !ot || !mt) goto done;
+    if (ds4_gpu_tensor_write(st, 0, scores.data(), scores.size() * sizeof(float)) == 0 ||
+        ds4_gpu_indexer_topk_tensor(ot, st, n_comp, n_tokens, top_k) == 0 ||
+        ds4_gpu_dsv4_topk_mask_tensor(mt, ot, n_comp, n_tokens, top_k) == 0 ||
+        ds4_gpu_tensor_read(ot, 0, got.data(), got.size() * sizeof(uint32_t)) == 0 ||
+        ds4_gpu_tensor_read(mt, 0, mask.data(), mask.size() * sizeof(float)) == 0)
+        goto done;
+
+    rc = 0;
+    for (uint32_t k = 0; k < top_k; k++) {
+        if (got[k] != ref[k]) {
+            fprintf(stderr, "indexer_topk_512: k=%u got %u want %u\n",
+                    k, got[k], ref[k]);
+            rc = 1;
+        }
+    }
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const bool selected_row = std::find(ref.begin(), ref.end(), c) != ref.end();
+        const float want = selected_row ? 0.0f : -INFINITY;
+        if ((std::isinf(want) && !(std::isinf(mask[c]) && mask[c] < 0.0f)) ||
+            (!std::isinf(want) && mask[c] != want)) {
+            fprintf(stderr, "indexer_topk_512: mask c=%u got %.6f\n", c, mask[c]);
+            rc = 1;
+        }
+    }
+done:
+    if (mt) ds4_gpu_tensor_free(mt);
+    if (ot) ds4_gpu_tensor_free(ot);
+    if (st) ds4_gpu_tensor_free(st);
+    return rc;
+}
+REGISTER_TEST(indexer_topk_512_masked, test_indexer_topk_512_masked);
 
 /* ------------------------------------------------------------------ */
 /* end-to-end decode path: score_one -> topk                          */

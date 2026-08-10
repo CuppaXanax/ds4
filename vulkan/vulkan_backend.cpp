@@ -1586,19 +1586,34 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
     return 1;
 }
 
+static float ds4_half_to_float(uint16_t h); /* defined below in this TU */
+static void ds4_embed_f16_row(float *out, const uint8_t *row, uint64_t n_embd);
+static int ds4_embed_row_ok(const void *model_map, uint64_t model_size,
+                            uint64_t weight_offset, uint64_t id, uint64_t row_bytes);
+
 /* ---- embed_token_hc_tensor ---- */
 int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc,
     const void *model_map, uint64_t model_size, uint64_t weight_offset,
     uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc)
 {
     DS4_VK_TRACE_KERNEL("embed_token_hc");
-    (void)model_size; (void)n_hc;
-    if (!out_hc || !model_map) return 0;
+    if (!out_hc || !model_map || n_vocab == 0 || n_embd == 0 || n_hc == 0) return 0;
     int32_t id = (int32_t)token;
     if (id < 0) id = 0;
     if ((uint32_t)id >= n_vocab) id = 0;
-    const float *w = (const float*)((const char*)model_map + weight_offset);
-    memcpy(out_hc->ptr, w + (uint64_t)id * n_embd, n_embd * sizeof(float));
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t out_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    if (out_hc->bytes < out_bytes ||
+        !ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes)) {
+        return 0;
+    }
+    float *out = (float *)out_hc->ptr;
+    ds4_embed_f16_row(out,
+                      (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
+                      n_embd);
+    for (uint32_t h = 1; h < n_hc; h++) {
+        memcpy(out + (uint64_t)h * n_embd, out, (size_t)n_embd * sizeof(float));
+    }
     return 1;
 }
 
@@ -1607,16 +1622,29 @@ int ds4_gpu_embed_tokens_hc_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     const void *model_map, uint64_t model_size, uint64_t weight_offset,
     uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc)
 {
-    (void)model_size; (void)n_hc;
-    if (!out_hc || !tokens || !model_map) return 0;
+    if (!out_hc || !tokens || !model_map || n_vocab == 0 ||
+        n_tokens == 0 || n_embd == 0 || n_hc == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t out_bytes = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
+    if (tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) || out_hc->bytes < out_bytes)
+        return 0;
     const int32_t *tok = (const int32_t*)tokens->ptr;
     float *out = (float*)out_hc->ptr;
-    const float *w = (const float*)((const char*)model_map + weight_offset);
     for (uint32_t t = 0; t < n_tokens; t++) {
         int32_t id = tok[t];
         if (id < 0) id = 0;
         if ((uint32_t)id >= n_vocab) id = 0;
-        memcpy(out + t * n_embd, w + (uint64_t)id * n_embd, n_embd * sizeof(float));
+        if (!ds4_embed_row_ok(model_map, model_size, weight_offset,
+                              (uint64_t)id, row_bytes)) return 0;
+        float *token_out = out + (uint64_t)t * n_hc * n_embd;
+        ds4_embed_f16_row(token_out,
+                          (const uint8_t *)model_map + weight_offset +
+                              (uint64_t)id * row_bytes,
+                          n_embd);
+        for (uint32_t h = 1; h < n_hc; h++) {
+            memcpy(token_out + (uint64_t)h * n_embd,
+                   token_out, (size_t)n_embd * sizeof(float));
+        }
     }
     return 1;
 }
@@ -1630,8 +1658,6 @@ int ds4_gpu_embed_tokens_hc_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
  * [0, n_vocab) clamp to row 0 (matches the HC embedders).  Rows are never
  * read past model_size (mmap SIGBUS guard).
  */
-static float ds4_half_to_float(uint16_t h); /* defined below in this TU */
-
 /* Dequantize one Q8_0 embedding row into out[0..n_embd).  The last block
  * may be partial when n_embd % 32 != 0; its tail int8s are ignored
  * (matches ds4.c embed_token_q8_0). */

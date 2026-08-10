@@ -286,6 +286,86 @@ static int test_embed_tokens_q8_0(void) {
 }
 REGISTER_TEST(embed_tokens_q8_0, test_embed_tokens_q8_0);
 
+static int test_embed_hc_f16(void) {
+    constexpr uint32_t n_vocab = 4;
+    constexpr uint32_t n_embd = 8;
+    constexpr uint32_t n_hc = 3;
+    uint64_t model_size = 0, weight_offset = 0;
+    unsigned char *model = make_f16_model(n_vocab, n_embd,
+                                           &model_size, &weight_offset);
+    if (!model) return 1;
+    if (ds4_gpu_set_model_map(model, model_size) == 0) {
+        free(model);
+        return 1;
+    }
+
+    float row[n_embd];
+    float want[n_hc * n_embd];
+    ref_embed_f16((const uint16_t *)(model + weight_offset + 2u * n_embd * 2u),
+                  n_embd, row);
+    for (uint32_t h = 0; h < n_hc; h++)
+        std::memcpy(want + h * n_embd, row, sizeof(row));
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(want));
+    if (!out) {
+        free(model);
+        return 1;
+    }
+    int rc = 1;
+    if (ds4_gpu_embed_token_hc_tensor(out, model, model_size, weight_offset,
+                                      n_vocab, 2, n_embd, n_hc) != 0) {
+        float got[n_hc * n_embd];
+        if (ds4_gpu_tensor_read(out, 0, got, sizeof(got)) != 0)
+            rc = check_f32("embed_token_hc/f16", got, want, n_hc * n_embd);
+    }
+    ds4_gpu_tensor_free(out);
+    if (rc != 0) {
+        free(model);
+        return rc;
+    }
+
+    const int32_t tokens[2] = {3, -1};
+    ds4_gpu_tensor *token_tensor = ds4_gpu_tensor_alloc(sizeof(tokens));
+    ds4_gpu_tensor *batch_out = ds4_gpu_tensor_alloc(2u * sizeof(want));
+    if (!token_tensor || !batch_out) {
+        if (token_tensor) ds4_gpu_tensor_free(token_tensor);
+        if (batch_out) ds4_gpu_tensor_free(batch_out);
+        free(model);
+        return 1;
+    }
+    if (ds4_gpu_tensor_write(token_tensor, 0, tokens, sizeof(tokens)) == 0) {
+        ds4_gpu_tensor_free(token_tensor);
+        ds4_gpu_tensor_free(batch_out);
+        free(model);
+        return 1;
+    }
+
+    float batch_want[2 * n_hc * n_embd];
+    for (uint32_t t = 0; t < 2; t++) {
+        const uint32_t id = tokens[t] < 0 ? 0u : (uint32_t)tokens[t];
+        ref_embed_f16((const uint16_t *)(model + weight_offset +
+                                        (uint64_t)id * n_embd * 2u),
+                      n_embd, row);
+        for (uint32_t h = 0; h < n_hc; h++)
+            std::memcpy(batch_want + ((uint64_t)t * n_hc + h) * n_embd,
+                        row, sizeof(row));
+    }
+
+    rc = 1;
+    if (ds4_gpu_embed_tokens_hc_tensor(batch_out, token_tensor, model, model_size,
+                                       weight_offset, n_vocab, 2, n_embd, n_hc) != 0) {
+        float got[2 * n_hc * n_embd];
+        if (ds4_gpu_tensor_read(batch_out, 0, got, sizeof(got)) != 0)
+            rc = check_f32("embed_tokens_hc/f16", got, batch_want,
+                           2 * n_hc * n_embd);
+    }
+    ds4_gpu_tensor_free(token_tensor);
+    ds4_gpu_tensor_free(batch_out);
+    free(model);
+    return rc;
+}
+REGISTER_TEST(embed_hc_f16, test_embed_hc_f16);
+
 /* Single-token quant dispatch: weight_type 8 -> Q8_0, 1 -> F16,
  * anything else -> 0. */
 static int test_embed_token_quant(void) {

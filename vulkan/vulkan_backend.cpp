@@ -42,10 +42,10 @@ struct VulkanCommandCtx {
     uint64_t        event_counter = 0;
     uint32_t        command_count = 0;
     bool            submitted = false;
+    bool            recording = false;
     bool            first_cmd = true;
     VkDescriptorSet ds_q8s = VK_NULL_HANDLE;  /* simple shader DS */
     VkDescriptorSet ds_q8c = VK_NULL_HANDLE;  /* complex shader DS */
-    VkDescriptorSet ds_f16 = VK_NULL_HANDLE;
     VkCommandBuffer cmd_rots[4] = {};
     uint32_t cmd_rot_idx = 0;
     uint32_t cmd_buf_count = 0;
@@ -415,9 +415,11 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
 
 static int begin_cmd(void) {
     auto &c = get_cmd_ctx();
+    if (c.recording) return 1;
     if (c.submitted) {
         VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
         VK_CHECK_RAW(vkResetFences(g_vk.device, 1, &c.fence));
+        c.submitted = false;
         /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
         c.cmd_buf_count++;
         if (c.cmd_buf_count >= 4) {
@@ -433,7 +435,7 @@ static int begin_cmd(void) {
     }
     /* Allocate or reuse CB */
     VkCommandBuffer &cb = c.cmd_rots[c.cmd_rot_idx];
-    if (cb == VK_NULL_HANDLE || c.cmd_buf_count == 0) {
+    if (cb == VK_NULL_HANDLE) {
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -444,6 +446,7 @@ static int begin_cmd(void) {
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
+    c.recording = true;
     c.command_count = 0;
     g_vk.cmd_gen++;
     if (getenv("DS4_VULKAN_DEBUG"))
@@ -458,11 +461,21 @@ static int begin_cmd(void) {
 
 static int end_and_submit(void) {
     auto &c = get_cmd_ctx();
-    if (c.command_count == 0) return 1;
+    if (!c.recording) return 1;
+    if (c.command_count == 0) {
+        VK_CHECK_RAW(vkEndCommandBuffer(c.cmd));
+        c.recording = false;
+        return 1;
+    }
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
                 (unsigned)c.command_count, c.cmd_rot_idx, (unsigned long long)g_vk.cmd_gen);
+    for (auto &[base, header] : g_vk.tensor_headers) {
+        (void)base;
+        (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
+    }
     VK_CHECK_RAW(vkEndCommandBuffer(c.cmd));
+    c.recording = false;
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
     VK_CHECK_RAW(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
@@ -472,8 +485,12 @@ static int end_and_submit(void) {
 
 static int wait_cmd(void) {
     auto &c = get_cmd_ctx();
-    if (c.command_count == 0) return 1;  /* Nothing was submitted, fence may be unsignaled */
+    if (!c.submitted) return 1;
     VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+    for (auto &[base, header] : g_vk.tensor_headers) {
+        (void)base;
+        (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
+    }
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -771,18 +788,42 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t ev, const char *label) {
 
 /* ---- Model Loading ---- */
 
+static void clear_weight_cache(void) {
+    if (!g_vk.weight_cache.empty()) {
+        (void)vkDeviceWaitIdle(g_vk.device);
+        for (auto &[offset, entry] : g_vk.weight_cache) {
+            (void)offset;
+            vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
+        }
+        g_vk.weight_cache.clear();
+        g_vk.weight_used = 0;
+    }
+    g_vk.range_registry.clear();
+}
+
+static void set_model_map_identity(const void *model_map, uint64_t model_size) {
+    if (g_vk.model_map != model_map) clear_weight_cache();
+    g_vk.model_map = model_map;
+    g_vk.model_size = model_size;
+}
+
 int ds4_gpu_set_model_map(const void *m, uint64_t s) {
     if (!m) return 0;
-    g_vk.model_map = m; g_vk.model_size = s;
+    set_model_map_identity(m, s);
     return 1;
 }
 int ds4_gpu_set_model_fd(int fd) { (void)fd; return 1; }
-int ds4_gpu_set_model_fd_for_map(int fd, const void *m) { (void)fd; if (!m) return 0; g_vk.model_map = m; return 1; }
+int ds4_gpu_set_model_fd_for_map(int fd, const void *m) {
+    (void)fd;
+    if (!m) return 0;
+    set_model_map_identity(m, g_vk.model_size);
+    return 1;
+}
 
 int ds4_gpu_set_model_map_range(const void *m, uint64_t s, uint64_t mo, uint64_t ms, uint64_t mt) {
     (void)mt;
     if (!m || s == 0 || mo > s || ms > s - mo) return 0;
-    g_vk.model_map = m; g_vk.model_size = s;
+    set_model_map_identity(m, s);
     return 1;  /* DS4 convention: 1 = success */
 }
 
@@ -792,7 +833,7 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
     for (uint32_t i = 0; i < c; i++) {
         if (o[i] > s || sz[i] == 0 || sz[i] > s - o[i]) return 0;
     }
-    g_vk.model_map = m; g_vk.model_size = s;
+    set_model_map_identity(m, s);
     return 1;  /* DS4 convention: 1 = success */
 }
 
@@ -1080,6 +1121,8 @@ int ds4_gpu_matmul_q8_0_tensor(
      * math as the shader: 34 B blocks, double accumulation) for wide rows;
      * the narrow per-layer matmuls keep the fast shader path. */
     if (out_dim > 50000u) {
+        auto &commands = get_cmd_ctx();
+        if (commands.recording && commands.command_count != 0 && !submit_and_wait()) return 0;
         if (!model_map || !out->ptr || !x->ptr) return 0;
         const uint64_t blocks = (in_dim + 31u) / 32u;
         const uint64_t row_bytes = blocks * 34u;
@@ -1127,6 +1170,7 @@ int ds4_gpu_matmul_q8_0_tensor(
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
+    if (!c.recording && !begin_cmd()) return 0;
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
 
     /* Find tensor buffers */
@@ -1210,7 +1254,6 @@ int ds4_gpu_matmul_q8_0_tensor(
         vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
     }
     c.command_count++;
-    maybe_submit();
 
     /* Memory barrier: visibility for subsequent dispatches */
     VkMemoryBarrier mb{};
@@ -1222,7 +1265,10 @@ int ds4_gpu_matmul_q8_0_tensor(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &mb, 0, nullptr, 0, nullptr);
 
-    return 1;
+    maybe_submit();
+    int ok = submit_and_wait();
+    if (ok && vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) ok = 0;
+    return ok;
 }
 
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */
@@ -1276,6 +1322,7 @@ int ds4_gpu_matmul_f16_tensor(
     }
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
+    if (!c.recording && !begin_cmd()) return 0;
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
 
     auto find_buf = [](const void *ptr, VkBuffer &buf, VkDeviceSize &off) -> bool {
@@ -1338,22 +1385,18 @@ int ds4_gpu_matmul_f16_tensor(
         wbuf = wit->second.buffer;
         wbuf_off = 0;
     }
-    const bool is_decode = (n_tok == 1);
-    /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSet &ds = c.ds_f16;
-    if (ds == VK_NULL_HANDLE) {
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &sh.desc_layout;
-        const VkResult alloc_result = vkAllocateDescriptorSets(g_vk.device, &dai, &ds);
-        if (alloc_result != VK_SUCCESS) {
-            if (getenv("DS4_VULKAN_DEBUG"))
-                fprintf(stderr,
-                        "ds4: [dbg] matmul_f16 descriptor allocation failed: %d\n",
-                        alloc_result);
-            return 0;
-        }
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &sh.desc_layout;
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    const VkResult alloc_result = vkAllocateDescriptorSets(g_vk.device, &dai, &ds);
+    if (alloc_result != VK_SUCCESS) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr,
+                    "ds4: [dbg] matmul_f16 descriptor allocation failed: %d\n",
+                    alloc_result);
+        return 0;
     }
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(
@@ -1388,7 +1431,6 @@ int ds4_gpu_matmul_f16_tensor(
         }
     }
     c.command_count++;
-    maybe_submit();
 
     /* Memory barrier: visibility for subsequent dispatches */
     VkMemoryBarrier mb{};
@@ -1400,7 +1442,10 @@ int ds4_gpu_matmul_f16_tensor(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &mb, 0, nullptr, 0, nullptr);
 
-    return 1;
+    maybe_submit();
+    int ok = submit_and_wait();
+    if (ok && vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) ok = 0;
+    return ok;
 }
 
 /* ---- rms_norm_weight_rows_tensor dispatch ---- */

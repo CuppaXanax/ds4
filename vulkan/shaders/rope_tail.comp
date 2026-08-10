@@ -37,6 +37,8 @@ void main() {
         theta = theta_interp * (1.0 - mix) + theta_extrap * mix;
         mscale *= 1.0 + 0.1 * log(1.0 / pc.freq_scale);
     }
+    const float two_pi = 6.283185307179586;
+    theta -= round(theta / two_pi) * two_pi;
     float c = cos(theta) * mscale;
     float s = sin(theta) * mscale;
     if (pc.inverse != 0) s = -s;

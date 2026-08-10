@@ -159,7 +159,7 @@ static void ref_rope_tail(float *x, uint32_t n_tok, uint32_t n_head,
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t h = 0; h < n_head; h++) {
             float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
-            float theta_extrap = (float)pos;
+            float theta_extrap = (float)(pos + t);
             for (uint32_t i = 0; i < n_rot; i += 2) {
                 const float theta_interp = freq_scale * theta_extrap;
                 float theta = theta_interp;

@@ -3250,15 +3250,13 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
     bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits)
 {
     (void)hash_offset; (void)hash_rows; (void)n_expert_groups; (void)n_group_used;
-    (void)hash_mode;
+    (void)token; (void)hash_mode;
     if (!selected || !weights || !probs || !logits || !logits->ptr) return 0;
     if (n_expert == 0 || n_expert_used == 0 || n_expert_used > n_expert) return 0;
 
-    /* Bounds: tensor byte ranges and the model bias range (never read past
-     * the file-backed mmap - SIGBUS).  (uint64_t)token + 1 <= 2^32 and
-     * n_expert < 2^32, so n_logits cannot wrap uint64. */
-    uint64_t n_logits = ((uint64_t)token + 1) * n_expert;
-    if (n_logits > logits->bytes / sizeof(float)) return 0;
+    /* Decode supplies one router-logits row. The token ID is only relevant
+     * to hash routing, which the engine applies immediately after this call. */
+    if ((uint64_t)n_expert * sizeof(float) > logits->bytes) return 0;
     if ((uint64_t)n_expert_used * sizeof(int32_t) > selected->bytes) return 0;
     if ((uint64_t)n_expert_used * sizeof(float) > weights->bytes) return 0;
     if ((uint64_t)n_expert * sizeof(float) > probs->bytes) return 0;
@@ -3268,9 +3266,9 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weigh
             (uint64_t)n_expert * sizeof(float) > model_size - bias_offset) return 0;
     }
 
-    /* Copy the token's logits row, folding in the bias.  The input tensor is
+    /* Copy the decode logits row, folding in the bias.  The input tensor is
      * never mutated (the old batch fallback used to clobber it). */
-    const float *lp = (const float*)logits->ptr + (uint64_t)token * n_expert;
+    const float *lp = (const float*)logits->ptr;
     const float *bias = has_bias ? (const float*)((const char*)model_map + bias_offset) : nullptr;
     std::vector<float> l(n_expert);
     for (uint32_t i = 0; i < n_expert; i++) {

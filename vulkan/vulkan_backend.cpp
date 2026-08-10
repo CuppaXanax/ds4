@@ -201,6 +201,8 @@ static int select_physical_device(void) {
     vkGetPhysicalDeviceProperties2(best, &p2);
 
     g_vk.caps.subgroup_size = sg.subgroupSize;
+    g_vk.caps.min_storage_buffer_offset_alignment =
+        props.limits.minStorageBufferOffsetAlignment;
     g_vk.caps.max_push_constants_size = props.limits.maxPushConstantsSize;
     g_vk.caps.max_compute_work_group_invocations = props.limits.maxComputeWorkGroupInvocations;
     g_vk.caps.max_shared_memory_size = props.limits.maxComputeSharedMemorySize;
@@ -1123,7 +1125,7 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
  * ========================================================================= */
 
-/* ---- matmul_q8_0 dispatch (host-side fallback for huge output rows) ---- */
+/* ---- matmul_q8_0 dispatch ---- */
 
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
@@ -1136,74 +1138,25 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                n_tok)
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
-    if (!out || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
-    if (n_tok <= UINT64_MAX / out_dim && n_tok * out_dim > 262144u) {
-        fprintf(stderr,
-                "ds4: VULKAN Q8 batch requires bounded dispatches "
-                "(tokens=%llu out_dim=%llu)\n",
-                (unsigned long long)n_tok,
-                (unsigned long long)out_dim);
-        return 0;
-    }
-
-    /* The GPU dispatch is pathological for very wide output rows (the vocab
-     * head, out_dim = 129280): RADV stalls for minutes and blocks the next
-     * decode's vkWaitForFences.  Fall back to a host-side q8_0 matmul (same
-     * math as the shader: 34 B blocks, double accumulation) for wide rows;
-     * the narrow per-layer matmuls keep the fast shader path. */
-    if (out_dim > 50000u) {
-        auto &commands = get_cmd_ctx();
-        if (commands.recording && commands.command_count != 0 && !submit_and_wait()) return 0;
-        if (!model_map || !out->ptr || !x->ptr) return 0;
-        const uint64_t blocks = (in_dim + 31u) / 32u;
-        const uint64_t row_bytes = blocks * 34u;
-        if (weight_offset > model_size ||
-            out_dim > (model_size - weight_offset) / row_bytes) return 0;
-        if (n_tok > UINT64_MAX / in_dim ||
-            (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes) return 0;
-        if (n_tok > UINT64_MAX / out_dim ||
-            (uint64_t)out_dim * n_tok * sizeof(float) > out->bytes) return 0;
-        const uint8_t *base = (const uint8_t *)model_map + weight_offset;
-        const float *xp = (const float *)x->ptr;
-        float *op = (float *)out->ptr;
-        for (uint64_t t = 0; t < n_tok; t++) {
-            const float *xt = xp + t * in_dim;
-            for (uint64_t o = 0; o < out_dim; o++) {
-                const uint8_t *row = base + o * row_bytes;
-                double acc = 0.0;
-                for (uint64_t b = 0; b < blocks; b++) {
-                    uint16_t scale_bits;
-                    memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
-                    const uint32_t sb = scale_bits;
-                    const uint32_t se = (sb >> 10) & 0x1fu;
-                    const uint32_t sm = sb & 0x3ffu;
-                    float scale;
-                    if (se == 0u) scale = sm != 0u ? (float)sm / 16384.0f : 0.0f;
-                    else if (se == 31u) scale = sm != 0u ? 0.0f : 1.0f / 0.0f;
-                    else scale = (1.0f + (float)sm / 1024.0f) * exp2f((int)se - 15);
-                    const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
-                    const uint64_t i0 = b * 32u;
-                    const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-                    for (uint64_t i = 0; i < n; i++)
-                        acc += (double)scale * (double)qs[i] * (double)xt[i0 + i];
-                }
-                op[t * out_dim + o] = (float)acc;
-            }
-        }
-        return 1;
-    }
-
-    (void)model_map; (void)model_size;
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (in_dim > 8192u || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
     uint64_t n_blocks = (in_dim + 31) / 32;
+    if (n_blocks > UINT64_MAX / 34u || out_dim > UINT64_MAX / (n_blocks * 34u)) return 0;
     const uint64_t weight_bytes = (uint64_t)out_dim * n_blocks * 34u;
+    if (weight_bytes > UINT32_MAX || (weight_bytes & 3u) != 0 ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        in_dim * n_tok > x->bytes / sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim ||
+        out_dim * n_tok > out->bytes / sizeof(float)) return 0;
 
     /* Get shader */
     auto si = g_vk.shader_map.find("matmul_q8_0");
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
+    if (c.recording && c.command_count != 0 && !submit_and_wait()) return 0;
     if (!c.recording && !begin_cmd()) return 0;
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
 
     /* Find tensor buffers */
     auto find_buf = [](const void *ptr, VkBuffer &buf, VkDeviceSize &off) -> bool {
@@ -1229,6 +1182,7 @@ int ds4_gpu_matmul_q8_0_tensor(
     }
     if (wit != g_vk.weight_cache.end()) {
         wit->second.last_used = ++g_vk.lru_counter;
+        wit->second.last_gen = g_vk.cmd_gen;
         wbuf = wit->second.buffer;
         wbuf_off = weight_offset - wit->first;
     } else {
@@ -1240,68 +1194,71 @@ int ds4_gpu_matmul_q8_0_tensor(
         wbuf_off = 0;
     }
 
-    /* Per-dispatch descriptor set (fresh each call) */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &sh.desc_layout;
-    VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
-
-    VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
         weight_bytes);
-    VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
-    VkDescriptorBufferInfo bufs[3] = {
-        {xbuf, xoff, x_size},
-        {wbuf, wbuf_off, w_size},
-        {obuf, ooff, o_size},
-    };
-    VkWriteDescriptorSet w[3];
-    for (int i = 0; i < 3; i++) {
-        w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
-    }
-    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
-
-    if (n_tok == 1) {
-        /* For decode: 1 token, use 2D grid like prefill */
+    const uint64_t tile_tokens = std::max<uint64_t>(1u, 32768u / out_dim);
+    const VkDeviceSize storage_align =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (storage_align != 0 && ((VkDeviceSize)wbuf_off % storage_align) != 0)
+        return 0;
+    for (uint64_t tile = 0; tile < n_tok; tile += tile_tokens) {
+        const uint32_t tile_n = (uint32_t)std::min<uint64_t>(tile_tokens, n_tok - tile);
+        if ((uint64_t)tile_n * in_dim > UINT32_MAX ||
+            (uint64_t)tile_n * out_dim > UINT32_MAX) return 0;
+        if (c.recording && c.command_count != 0 && !submit_and_wait()) return 0;
+        if (!c.recording && !begin_cmd()) return 0;
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &sh.desc_layout;
+        VkDescriptorSet ds;
+        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+        const VkDeviceSize x_size = (VkDeviceSize)tile_n * in_dim * sizeof(float);
+        const VkDeviceSize o_size = (VkDeviceSize)tile_n * out_dim * sizeof(float);
+        const VkDeviceSize tile_x_off =
+            xoff + (VkDeviceSize)tile * in_dim * sizeof(float);
+        const VkDeviceSize tile_o_off =
+            ooff + (VkDeviceSize)tile * out_dim * sizeof(float);
+        if (storage_align != 0 &&
+            ((tile_x_off % storage_align) != 0 ||
+             (tile_o_off % storage_align) != 0)) {
+            vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds);
+            return 0;
+        }
+        VkDescriptorBufferInfo bufs[3] = {
+            {xbuf, tile_x_off, x_size},
+            {wbuf, wbuf_off, w_size},
+            {obuf, tile_o_off, o_size},
+        };
+        VkWriteDescriptorSet w[3];
+        for (int i = 0; i < 3; i++) {
+            w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
+        }
+        vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
+        vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
+        vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
         const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
         const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
         struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
-            (uint32_t)in_dim, (uint32_t)out_dim, 1u, (uint32_t)n_blocks, y_scale
+            (uint32_t)in_dim, (uint32_t)out_dim, tile_n, (uint32_t)n_blocks, y_scale
         };
         vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(c.cmd, y_scale, y_cnt, 1);
-    } else {
-        /* Prefill: 2D grid with n_tok in Z */
-        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
-        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
-        struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
-            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)n_blocks, y_scale
-        };
-        vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(c.cmd, y_scale, y_cnt, (uint32_t)n_tok);
+        vkCmdDispatch(c.cmd, y_scale, y_cnt, tile_n);
+        c.command_count++;
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                             0, nullptr, 0, nullptr);
+        if (!submit_and_wait()) return 0;
+        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) return 0;
     }
-    c.command_count++;
-
-    /* Memory barrier: visibility for subsequent dispatches */
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(c.cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, nullptr, 0, nullptr);
-
-    maybe_submit();
-    int ok = submit_and_wait();
-    if (ok && vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) ok = 0;
-    return ok;
+    return 1;
 }
 
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */

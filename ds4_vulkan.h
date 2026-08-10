@@ -35,6 +35,7 @@ struct ds4_vulkan_submission;
 typedef struct ds4_vulkan_caps {
     uint32_t subgroup_size;                /* e.g. 64 or 32 */
     uint32_t min_uniform_offset;
+    uint64_t min_storage_buffer_offset_alignment;
     uint32_t max_push_constants_size;      /* bytes */
     uint32_t max_compute_work_group_invocations;
     uint32_t max_shared_memory_size;       /* bytes */

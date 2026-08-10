@@ -64,9 +64,9 @@ static float f16_to_f32(uint16_t h) {
 }
 
 static int test_matmul_q8_0(void) {
-    const uint64_t in_dim    = 4096;                /* Flash Q_A width: 128 blocks */
-    const uint64_t out_dim   = 8;
-    const uint64_t n_tok     = 2;
+    const uint64_t in_dim    = 128;
+    const uint64_t out_dim   = 1024;
+    const uint64_t n_tok     = 33;                  /* crosses the 32768-element tile */
     const uint64_t n_blocks  = (in_dim + 31u) / 32u;
     const uint64_t row_bytes = n_blocks * 34u;      /* GGUF Q8_0: 34 B/block */
     const uint64_t w_bytes   = out_dim * row_bytes;
@@ -161,36 +161,22 @@ static int test_matmul_q8_0(void) {
         ds4_gpu_synchronize();              /* wait for GPU before reading */
         float outv[n_tok * out_dim];
         if (ds4_gpu_tensor_read(out, 0, outv, sizeof(outv)) != 0) {
-            fprintf(stderr, "--- matmul_q8_0 diagnostic ---\n");
-            for (uint64_t o = 0; o < out_dim; o++) {
-                const uint8_t *row = model + header + o * row_bytes;
-                uint16_t scale_bits;
-                std::memcpy(&scale_bits, row, sizeof(scale_bits));
-                fprintf(stderr, "W[%llu] scale=%.3f qs0[0..7]: ",
-                        (unsigned long long)o, f16_to_f32(scale_bits));
-                const int8_t *qs = (const int8_t *)(row + 2u);
-                for (uint32_t i = 0; i < 8; i++)
-                    fprintf(stderr, "%d ", (int)qs[i]);
-                fprintf(stderr, "\n");
-            }
-            fprintf(stderr, "X[0]: ");
-            for (uint64_t i = 0; i < 64; i++)
-                fprintf(stderr, "%.3f ", xv[i]);
-            fprintf(stderr, "\n");
-            for (uint64_t t = 0; t < n_tok; t++) {
-                for (uint64_t o = 0; o < out_dim; o++) {
-                    fprintf(stderr, "out[%llu][%llu] got=%.6f want=%.6f %s\n",
-                            (unsigned long long)t, (unsigned long long)o,
-                            outv[t * out_dim + o], ref[t * out_dim + o],
-                            std::fabsf(outv[t * out_dim + o] - ref[t * out_dim + o]) <= 1e-6f ? "ok" : "MISMATCH");
-                }
-            }
             rc = 0;
+            uint32_t printed = 0;
             for (uint64_t t = 0; t < n_tok && rc == 0; t++) {
                 for (uint64_t o = 0; o < out_dim; o++) {
                     float got = outv[t * out_dim + o];
                     float want = ref[t * out_dim + o];
-                    if (!(std::fabsf(got - want) <= 1e-6f)) rc = 1;
+                    if (!(std::fabsf(got - want) <= 1e-6f)) {
+                        rc = 1;
+                        if (printed++ < 8) {
+                            fprintf(stderr,
+                                    "matmul_q8_0[%llu][%llu]: got=%.6f want=%.6f\n",
+                                    (unsigned long long)t,
+                                    (unsigned long long)o,
+                                    got, want);
+                        }
+                    }
                 }
             }
         }
@@ -203,19 +189,3 @@ static int test_matmul_q8_0(void) {
 }
 REGISTER_TEST(matmul_q8_0, test_matmul_q8_0);
 
-static int test_matmul_q8_0_rejects_unbounded_batch(void) {
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(float));
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(float));
-    if (!x || !out) {
-        if (x) ds4_gpu_tensor_free(x);
-        if (out) ds4_gpu_tensor_free(out);
-        return 1;
-    }
-    const int result = ds4_gpu_matmul_q8_0_tensor(
-        out, nullptr, 0, 0, 1, 32768, x, 9);
-    ds4_gpu_tensor_free(out);
-    ds4_gpu_tensor_free(x);
-    return result == 0 ? 0 : 1;
-}
-REGISTER_TEST(matmul_q8_0_rejects_unbounded_batch,
-              test_matmul_q8_0_rejects_unbounded_batch);

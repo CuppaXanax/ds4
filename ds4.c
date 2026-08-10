@@ -29695,23 +29695,27 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_wants("attn_out", il, pos0);
     bool attn_out_f16 = false;
     if (ok &&
+        g->batch_q_half &&
         !attn_out_debug &&
         !tp_row_split_attn &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_directional_steering_attn_enabled(g)) {
-        attn_out_f16 = ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
-                                                                    metal_graph_batch_attn_low(g),
-                                                                    model->map,
-                                                                    model->size,
-                                                                    layer->attn_output_a->abs_offset,
-                                                                    layer->attn_output_b->abs_offset,
-                                                                    group_dim,
-                                                                    rank,
-                                                                    n_groups,
-                                                                    DS4_N_EMBD,
-                                                                    metal_graph_batch_heads(g),
-                                                                    n_tokens) != 0;
+        const int attn_out_f16_rc =
+            ds4_gpu_attention_output_q8_batch_f16_tensor(g->batch_q_half,
+                                                         metal_graph_batch_attn_low(g),
+                                                         model->map,
+                                                         model->size,
+                                                         layer->attn_output_a->abs_offset,
+                                                         layer->attn_output_b->abs_offset,
+                                                         group_dim,
+                                                         rank,
+                                                         n_groups,
+                                                         DS4_N_EMBD,
+                                                         metal_graph_batch_heads(g),
+                                                         n_tokens);
+        attn_out_f16 = attn_out_f16_rc == 1;
+        if (attn_out_f16_rc < 0) ok = false;
     }
     uint64_t tp_attn_gate_seq = 0;
     /* Opt-in sub-chunk gate pipelining (see metal_graph_tp_subgate_pipeline;

@@ -122,8 +122,8 @@ static unsigned char *make_q8_0_model(uint64_t header, uint64_t out_dim0,
     return model;
 }
 
-/* CPU reference for one Q8_0 row x vector: same math as the backend /
- * matmul_q8_0 shader (f16 scale, int8 quants, double accumulation). */
+/* CPU reference for one Q8_0 row x vector, including the shader's
+ * per-block Q8 activation quantization. */
 static float ref_q8_0_dot(const uint8_t *row, const float *xp,
                           uint64_t in_dim, uint64_t n_blocks) {
     double acc = 0.0;
@@ -134,8 +134,19 @@ static float ref_q8_0_dot(const uint8_t *row, const float *xp,
         const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
         const uint64_t i0 = b * 32u;
         const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
+        float amax = 0.0f;
         for (uint64_t i = 0; i < n; i++)
-            acc += (double)scale * (double)qs[i] * (double)xp[i0 + i];
+            amax = std::fmax(amax, std::fabs(xp[i0 + i]));
+        const float xd = amax / 127.0f;
+        const float xid = xd != 0.0f ? 1.0f / xd : 0.0f;
+        int dot = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            int xq = (int)std::nearbyint(xp[i0 + i] * xid);
+            if (xq < -128) xq = -128;
+            if (xq > 127) xq = 127;
+            dot += (int)qs[i] * xq;
+        }
+        acc += (double)scale * (double)xd * dot;
     }
     return (float)acc;
 }

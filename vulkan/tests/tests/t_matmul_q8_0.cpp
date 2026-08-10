@@ -11,9 +11,8 @@
  * harness tests, so a range starting at 16 would alias t_matmul_f16's cached
  * entry and produce wrong data (or a RADV descriptor-range crash).
  *
- * The CPU reference decodes the stored f16 scale + int8 quants and multiplies
- * by the raw f32 activations, validating the full storage + decode + matmul
- * path with the same math as the shader (double accumulation).
+ * The CPU reference quantizes activations per 32-value block before taking
+ * integer dots, matching ds4.c matvec_q8_0.
  */
 #include "../tests.h"
 #include "../../ds4_gpu.h"
@@ -114,24 +113,40 @@ static int test_matmul_q8_0(void) {
         free(model); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); return 1;
     }
 
-    /* CPU reference: dequant Q8_0 exactly like the shader (f16 scale, int8
-     * quants, double accumulation).  Q8_0 weights are quantized, so the
-     * shader/reference agree to ~1e-2 even for real models. */
+    /* CPU reference: blockwise Q8_0 activation quantization followed by the
+     * scaled integer dot used by ds4.c dot_q8_0_row. */
     float ref[n_tok * out_dim];
     for (uint64_t t = 0; t < n_tok; t++) {
+        int8_t xq[in_dim];
+        float xscale[n_blocks];
+        for (uint64_t b = 0; b < n_blocks; b++) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++)
+                amax = std::fmaxf(amax, std::fabsf(xv[t * in_dim + b * 32u + i]));
+            const float d = amax / 127.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            xscale[b] = d;
+            for (uint32_t i = 0; i < 32; i++) {
+                int q = (int)std::lrintf(xv[t * in_dim + b * 32u + i] * id);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                xq[b * 32u + i] = (int8_t)q;
+            }
+        }
         for (uint64_t o = 0; o < out_dim; o++) {
             const uint8_t *row = model + header + o * row_bytes;
-            double acc = 0.0;
+            float acc = 0.0f;
             for (uint64_t b = 0; b < n_blocks; b++) {
                 uint16_t scale_bits;
                 std::memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
                 const float scale = f16_to_f32(scale_bits);
                 const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
+                int32_t dot = 0;
                 for (uint32_t i = 0; i < 32; i++)
-                    acc += (double)scale * (double)qs[i] *
-                           (double)xv[t * in_dim + b * 32u + i];
+                    dot += (int32_t)qs[i] * (int32_t)xq[b * 32u + i];
+                acc += scale * xscale[b] * (float)dot;
             }
-            ref[t * out_dim + o] = (float)acc;
+            ref[t * out_dim + o] = acc;
         }
     }
 

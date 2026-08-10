@@ -108,12 +108,14 @@ static int test_hc_expand_add_split_half_add(void) {
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     ds4_gpu_tensor *out_hc      = ds4_gpu_tensor_alloc(n_tokens * hc_dim * sizeof(float));
     ds4_gpu_tensor *block_out   = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(float));
+    ds4_gpu_tensor *block_add   = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(float));
     ds4_gpu_tensor *block_add_h = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_embd * sizeof(uint16_t));
     ds4_gpu_tensor *residual    = ds4_gpu_tensor_alloc(n_tokens * hc_dim * sizeof(float));
     ds4_gpu_tensor *split       = ds4_gpu_tensor_alloc((uint64_t)n_tokens * kMixHC * sizeof(float));
-    if (!out_hc || !block_out || !block_add_h || !residual || !split) {
+    if (!out_hc || !block_out || !block_add || !block_add_h || !residual || !split) {
         if (out_hc) ds4_gpu_tensor_free(out_hc);
         if (block_out) ds4_gpu_tensor_free(block_out);
+        if (block_add) ds4_gpu_tensor_free(block_add);
         if (block_add_h) ds4_gpu_tensor_free(block_add_h);
         if (residual) ds4_gpu_tensor_free(residual);
         if (split) ds4_gpu_tensor_free(split);
@@ -122,11 +124,13 @@ static int test_hc_expand_add_split_half_add(void) {
     std::vector<float> bo((uint64_t)n_tokens * n_embd);
     std::vector<float> rh((uint64_t)n_tokens * hc_dim);
     std::vector<float> sp((uint64_t)n_tokens * kMixHC);
+    std::vector<float> ba((uint64_t)n_tokens * n_embd);
     std::vector<uint16_t> bah((uint64_t)n_tokens * n_embd);
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t i = 0; i < n_embd; i++) {
             bo[(uint64_t)t * n_embd + i] = synth_float(t * 17u + i, 0.25f);
             bah[(uint64_t)t * n_embd + i] = f32_to_f16(synth_float(t * 19u + i + 3u, 0.10f));
+            ba[(uint64_t)t * n_embd + i] = f16_to_f32(bah[(uint64_t)t * n_embd + i]);
         }
         for (uint32_t i = 0; i < (uint32_t)hc_dim; i++)
             rh[(uint64_t)t * hc_dim + i] = synth_float(t * 23u + i, 0.20f);
@@ -134,10 +138,11 @@ static int test_hc_expand_add_split_half_add(void) {
             sp[(uint64_t)t * kMixHC + i] = synth_float(t * 29u + i, 0.08f);
     }
     if (!ds4_gpu_tensor_write(block_out, 0, bo.data(), bo.size() * sizeof(float)) ||
+        !ds4_gpu_tensor_write(block_add, 0, ba.data(), ba.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(block_add_h, 0, bah.data(), bah.size() * sizeof(uint16_t)) ||
         !ds4_gpu_tensor_write(residual, 0, rh.data(), rh.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(split, 0, sp.data(), sp.size() * sizeof(float))) {
-        ds4_gpu_tensor_free(out_hc); ds4_gpu_tensor_free(block_out);
+        ds4_gpu_tensor_free(out_hc); ds4_gpu_tensor_free(block_out); ds4_gpu_tensor_free(block_add);
         ds4_gpu_tensor_free(block_add_h); ds4_gpu_tensor_free(residual);
         ds4_gpu_tensor_free(split);
         return 1;
@@ -165,7 +170,17 @@ static int test_hc_expand_add_split_half_add(void) {
             rc = check_f32("hc_expand_add_split_half_add", got.data(), want.data(),
                            (uint32_t)(n_tokens * hc_dim));
     }
-    ds4_gpu_tensor_free(out_hc); ds4_gpu_tensor_free(block_out);
+    if (rc == 0 &&
+        ds4_gpu_hc_expand_add_split_tensor(out_hc, block_out, block_add,
+                                           residual, split, n_embd, n_hc) != 0) {
+        std::vector<float> got((uint64_t)n_tokens * hc_dim);
+        if (ds4_gpu_tensor_read(out_hc, 0, got.data(), got.size() * sizeof(float)) != 0)
+            rc = check_f32("hc_expand_add_split", got.data(), want.data(),
+                           (uint32_t)(n_tokens * hc_dim));
+    } else if (rc == 0) {
+        rc = 1;
+    }
+    ds4_gpu_tensor_free(out_hc); ds4_gpu_tensor_free(block_out); ds4_gpu_tensor_free(block_add);
     ds4_gpu_tensor_free(block_add_h); ds4_gpu_tensor_free(residual);
     ds4_gpu_tensor_free(split);
     return rc;

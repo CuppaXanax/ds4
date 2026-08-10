@@ -856,13 +856,6 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(ds4_gpu_tensor       *hea
         uint32_t              n_head,
         uint32_t              kv_lora_dim,
         uint32_t              value_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_glm_value_project_typed_batch_heads_tensor\n"); return 1; }
-int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor       *out_hc,
-        const ds4_gpu_tensor *block_out,
-        const ds4_gpu_tensor *block_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_expand_add_split_tensor\n"); return 1; }
 int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *scale_scratch,
         const void             *model_map,

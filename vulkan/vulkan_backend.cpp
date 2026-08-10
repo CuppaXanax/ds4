@@ -2906,6 +2906,41 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     return 1;
 }
 
+int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc,
+    const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add,
+    const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+    uint32_t n_embd, uint32_t n_hc)
+{
+    if (!out_hc || !block_out || !block_add || !residual_hc || !split) return 0;
+    const uint64_t hc_values = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_values == 0 || mix_hc == 0) return 0;
+    const uint64_t hc_row_bytes = hc_values * sizeof(float);
+    const uint64_t embd_row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t split_row_bytes = mix_hc * sizeof(float);
+    uint64_t rows = out_hc->bytes / hc_row_bytes;
+    rows = std::min(rows, block_out->bytes / embd_row_bytes);
+    rows = std::min(rows, block_add->bytes / embd_row_bytes);
+    rows = std::min(rows, residual_hc->bytes / hc_row_bytes);
+    rows = std::min(rows, split->bytes / split_row_bytes);
+    if (rows == 0) return 0;
+
+    for (uint64_t row = 0; row < rows; row++) {
+        float *out = (float *)out_hc->ptr + row * hc_values;
+        const float *block = (const float *)block_out->ptr + row * n_embd;
+        const float *add = (const float *)block_add->ptr + row * n_embd;
+        const float *residual = (const float *)residual_hc->ptr + row * hc_values;
+        const float *post = (const float *)split->ptr + row * mix_hc + n_hc;
+        for (uint32_t h = 0; h < n_hc; h++) {
+            for (uint32_t i = 0; i < n_embd; i++) {
+                const uint64_t index = (uint64_t)h * n_embd + i;
+                out[index] = post[h] * (block[i] + add[i]) + residual[index];
+            }
+        }
+    }
+    return 1;
+}
+
 /* ---- HC expand (single-token) ----
  *
  * ds4.c hc_post_one: inject the sublayer output into every HC stream and

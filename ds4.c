@@ -30123,16 +30123,19 @@ static bool metal_graph_encode_layer_ffn_batch(
     bool shared_down_f16 = false;
 
 #define DS4_METAL_TRY_SHARED_DOWN_F16() do { \
-        if (ok && !tp_row_split_ffn && !keep_ffn_out && \
+        if (ok && g->batch_q_half && !tp_row_split_ffn && !keep_ffn_out && \
             !metal_graph_debug_wants("ffn_shexp", il, pos0)) { \
-            shared_down_f16 = ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
-                                                                 model->map, \
-                                                                 model->size, \
-                                                                 layer->ffn_down_shexp->abs_offset, \
-                                                                 shared_dim, \
-                                                                 DS4_N_EMBD, \
-                                                                 metal_graph_batch_shared_mid(g), \
-                                                                 n_tokens) != 0; \
+            const int shared_down_f16_rc = \
+                ds4_gpu_matmul_q8_0_f16_out_tensor(g->batch_q_half, \
+                                                    model->map, \
+                                                    model->size, \
+                                                    layer->ffn_down_shexp->abs_offset, \
+                                                    shared_dim, \
+                                                    DS4_N_EMBD, \
+                                                    metal_graph_batch_shared_mid(g), \
+                                                    n_tokens); \
+            shared_down_f16 = shared_down_f16_rc == 1; \
+            if (shared_down_f16_rc < 0) ok = false; \
         } \
     } while (0)
 

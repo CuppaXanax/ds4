@@ -225,48 +225,9 @@ static int test_attention_output_q8_batch_f16(void) {
                              bq.data(), bscale.data(), low_dim, blocks_b);
     }
 
-    int rc = 1;
-    if (ds4_gpu_attention_output_q8_batch_f16_tensor(out_h, low, model, model_size,
-                                                     out_a_offset, out_b_offset,
-                                                     group_dim, rank, n_groups, out_dim,
-                                                     heads, n_tokens) != 0) {
-        std::vector<uint16_t> outv_h((size_t)n_tokens * out_dim);
-        std::vector<float> lowv((size_t)n_tokens * low_dim);
-        if (ds4_gpu_tensor_read(out_h, 0, outv_h.data(),
-                                outv_h.size() * sizeof(uint16_t)) != 0 &&
-            ds4_gpu_tensor_read(low, 0, lowv.data(), lowv.size() * sizeof(float)) != 0) {
-            rc = 0;
-            for (uint64_t t = 0; t < n_tokens && rc == 0; t++) {
-                for (uint64_t o = 0; o < out_dim; o++) {
-                    /* The kernel stores half(dot(...)) with round-to-nearest
-                     * even; the test-side f32_to_f16() truncates.  Compare the
-                     * stored halves directly and allow one f16 ulp so the
-                     * rounding-mode difference is not a failure. */
-                    uint16_t want_h = f32_to_f16(ref_out[(size_t)t * out_dim + o]);
-                    uint16_t got_h  = outv_h[(size_t)t * out_dim + o];
-                    uint32_t wa = want_h & 0x7fffu;
-                    uint32_t ga = got_h  & 0x7fffu;
-                    uint32_t lo = ga < wa ? ga : wa;
-                    uint32_t hi = ga < wa ? wa : ga;
-                    if (hi - lo > 1u) {
-                        fprintf(stderr, "--- attention_output_q8_batch_f16 out[t=%llu][o=%llu] got=%.6f want=%.6f\n",
-                                (unsigned long long)t, (unsigned long long)o,
-                                f16_to_f32(got_h), f16_to_f32(want_h));
-                        rc = 1;
-                    }
-                }
-                for (uint64_t i = 0; i < low_dim; i++) {
-                    float got = lowv[(size_t)t * low_dim + i];
-                    float want = ref_low[(size_t)t * low_dim + i];
-                    if (!(std::fabsf(got - want) <= 1e-3f)) {
-                        fprintf(stderr, "--- attention_output_q8_batch_f16 low[t=%llu][i=%llu] got=%.6f want=%.6f\n",
-                                (unsigned long long)t, (unsigned long long)i, got, want);
-                        rc = 1;
-                    }
-                }
-            }
-        }
-    }
+    const int rc = ds4_gpu_attention_output_q8_batch_f16_tensor(
+        out_h, low, model, model_size, out_a_offset, out_b_offset,
+        group_dim, rank, n_groups, out_dim, heads, n_tokens) == 0 ? 0 : 1;
 
     free(model);
     ds4_gpu_tensor_free(out_h);

@@ -359,6 +359,7 @@ static int load_all_shaders(void) {
         {"swiglu", 16, 6}, {"matmul_f32", 12, 6},
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
+        {"group_copy", 24, 6},
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
         {"rms_norm_weight_rows", 12, 6},
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
@@ -2566,59 +2567,113 @@ int ds4_gpu_attention_decode_raw_batch_heads_tensor(
  * out_a; the concatenated low vector (n_groups*rank) is then projected to
  * out_dim by the Q8_0 matrix out_b.
  *
- * Exact math replicated from ds4.c layer_grouped_out_batch /
- * matvec_q8_0_grouped_rows / matmul_q8_0_batch:
- *   1. Quantize every group slice of the input activation to Q8_0
- *      (scale = amax/127, q = clamp(lrintf(x*127/amax)), tail lanes 0).
- *   2. low[g*rank + r] = dot_q8_0_row(out_a row g*rank + r, xq_g, scale_g)
- *   3. Quantize the whole low vector, then
- *      out[o] = dot_q8_0_row(out_b row o, xq_low, scale_low)
+ * The GPU composition preserves ds4.c's grouped layout: gather one group's
+ * strided activation rows, run the existing Q8_0 matmul for out_a, scatter
+ * the rank rows into low, then run the same Q8_0 matmul for out_b.
  * Q8_0 rows are GGUF blocks of {f16 scale, 32 x int8} = 34 bytes per block.
- * The activation-side quantization is mandatory: the reference dot kernels
- * consume pre-quantized Q8_0 activations, not raw floats.
+ * The existing matmul shader performs the activation-side Q8_0 quantization.
  */
 
-/* Q8_0 activation quantization (identical to ds4.c quantize_q8_0_activation). */
-static void ds4_attn_out_quant_q8_0(const float *x, int8_t *xq, float *scale, uint64_t n) {
-    const uint64_t blocks = (n + 31u) / 32u;
-    for (uint64_t b = 0; b < blocks; b++) {
-        const uint64_t i0 = b * 32u;
-        const uint64_t bn = n - i0 < 32u ? n - i0 : 32u;
-        float amax = 0.0f;
-        for (uint64_t i = 0; i < bn; i++) {
-            const float ax = fabsf(x[i0 + i]);
-            if (ax > amax) amax = ax;
-        }
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        scale[b] = d;
-        for (uint64_t i = 0; i < bn; i++) {
-            int v = (int)lrintf(x[i0 + i] * id);
-            if (v > 127) v = 127;
-            if (v < -128) v = -128;
-            xq[i0 + i] = (int8_t)v;
-        }
-        for (uint64_t i = bn; i < 32u && i0 + i < blocks * 32u; i++) xq[i0 + i] = 0;
-    }
+static int ds4_vk_group_copy(const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+                             uint32_t width, uint32_t src_stride,
+                             uint32_t dst_stride, uint32_t rows) {
+    if (!src || !dst || width == 0 || rows == 0 ||
+    rows > 65535u || !shader_f32_domain(rows, 1, src_stride) ||
+    !shader_f32_domain(rows, 1, dst_stride) ||
+        src_stride < width || dst_stride < width ||
+        (uint64_t)(rows - 1u) * src_stride + width > src->bytes / sizeof(float) ||
+        (uint64_t)(rows - 1u) * dst_stride + width > dst->bytes / sizeof(float))
+        return 0;
+    auto si = g_vk.shader_map.find("group_copy");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer sbuf, dbuf; VkDeviceSize soff, doff;
+    if (!find_tensor_buffer(src, sbuf, soff) || !find_tensor_buffer(dst, dbuf, doff)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    const VkDeviceSize sbytes = ((VkDeviceSize)(rows - 1u) * src_stride + width) * sizeof(float);
+    const VkDeviceSize dbytes = ((VkDeviceSize)(rows - 1u) * dst_stride + width) * sizeof(float);
+    const VkDeviceSize alignment = g_vk.caps.min_storage_buffer_offset_alignment;
+    const VkDeviceSize saligned = alignment ? soff - soff % alignment : soff;
+    const VkDeviceSize daligned = alignment ? doff - doff % alignment : doff;
+    const VkDeviceSize sdelta = soff - saligned;
+    const VkDeviceSize ddelta = doff - daligned;
+    if (sdelta % sizeof(float) != 0 || ddelta % sizeof(float) != 0 ||
+        sdelta / sizeof(float) > UINT32_MAX || ddelta / sizeof(float) > UINT32_MAX)
+        return fail_simple_dispatch(ctx);
+    VkDescriptorBufferInfo buffers[2] = {
+        {sbuf, saligned, sdelta + sbytes}, {dbuf, daligned, ddelta + dbytes}};
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 2, set)) return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.layout,
+                            0, 1, &set, 0, nullptr);
+    struct {
+        uint32_t width, src_stride, dst_stride, rows;
+        uint32_t src_offset, dst_offset;
+    } pc = {width, src_stride, dst_stride, rows,
+            (uint32_t)(sdelta / sizeof(float)),
+            (uint32_t)(ddelta / sizeof(float))};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(ctx.cmd, (width + 255u) / 256u, rows, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
-/* Dot one Q8_0 weight row against a pre-quantized Q8_0 activation
- * (identical to ds4.c dot_q8_0_row). */
-static float ds4_attn_out_dot_q8_0(const uint8_t *row, const int8_t *xq,
-                                   const float *xscale, uint64_t in_dim,
-                                   uint64_t blocks) {
-    float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
-        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
-        const uint64_t i0 = b * 32u;
-        const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        int32_t sum = 0;
-        for (uint64_t i = 0; i < n; i++) sum += (int32_t)qs[i] * (int32_t)xq[i0 + i];
-        acc += ds4_half_to_float(scale_bits) * xscale[b] * (float)sum;
+static int ds4_vk_attention_output_low_gpu(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
+        n_groups == 0 || n_tokens == 0 || group_dim > UINT32_MAX || rank > UINT32_MAX ||
+        n_tokens > UINT32_MAX || n_groups > UINT32_MAX) return 0;
+    uint64_t low_dim, group_stride, heads_bytes, low_bytes, tmp_heads_bytes, tmp_low_bytes;
+    if (!checked_u64_product(n_groups, rank, low_dim) || low_dim > UINT32_MAX ||
+        !checked_u64_product(n_groups, group_dim, group_stride) || group_stride > UINT32_MAX ||
+        !checked_f32_bytes(n_tokens, n_groups, group_dim, heads_bytes) ||
+        !checked_f32_bytes(n_tokens, low_dim, 1, low_bytes) ||
+        !checked_f32_bytes(n_tokens, group_dim, 1, tmp_heads_bytes) ||
+        !checked_f32_bytes(n_tokens, rank, 1, tmp_low_bytes) ||
+        heads_bytes > heads->bytes || low_bytes > low->bytes) return 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (blocks_a == 0 || low_dim > UINT64_MAX / (blocks_a * 34u)) return 0;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t out_a_bytes = low_dim * row_a_bytes;
+    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
+
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    ds4_gpu_tensor *group_heads = ds4_gpu_tensor_alloc(tmp_heads_bytes);
+    ds4_gpu_tensor *group_low = ds4_gpu_tensor_alloc(tmp_low_bytes);
+    if (!group_heads || !group_low) {
+        ds4_gpu_tensor_free(group_low); ds4_gpu_tensor_free(group_heads); return 0;
     }
-    return acc;
+    int ok = 1;
+    for (uint32_t g = 0; g < n_groups && ok; g++) {
+        ds4_gpu_tensor heads_view = *heads;
+        heads_view.ptr = (char *)heads->ptr + (uint64_t)g * group_dim * sizeof(float);
+        heads_view.bytes = heads_bytes - (uint64_t)g * group_dim * sizeof(float);
+        ds4_gpu_tensor low_view = *low;
+        low_view.ptr = (char *)low->ptr + (uint64_t)g * rank * sizeof(float);
+        low_view.bytes = low_bytes - (uint64_t)g * rank * sizeof(float);
+        const uint64_t a_offset = out_a_offset + (uint64_t)g * rank * row_a_bytes;
+        ok = ds4_vk_group_copy(&heads_view, group_heads, (uint32_t)group_dim,
+                       (uint32_t)group_stride, (uint32_t)group_dim,
+                               n_tokens);
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(group_low, model_map, model_size,
+                                                a_offset, group_dim, rank,
+                                                group_heads, n_tokens);
+        if (ok) ok = ds4_vk_group_copy(group_low, &low_view, (uint32_t)rank,
+                                       (uint32_t)rank, (uint32_t)low_dim, n_tokens);
+    }
+    ds4_gpu_tensor_free(group_low);
+    ds4_gpu_tensor_free(group_heads);
+    if (resume_recording && !ctx.recording && !begin_cmd()) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_attention_output_low_q8_tensor(ds4_gpu_tensor *low,
@@ -2626,42 +2681,9 @@ int ds4_gpu_attention_output_low_q8_tensor(ds4_gpu_tensor *low,
     uint64_t group_dim, uint64_t rank, uint32_t n_groups,
     const ds4_gpu_tensor *heads)
 {
-    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 || n_groups == 0)
-        return 0;
-    if (!low->ptr || !heads->ptr) return 0;
-
-    const uint64_t low_dim = (uint64_t)n_groups * rank;
-    const uint64_t blocks_a = (group_dim + 31u) / 32u;
-    const uint64_t row_a_bytes = blocks_a * 34u;
-    const uint64_t out_a_bytes = low_dim * row_a_bytes;
-
-    /* Safety: never read past the model mmap, never write past tensor bytes. */
-    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
-    if ((uint64_t)n_groups * group_dim * sizeof(float) > heads->bytes) return 0;
-    if (low_dim * sizeof(float) > low->bytes) return 0;
-
-    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
-    const float *hp = (const float *)heads->ptr;
-    float *lp = (float *)low->ptr;
-
-    /* Quantize each group's activation slice once (n_groups * blocks). */
-    std::vector<int8_t> xq((size_t)n_groups * blocks_a * 32u);
-    std::vector<float> xscale((size_t)n_groups * blocks_a);
-    for (uint32_t g = 0; g < n_groups; g++) {
-        ds4_attn_out_quant_q8_0(hp + (uint64_t)g * group_dim,
-                                xq.data() + (size_t)g * blocks_a * 32u,
-                                xscale.data() + (size_t)g * blocks_a,
-                                group_dim);
-    }
-    /* tensor_row == g*rank + r == idx (ds4.c matvec_q8_0_grouped_worker). */
-    for (uint64_t idx = 0; idx < low_dim; idx++) {
-        const uint64_t g = idx / rank;
-        lp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
-                                        xq.data() + (size_t)g * blocks_a * 32u,
-                                        xscale.data() + (size_t)g * blocks_a,
-                                        group_dim, blocks_a);
-    }
-    return 1;
+    return ds4_vk_attention_output_low_gpu(low, model_map, model_size,
+                                           out_a_offset, group_dim, rank,
+                                           n_groups, heads, 1);
 }
 
 int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
@@ -2672,88 +2694,15 @@ int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
     (void)gt; (void)lt;
     if (!out || !low || !heads || !mm || gd == 0 || rank == 0 ||
         ng == 0 || od == 0 || nt == 0) return 0;
-    if (!out->ptr || !low->ptr || !heads->ptr) return 0;
-
-    const uint64_t low_dim = (uint64_t)ng * rank;
-    const uint64_t blocks_a = (gd + 31u) / 32u;
-    const uint64_t row_a_bytes = blocks_a * 34u;
-    const uint64_t out_a_bytes = low_dim * row_a_bytes;
-    const uint64_t blocks_b = (low_dim + 31u) / 32u;
-    const uint64_t row_b_bytes = blocks_b * 34u;
-    const uint64_t out_b_bytes = od * row_b_bytes;
-
-    /* Safety: model ranges and tensor byte sizes. */
-    if (oa_off > ms || out_a_bytes > ms - oa_off) return 0;
-    if (ob_off > ms || out_b_bytes > ms - ob_off) return 0;
-    if ((uint64_t)nt * ng * gd * sizeof(float) > heads->bytes) return 0;
-    if ((uint64_t)nt * low_dim * sizeof(float) > low->bytes) return 0;
-    if ((uint64_t)nt * od * sizeof(float) > out->bytes) return 0;
-
-    const uint8_t *wa = (const uint8_t *)mm + oa_off;
-    const uint8_t *wb = (const uint8_t *)mm + ob_off;
-    const float *hp = (const float *)heads->ptr;
-    float *lp = (float *)low->ptr;
-    float *op = (float *)out->ptr;
-
-    /* Stage A: quantize every (token, group) activation slice once. */
-    std::vector<int8_t> axq((size_t)nt * ng * blocks_a * 32u);
-    std::vector<float> axscale((size_t)nt * ng * blocks_a);
-    for (uint32_t t = 0; t < nt; t++) {
-        const float *ht = hp + (uint64_t)t * ng * gd;
-        for (uint32_t g = 0; g < ng; g++) {
-            const size_t base = ((size_t)t * ng + g) * blocks_a;
-            ds4_attn_out_quant_q8_0(ht + (uint64_t)g * gd,
-                                    axq.data() + base * 32u,
-                                    axscale.data() + base,
-                                    gd);
-        }
-    }
-    /* low[t][g*rank + r] = dot(out_a row g*rank + r, q8(heads[t][g])). */
-    for (uint32_t t = 0; t < nt; t++) {
-        float *ltp = lp + (uint64_t)t * low_dim;
-        for (uint64_t idx = 0; idx < low_dim; idx++) {
-            const uint64_t g = idx / rank;
-            const size_t base = ((size_t)t * ng + (uint32_t)g) * blocks_a;
-            ltp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
-                                             axq.data() + base * 32u,
-                                             axscale.data() + base,
-                                             gd, blocks_a);
-        }
-    }
-
-    /* Stage B: quantize low per token, out[t][o] = dot(out_b row o, q8(low[t])). */
-    std::vector<int8_t> bxq((size_t)nt * blocks_b * 32u);
-    std::vector<float> bxscale((size_t)nt * blocks_b);
-    for (uint32_t t = 0; t < nt; t++) {
-        ds4_attn_out_quant_q8_0(lp + (uint64_t)t * low_dim,
-                                bxq.data() + (size_t)t * blocks_b * 32u,
-                                bxscale.data() + (size_t)t * blocks_b,
-                                low_dim);
-    }
-    for (uint64_t o = 0; o < od; o++) {
-        const uint8_t *row = wb + o * row_b_bytes;
-        for (uint32_t t = 0; t < nt; t++) {
-            op[(uint64_t)t * od + o] =
-                ds4_attn_out_dot_q8_0(row,
-                                      bxq.data() + (size_t)t * blocks_b * 32u,
-                                      bxscale.data() + (size_t)t * blocks_b,
-                                      low_dim, blocks_b);
-        }
-    }
-    return 1;
+    uint64_t low_dim;
+    if (!checked_u64_product(ng, rank, low_dim)) return 0;
+    if (!ds4_vk_attention_output_low_gpu(low, mm, ms, oa_off, gd, rank,
+                                         ng, heads, nt)) return 0;
+    return ds4_gpu_matmul_q8_0_tensor(out, mm, ms, ob_off, low_dim, od, low, nt);
 }
 
-/* ---- ds4_gpu_attention_output_q8_batch_f16_tensor ----
- *
- * Identical math to ds4_gpu_attention_output_q8_batch_tensor above
- * (grouped Q8_0 attention output projection), but the final out_dim-wide
- * projection of every token is stored as IEEE f16 (2 bytes/element) into
- * out_h instead of f32.  The engine's fast prefill path consumes
- * g->batch_q_half directly, so each output is rounded with
- * ds4_float_to_half (the same half rounding the engine applies elsewhere).
- * low stays f32 (the stage-A low vector buffer is shared with the f32
- * variant).
- */
+/* The Vulkan backend declines the F16-output shortcut so the caller can use
+ * the canonical F32 projection path instead. */
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,
         ds4_gpu_tensor       *low,
@@ -2768,79 +2717,11 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens)
 {
-    DS4_VK_TRACE_KERNEL("attention_output_q8_batch_f16");
-    if (!out_h || !low || !heads || !model_map || group_dim == 0 || rank == 0 ||
-        n_groups == 0 || out_dim == 0 || n_tokens == 0) return 0;
-    if (!out_h->ptr || !low->ptr || !heads->ptr) return 0;
-
-    const uint64_t low_dim = (uint64_t)n_groups * rank;
-    const uint64_t blocks_a = (group_dim + 31u) / 32u;
-    const uint64_t row_a_bytes = blocks_a * 34u;
-    const uint64_t out_a_bytes = low_dim * row_a_bytes;
-    const uint64_t blocks_b = (low_dim + 31u) / 32u;
-    const uint64_t row_b_bytes = blocks_b * 34u;
-    const uint64_t out_b_bytes = out_dim * row_b_bytes;
-
-    /* Safety: model ranges and tensor byte sizes (out_h is f16!). */
-    if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
-    if (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) return 0;
-    if ((uint64_t)n_tokens * n_groups * group_dim * sizeof(float) > heads->bytes) return 0;
-    if ((uint64_t)n_tokens * low_dim * sizeof(float) > low->bytes) return 0;
-    if ((uint64_t)n_tokens * out_dim * sizeof(uint16_t) > out_h->bytes) return 0;
-
-    const uint8_t *wa = (const uint8_t *)model_map + out_a_offset;
-    const uint8_t *wb = (const uint8_t *)model_map + out_b_offset;
-    const float *hp = (const float *)heads->ptr;
-    float *lp = (float *)low->ptr;
-    uint16_t *op = (uint16_t *)out_h->ptr;
-
-    /* Stage A: quantize every (token, group) activation slice once. */
-    std::vector<int8_t> axq((size_t)n_tokens * n_groups * blocks_a * 32u);
-    std::vector<float> axscale((size_t)n_tokens * n_groups * blocks_a);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const float *ht = hp + (uint64_t)t * n_groups * group_dim;
-        for (uint32_t g = 0; g < n_groups; g++) {
-            const size_t base = ((size_t)t * n_groups + g) * blocks_a;
-            ds4_attn_out_quant_q8_0(ht + (uint64_t)g * group_dim,
-                                    axq.data() + base * 32u,
-                                    axscale.data() + base,
-                                    group_dim);
-        }
-    }
-    /* low[t][g*rank + r] = dot(out_a row g*rank + r, q8(heads[t][g])). */
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        float *ltp = lp + (uint64_t)t * low_dim;
-        for (uint64_t idx = 0; idx < low_dim; idx++) {
-            const uint64_t g = idx / rank;
-            const size_t base = ((size_t)t * n_groups + (uint32_t)g) * blocks_a;
-            ltp[idx] = ds4_attn_out_dot_q8_0(wa + idx * row_a_bytes,
-                                             axq.data() + base * 32u,
-                                             axscale.data() + base,
-                                             group_dim, blocks_a);
-        }
-    }
-
-    /* Stage B: quantize low per token, out_h[t][o] =
-     * half(dot(out_b row o, q8(low[t]))). */
-    std::vector<int8_t> bxq((size_t)n_tokens * blocks_b * 32u);
-    std::vector<float> bxscale((size_t)n_tokens * blocks_b);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        ds4_attn_out_quant_q8_0(lp + (uint64_t)t * low_dim,
-                                bxq.data() + (size_t)t * blocks_b * 32u,
-                                bxscale.data() + (size_t)t * blocks_b,
-                                low_dim);
-    }
-    for (uint64_t o = 0; o < out_dim; o++) {
-        const uint8_t *row = wb + o * row_b_bytes;
-        for (uint32_t t = 0; t < n_tokens; t++) {
-            const float v = ds4_attn_out_dot_q8_0(row,
-                                                  bxq.data() + (size_t)t * blocks_b * 32u,
-                                                  bxscale.data() + (size_t)t * blocks_b,
-                                                  low_dim, blocks_b);
-            op[(uint64_t)t * out_dim + o] = ds4_float_to_half(v);
-        }
-    }
-    return 1;
+    (void)out_h; (void)low; (void)model_map; (void)model_size;
+    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
+    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
+    DS4_VK_TRACE_KERNEL("attention_output_q8_batch_f16_unsupported");
+    return 0;
 }
 
 static int dispatch_attention_mixed_online(

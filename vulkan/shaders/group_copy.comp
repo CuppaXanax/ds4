@@ -1,0 +1,24 @@
+#version 460 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer SrcBuf { float src_buf[]; };
+layout(set = 0, binding = 1) writeonly buffer DstBuf { float dst_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint src_stride;
+    uint dst_stride;
+    uint rows;
+    uint src_offset;
+    uint dst_offset;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.y;
+    uint col = gl_LocalInvocationIndex;
+    if (row >= pc.rows || col >= pc.width) return;
+    for (uint i = col; i < pc.width; i += 256u)
+        dst_buf[pc.dst_offset + row * pc.dst_stride + i] =
+            src_buf[pc.src_offset + row * pc.src_stride + i];
+}

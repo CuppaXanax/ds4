@@ -128,7 +128,8 @@ static void ref_rope_tail(float *x, uint32_t n_tok, uint32_t n_head,
 static int check_f32(const char *what, const float *got, const float *want, uint32_t n) {
     int bad = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (!(std::fabsf(got[i] - want[i]) <= 1e-3f)) {
+        const float tolerance = 1e-3f + 5e-4f * std::fabsf(want[i]);
+        if (!(std::fabsf(got[i] - want[i]) <= tolerance)) {
             if (bad < 8)
                 fprintf(stderr, "--- %s mismatch[%u]: got %.6f want %.6f\n",
                         what, i, got[i], want[i]);

@@ -140,11 +140,14 @@ static float dot_q8_0_row(const uint8_t *row, const int8_t *xq, const float *xsc
 static void fill_q8_row(uint8_t *dst, uint32_t n_elem, float scale,
                         uint32_t row, uint32_t kind) {
     uint16_t d16 = f32_to_f16(scale);
-    std::memcpy(dst, &d16, 2);
-    int8_t *qs = (int8_t *)(dst + 2);
-    for (uint32_t i = 0; i < n_elem; i++) {
-        const int v = (int)(((i * 7 + row * 13 + kind * 11) % 65) - 32);
-        qs[i] = (int8_t)v;
+    for (uint32_t block = 0; block < (n_elem + 31u) / 32u; block++) {
+        std::memcpy(dst + block * 34u, &d16, 2);
+        int8_t *qs = (int8_t *)(dst + block * 34u + 2u);
+        for (uint32_t i = 0; i < 32u; i++) {
+            const uint32_t index = block * 32u + i;
+            const int v = (int)(((index * 7 + row * 13 + kind * 11) % 65) - 32);
+            qs[i] = (int8_t)v;
+        }
     }
 }
 

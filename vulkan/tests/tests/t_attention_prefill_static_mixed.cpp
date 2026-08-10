@@ -306,10 +306,12 @@ static int test_attention_prefill_static_mixed(void) {
         std::vector<float> long_raw((uint64_t)long_tokens * head_dim);
         std::vector<float> long_comp_data((uint64_t)long_comp * head_dim);
         std::vector<uint16_t> long_comp_half((uint64_t)long_comp * head_dim);
-        for (size_t i = 0; i < long_q.size(); i++) long_q[i] = 0.01f * (float)((i * 17) % 101 - 50);
-        for (size_t i = 0; i < long_raw.size(); i++) long_raw[i] = 0.02f * (float)((i * 13) % 73 - 36);
+        for (size_t i = 0; i < long_q.size(); i++)
+            long_q[i] = 0.01f * (float)((int)((i * 17) % 101) - 50);
+        for (size_t i = 0; i < long_raw.size(); i++)
+            long_raw[i] = 0.02f * (float)((int)((i * 13) % 73) - 36);
         for (size_t i = 0; i < long_comp_data.size(); i++) {
-            long_comp_data[i] = 0.015f * (float)((i * 11) % 89 - 44);
+            long_comp_data[i] = 0.015f * (float)((int)((i * 11) % 89) - 44);
             long_comp_half[i] = float_to_half(long_comp_data[i]);
         }
         rc |= run_prefill_case(long_tokens, long_comp, n_head, head_dim, 16, 4,

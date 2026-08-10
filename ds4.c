@@ -26528,24 +26528,35 @@ static int metal_graph_decode_test(
     }
 
     if (ok) {
-        ok = ds4_gpu_tensor_read(metal_graph_after_ffn_hc(&g), 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_attn_cur(&g), 0, gpu_attn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_attn_norm(&g), 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_q(&g), 0, gpu_q, q_dim * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_kv(&g), 0, gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(g.layer_raw_cache[0], 0, gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_attn_out(&g), 0, gpu_attn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_after_attn_hc(&g), 0, gpu_after_attn_hc, hc_dim * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_ffn_cur(&g), 0, gpu_ffn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_ffn_norm(&g), 0, gpu_ffn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_shared_out(&g), 0, gpu_shared, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_router_selected(&g), 0, gpu_selected, sizeof(gpu_selected)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_router_weights(&g), 0, gpu_expert_weight, sizeof(gpu_expert_weight)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_routed_out(&g), 0, gpu_routed, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_ffn_out(&g), 0, gpu_ffn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_cur_hc(&g), 0, gpu_after_ffn_hc, hc_dim * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_read(metal_graph_logits(&g), 0, gpu_logits, vocab_dim * sizeof(float)) != 0;
-            if (!ok) fprintf(stderr, "ds4: graph test phase failed: tensor_readback\n");
+#define DS4_GRAPH_TEST_READ(label_, tensor_, dst_, bytes_) do { \
+            if (ok && ds4_gpu_tensor_read((tensor_), 0, (dst_), (bytes_)) == 0) { \
+                fprintf(stderr, \
+                        "ds4: graph test readback failed: %s tensor=%p have=%llu need=%llu\n", \
+                        (label_), (void *)(tensor_), \
+                        (unsigned long long)ds4_gpu_tensor_bytes((tensor_)), \
+                        (unsigned long long)(bytes_)); \
+                ok = false; \
+            } \
+        } while (0)
+        DS4_GRAPH_TEST_READ("after_ffn_hc", metal_graph_after_ffn_hc(&g), gpu_hc, hc_dim * sizeof(float));
+        DS4_GRAPH_TEST_READ("attn_cur", metal_graph_attn_cur(&g), gpu_attn_cur, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("attn_norm", metal_graph_attn_norm(&g), gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("q", metal_graph_q(&g), gpu_q, q_dim * sizeof(float));
+        DS4_GRAPH_TEST_READ("kv", metal_graph_kv(&g), gpu_kv, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        DS4_GRAPH_TEST_READ("raw_cache", g.layer_raw_cache[0], gpu_raw, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        DS4_GRAPH_TEST_READ("attn_out", metal_graph_attn_out(&g), gpu_attn_out, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("after_attn_hc", metal_graph_after_attn_hc(&g), gpu_after_attn_hc, hc_dim * sizeof(float));
+        DS4_GRAPH_TEST_READ("ffn_cur", metal_graph_ffn_cur(&g), gpu_ffn_cur, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("ffn_norm", metal_graph_ffn_norm(&g), gpu_ffn_norm, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("shared_out", metal_graph_shared_out(&g), gpu_shared, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("router_selected", metal_graph_router_selected(&g), gpu_selected, sizeof(gpu_selected));
+        DS4_GRAPH_TEST_READ("router_weights", metal_graph_router_weights(&g), gpu_expert_weight, sizeof(gpu_expert_weight));
+        DS4_GRAPH_TEST_READ("routed_out", metal_graph_routed_out(&g), gpu_routed, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("ffn_out", metal_graph_ffn_out(&g), gpu_ffn_out, (uint64_t)DS4_N_EMBD * sizeof(float));
+        DS4_GRAPH_TEST_READ("cur_hc", metal_graph_cur_hc(&g), gpu_after_ffn_hc, hc_dim * sizeof(float));
+        DS4_GRAPH_TEST_READ("logits", metal_graph_logits(&g), gpu_logits, vocab_dim * sizeof(float));
+#undef DS4_GRAPH_TEST_READ
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: tensor_readback\n");
     }
 
     if (ok) {

@@ -38,6 +38,9 @@ typedef struct ds4_vulkan_caps {
     uint64_t min_storage_buffer_offset_alignment;
     uint32_t max_push_constants_size;      /* bytes */
     uint32_t max_compute_work_group_invocations;
+    uint32_t max_compute_work_group_count[3];
+    uint32_t max_compute_work_group_size[3];
+    uint64_t max_storage_buffer_range;
     uint32_t max_shared_memory_size;       /* bytes */
     uint64_t device_memory_total;          /* bytes */
     uint64_t device_memory_available;      /* bytes at init */

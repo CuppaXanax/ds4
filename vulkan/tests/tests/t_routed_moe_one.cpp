@@ -705,7 +705,7 @@ static int test_routed_moe_one(void) {
      * The production gate/up layout (66 B/block). */
     {
         const uint32_t in_dim = 256, mid_dim = 256, out_dim = 8;
-        const uint32_t n_total = 2, n_expert = 2;
+        const uint32_t n_total = 256, n_expert = 6;
         const float clamp = 0.25f;
         const uint64_t gate_row_bytes = 66;          /* IQ2_XXS block */
         const uint64_t down_row_bytes = 84;          /* Q2_K block */
@@ -762,8 +762,8 @@ static int test_routed_moe_one(void) {
 
         std::vector<float> x(in_dim);
         for (uint32_t i = 0; i < in_dim; i++) x[i] = (float)((int)((i * 7 + 3) % 19) - 9) * 0.125f;
-        std::vector<int32_t> sel = { 0, 1 };
-        std::vector<float> wgt = { 0.35f, 0.65f };
+        std::vector<int32_t> sel = { 0, 1, 2, 3, 4, 5 };
+        std::vector<float> wgt = { 0.20f, 0.18f, 0.17f, 0.16f, 0.15f, 0.14f };
         rc |= run_moe_case("iq2xxs-gate-q2k-down", 16, 10, in_dim, mid_dim, out_dim,
                            n_total, n_expert, clamp, x, sel, wgt, model,
                            gate_offset, up_offset, down_offset,

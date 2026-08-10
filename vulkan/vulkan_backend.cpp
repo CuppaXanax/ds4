@@ -207,6 +207,11 @@ static int select_physical_device(void) {
     g_vk.caps.max_push_constants_size = props.limits.maxPushConstantsSize;
     g_vk.caps.max_compute_work_group_invocations = props.limits.maxComputeWorkGroupInvocations;
     g_vk.caps.max_shared_memory_size = props.limits.maxComputeSharedMemorySize;
+    for (int i = 0; i < 3; ++i) {
+        g_vk.caps.max_compute_work_group_count[i] = props.limits.maxComputeWorkGroupCount[i];
+        g_vk.caps.max_compute_work_group_size[i] = props.limits.maxComputeWorkGroupSize[i];
+    }
+    g_vk.caps.max_storage_buffer_range = props.limits.maxStorageBufferRange;
 
     g_vk.caps.has_subgroup_basic      = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT);
     g_vk.caps.has_subgroup_arithmetic = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
@@ -387,6 +392,7 @@ static int load_all_shaders(void) {
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
         {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
         {"router_select", 24, 7}, /* n_tokens, hash_rows, token, bias/hash, scale */
+        {"routed_moe", 64, 6}, /* canonical Q8_K/IQ2_XXS/Q2_K routed MoE */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -711,6 +717,11 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 }
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
+static bool find_tensor_buffer(const ds4_gpu_tensor *tensor,
+                               VkBuffer &buffer, VkDeviceSize &offset);
+static bool find_model_buffer(uint64_t offset, uint64_t bytes,
+                              VkBuffer &buffer, VkDeviceSize &buffer_offset,
+                              VkDeviceSize &range);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
@@ -4266,6 +4277,7 @@ static float ds4gk_vec_dot_iq2_xxs_q8_K(int n, const ds4gk_block_iq2_xxs *x, con
  * token's slot; the caller validates the tensors and dimensions.  Returns
  * false and prints a diagnostic on an unsupported quant type, an out-of-range
  * selected expert, or weights past the end of the model map. */
+#if 0
 static bool ds4gk_routed_moe_slot(
         uint32_t gate_type, uint32_t down_type,
         uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
@@ -4433,6 +4445,257 @@ static bool ds4gk_routed_moe_slot(
     }
     return true;
 }
+#endif
+
+struct ds4gk_routed_pc {
+    uint32_t mode, gate_type, down_type, in_dim, mid_dim, out_dim;
+    uint32_t n_tokens, n_selected, n_total_expert;
+    uint32_t gate_expert_bytes, gate_row_bytes;
+    uint32_t down_expert_bytes, down_row_bytes, q8_blocks;
+    float clamp_value;
+    uint32_t add_enabled;
+};
+
+static bool ds4gk_routed_buffer(const ds4_gpu_tensor *tensor,
+                                 VkDescriptorBufferInfo &info) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    if (!find_tensor_buffer(tensor, buffer, offset) || tensor->bytes == 0)
+        return false;
+    const VkDeviceSize alignment = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if ((alignment != 0 && offset % alignment != 0) ||
+        tensor->bytes > g_vk.caps.max_storage_buffer_range) return false;
+    /* tensor->bytes is the view length; offset belongs to the parent buffer. */
+    info = {buffer, offset, tensor->bytes};
+    return info.range != 0;
+}
+
+static bool ds4gk_routed_model(uint64_t offset, uint64_t bytes,
+                               VkDescriptorBufferInfo &info) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize buffer_offset = 0, range = 0;
+    if (!find_model_buffer(offset, bytes, buffer, buffer_offset, range)) return false;
+    const VkDeviceSize alignment = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if ((alignment != 0 && buffer_offset % alignment != 0) ||
+        range > g_vk.caps.max_storage_buffer_range) return false;
+    info = {buffer, buffer_offset, range};
+    return info.range != 0;
+}
+
+static bool ds4gk_routed_dispatch(const char *stage,
+                                  const ds4gk_routed_pc &pc,
+                                  VkDescriptorBufferInfo *buffers,
+                                  uint32_t gx, uint32_t gy, uint32_t gz) {
+    auto si = g_vk.shader_map.find("routed_moe");
+    if (si == g_vk.shader_map.end()) return false;
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.recording && !begin_cmd()) return false;
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 6, set)) return false;
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(ctx.cmd, gx, gy, gz);
+    ctx.command_count++;
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+    const int submitted = submit_and_wait();
+    const int released = release_simple_descriptors(set);
+    if (!submitted) {
+        fprintf(stderr, "ds4: routed_moe: %s dispatch failed\n", stage);
+        return false;
+    }
+    return released != 0;
+}
+
+static bool ds4gk_routed_common(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
+        uint32_t n_tokens, bool *mid_is_f16) {
+    if (mid_is_f16) *mid_is_f16 = false;
+    if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
+        !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        (gate_type != 8 && gate_type != 10 && gate_type != 16) ||
+        (down_type != 8 && down_type != 10 && down_type != 16) ||
+        (gate_type != 8 && expert_in_dim % 256 != 0) ||
+        (down_type != 8 && expert_mid_dim % 256 != 0))
+        return false;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    const uint64_t gate_blocks = gate_type == 8 ? (expert_in_dim + 31u) / 32u : expert_in_dim / 256;
+    const uint64_t mid_blocks = down_type == 8 ? (expert_mid_dim + 31u) / 32u : expert_mid_dim / 256;
+    const uint64_t expected_gate_row = gate_blocks *
+        (gate_type == 8 ? 34 : gate_type == 10 ? 84 : 66);
+    const uint64_t expected_down_row = mid_blocks * (down_type == 8 ? 34 : down_type == 10 ? 84 : 66);
+    if (gate_row_bytes != expected_gate_row || down_row_bytes != expected_down_row ||
+        gate_expert_bytes != (uint64_t)expert_mid_dim * gate_row_bytes ||
+        down_expert_bytes != (uint64_t)out_dim * down_row_bytes ||
+        gate_expert_bytes > UINT32_MAX || gate_row_bytes > UINT32_MAX ||
+        down_expert_bytes > UINT32_MAX || down_row_bytes > UINT32_MAX ||
+        n_tokens > UINT32_MAX || expert_in_dim > UINT32_MAX ||
+        expert_mid_dim > UINT32_MAX || out_dim > UINT32_MAX)
+        return false;
+    uint64_t gate_bytes, down_bytes;
+    if (!checked_u64_product(n_total_expert, gate_expert_bytes, gate_bytes) ||
+        !checked_u64_product(n_total_expert, down_expert_bytes, down_bytes) ||
+        gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset)
+        return false;
+    uint64_t selected_values, pair_values, expert_values, x_values, out_values;
+    if (!checked_u64_product(n_tokens, n_expert, selected_values) ||
+        !checked_u64_product(selected_values, expert_mid_dim, pair_values) ||
+        !checked_u64_product(selected_values, out_dim, expert_values) ||
+        !checked_u64_product(n_tokens, expert_in_dim, x_values) ||
+        !checked_u64_product(n_tokens, out_dim, out_values)) return false;
+    if (selected_values > UINT32_MAX || pair_values > UINT32_MAX ||
+        expert_values > UINT32_MAX ||
+        selected->bytes < selected_values * sizeof(int32_t) ||
+        weights->bytes < selected_values * sizeof(float) ||
+        x->bytes < x_values * sizeof(float) ||
+        gate->bytes < pair_values * sizeof(float) || up->bytes < pair_values * sizeof(float) ||
+        mid->bytes < pair_values * sizeof(float) || experts->bytes < expert_values * sizeof(float) ||
+        out->bytes < out_values * sizeof(float) ||
+        (add_in && add_in->bytes < (uint64_t)out_dim * sizeof(float)))
+        return false;
+
+    VkDescriptorBufferInfo x_info, out_info, gate_info, up_info, mid_info, exp_info;
+    VkDescriptorBufferInfo gate_model, up_model, down_model;
+    VkDescriptorBufferInfo selected_info, weights_info, add_info;
+    if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
+        !ds4gk_routed_buffer(gate, gate_info) || !ds4gk_routed_buffer(up, up_info) ||
+        !ds4gk_routed_buffer(mid, mid_info) || !ds4gk_routed_buffer(experts, exp_info) ||
+        !ds4gk_routed_buffer(selected, selected_info) || !ds4gk_routed_buffer(weights, weights_info))
+        return false;
+    if (add_in && !ds4gk_routed_buffer(add_in, add_info)) return false;
+    if (!add_in) add_info = out_info;
+    if (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
+        !ds4gk_routed_model(up_offset, gate_bytes, up_model) ||
+        !ds4gk_routed_model(down_offset, down_bytes, down_model))
+        return false;
+
+    uint64_t q8_blocks = 0, q8_bytes = 0;
+    const uint64_t q8_stride = gate_type == 8 ? 36 : 292;
+    if (!checked_u64_product((uint64_t)n_tokens * n_expert,
+                             std::max(gate_blocks, mid_blocks), q8_blocks) ||
+        !checked_u64_product(q8_blocks,
+                             std::max(q8_stride, down_type == 8 ? 36ull : 292ull), q8_bytes) ||
+        q8_bytes > UINT32_MAX * (uint64_t)sizeof(uint32_t))
+        return false;
+    if (gate_blocks > g_vk.caps.max_compute_work_group_count[0] ||
+        n_tokens > g_vk.caps.max_compute_work_group_count[1] ||
+        n_expert > g_vk.caps.max_compute_work_group_count[2] ||
+        expert_mid_dim > g_vk.caps.max_compute_work_group_count[0] ||
+        out_dim > g_vk.caps.max_compute_work_group_count[0] ||
+        g_vk.caps.max_compute_work_group_size[0] < 256 ||
+        g_vk.caps.max_compute_work_group_invocations < 256)
+        return false;
+    ds4_gpu_tensor q8{}, invalid{};
+    if (!ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) ||
+        !ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t))) {
+        ds4_gpu_tensor_free_in_place(&q8);
+        return false;
+    }
+    const uint32_t zero = 0;
+    if (!ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
+        ds4_gpu_tensor_free_in_place(&invalid);
+        ds4_gpu_tensor_free_in_place(&q8);
+        return false;
+    }
+    const bool resume_recording = get_cmd_ctx().recording;
+    bool ok = true;
+    ds4gk_routed_pc pc{};
+    pc = {0, gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+          n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
+          (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
+          (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0};
+    VkDescriptorBufferInfo q8_info, invalid_info;
+    ok = ds4gk_routed_buffer(&q8, q8_info) &&
+         ds4gk_routed_buffer(&invalid, invalid_info);
+    if (ok) {
+        pc.mode = 5;
+        VkDescriptorBufferInfo validate_buffers[6] = {
+            selected_info, selected_info, selected_info, selected_info,
+            invalid_info, invalid_info};
+        ok = ds4gk_routed_dispatch("validate_selected", pc,
+            validate_buffers, 1, n_tokens, 1);
+        uint32_t invalid_value = 0;
+        if (ok) ok = ds4_gpu_tensor_read(&invalid, 0, &invalid_value,
+                                          sizeof(invalid_value)) != 0 &&
+                     invalid_value == 0;
+        pc.mode = 0;
+    }
+    if (ok) {
+        VkDescriptorBufferInfo quantize_buffers[6] = {
+            x_info, x_info, x_info, x_info, q8_info, q8_info};
+        ok = ds4gk_routed_dispatch("quantize_input", pc,
+            quantize_buffers, gate_blocks, n_tokens, 1);
+    }
+    if (ok) {
+        pc.mode = 1;
+        VkDescriptorBufferInfo gate_up_buffers[6] = {
+            q8_info, gate_model, up_model, selected_info, gate_info, up_info};
+        ok = ds4gk_routed_dispatch("gate_up", pc,
+            gate_up_buffers,
+            expert_mid_dim, n_tokens, n_expert);
+    }
+    if (ok) {
+        pc.mode = 2;
+        VkDescriptorBufferInfo swiglu_buffers[6] = {
+            gate_info, up_info, weights_info, weights_info, mid_info, mid_info};
+        ok = ds4gk_routed_dispatch("swiglu", pc,
+            swiglu_buffers,
+            expert_mid_dim, n_tokens, n_expert);
+    }
+    if (ok) {
+        pc.mode = 0; pc.gate_type = down_type; pc.in_dim = expert_mid_dim;
+        pc.q8_blocks = (uint32_t)mid_blocks;
+        pc.n_tokens = n_tokens * n_expert;
+        VkDescriptorBufferInfo mid_quantize_buffers[6] = {
+            mid_info, mid_info, mid_info, mid_info, q8_info, q8_info};
+        ok = ds4gk_routed_dispatch("quantize_mid", pc,
+            mid_quantize_buffers,
+            mid_blocks, n_tokens * n_expert, 1);
+    }
+    if (ok) {
+        pc.mode = 3; pc.n_tokens = n_tokens;
+        VkDescriptorBufferInfo down_buffers[6] = {
+            q8_info, down_model, down_model, selected_info, exp_info, exp_info};
+        ok = ds4gk_routed_dispatch("down", pc,
+            down_buffers,
+            out_dim, n_tokens, n_expert);
+    }
+    if (ok) {
+        pc.mode = 4; pc.add_enabled = add_in ? 1u : 0u;
+        VkDescriptorBufferInfo reduce_buffers[6] = {
+            add_info, exp_info, out_info, out_info, out_info, out_info};
+        ok = ds4gk_routed_dispatch("reduce", pc,
+            reduce_buffers,
+            out_dim, n_tokens, 1);
+    }
+    ds4_gpu_tensor_free_in_place(&invalid);
+    ds4_gpu_tensor_free_in_place(&q8);
+    if (resume_recording && !get_cmd_ctx().recording && !begin_cmd()) ok = false;
+    return ok;
+}
 
 } /* namespace */
 
@@ -4469,41 +4732,13 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
     DS4_VK_TRACE_KERNEL("routed_moe_one");
     (void)layer_index;
     (void)force_resident;
-    if (!out || !out->ptr || !gate || !gate->ptr || !up || !up->ptr ||
-        !mid || !mid->ptr || !experts || !experts->ptr ||
-        !selected || !selected->ptr || !weights || !weights->ptr ||
-        !x || !x->ptr || !model_map) {
-        fprintf(stderr, "ds4: routed_moe_one: invalid argument\n");
-        return 0;
-    }
-    if (n_expert == 0 || expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0) {
-        fprintf(stderr, "ds4: routed_moe_one: empty dimensions\n");
-        return 0;
-    }
-
-    if (!ds4gk_routed_moe_slot(
-            gate_type, down_type,
-            expert_in_dim, expert_mid_dim, out_dim,
-            n_total_expert, n_expert, clamp,
-            (const uint8_t *)model_map, model_size,
-            gate_offset, up_offset, down_offset,
-            gate_expert_bytes, gate_row_bytes,
-            down_expert_bytes, down_row_bytes,
-            (const float *)x->ptr,
-            (const int32_t *)selected->ptr,
-            (const float *)weights->ptr,
-            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-            (float *)experts->ptr, (float *)out->ptr,
-            "routed_moe_one")) {
-        return 0;
-    }
-
-    if (add_in && add_in->ptr) {
-        const float *ap = (const float *)add_in->ptr;
-        float *op = (float *)out->ptr;
-        for (uint32_t r = 0; r < out_dim; r++) op[r] += ap[r];
-    }
-    return 1;
+    bool mid_is_f16 = false;
+    return ds4gk_routed_common(
+        out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16) ? 1 : 0;
 }
 
 /* Prefill routed MoE over n_tokens tokens.  Same math as the single-token
@@ -4547,53 +4782,12 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(
 {
     (void)layer_index;
     (void)force_resident;
-    if (mid_is_f16) *mid_is_f16 = false;   /* host path writes f32 mid */
-    if (!out || !out->ptr || !gate || !gate->ptr || !up || !up->ptr ||
-        !mid || !mid->ptr || !experts || !experts->ptr ||
-        !selected || !selected->ptr || !weights || !weights->ptr ||
-        !x || !x->ptr || !model_map) {
-        fprintf(stderr, "ds4: routed_moe_batch: invalid argument\n");
-        return 0;
-    }
-    if (n_tokens == 0 || n_expert == 0 || expert_in_dim == 0 ||
-        expert_mid_dim == 0 || out_dim == 0) {
-        fprintf(stderr, "ds4: routed_moe_batch: empty dimensions\n");
-        return 0;
-    }
-    if (gate_expert_bytes == 0 || gate_row_bytes == 0 ||
-        down_expert_bytes == 0 || down_row_bytes == 0 ||
-        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
-        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
-        fprintf(stderr, "ds4: routed_moe_batch: expert byte-size overflow\n");
-        return 0;
-    }
-
-    const uint8_t *base = (const uint8_t *)model_map;
-    const uint64_t pair_stride = (uint64_t)n_expert * expert_mid_dim;
-    const uint64_t exp_stride  = (uint64_t)n_expert * out_dim;
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        if (!ds4gk_routed_moe_slot(
-                gate_type, down_type,
-                expert_in_dim, expert_mid_dim, out_dim,
-                n_total_expert, n_expert, clamp,
-                base, model_size,
-                gate_offset, up_offset, down_offset,
-                gate_expert_bytes, gate_row_bytes,
-                down_expert_bytes, down_row_bytes,
-                (const float *)x->ptr + (uint64_t)t * expert_in_dim,
-                (const int32_t *)selected->ptr + (uint64_t)t * n_expert,
-                (const float *)weights->ptr + (uint64_t)t * n_expert,
-                (float *)gate->ptr     + (uint64_t)t * pair_stride,
-                (float *)up->ptr       + (uint64_t)t * pair_stride,
-                (float *)mid->ptr      + (uint64_t)t * pair_stride,
-                (float *)experts->ptr  + (uint64_t)t * exp_stride,
-                (float *)out->ptr      + (uint64_t)t * out_dim,
-                "routed_moe_batch")) {
-            return 0;
-        }
-    }
-    return 1;
+    return ds4gk_routed_common(
+        out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, nullptr, n_tokens, mid_is_f16) ? 1 : 0;
 }
 
 /* =========================================================================

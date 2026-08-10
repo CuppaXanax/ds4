@@ -1,0 +1,259 @@
+#version 460 core
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { uint b2[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { uint b3[]; };
+layout(set = 0, binding = 4) buffer B4 { uint b4[]; };
+layout(set = 0, binding = 5) buffer B5 { uint b5[]; };
+
+layout(push_constant) uniform PC {
+    uint mode;
+    uint gate_type;
+    uint down_type;
+    uint in_dim;
+    uint mid_dim;
+    uint out_dim;
+    uint n_tokens;
+    uint n_selected;
+    uint n_total_expert;
+    uint gate_expert_bytes;
+    uint gate_row_bytes;
+    uint down_expert_bytes;
+    uint down_row_bytes;
+    uint q8_blocks;
+    float clamp_value;
+    uint add_enabled;
+} pc;
+
+shared float q8_values[256];
+
+#include "iq2_tables.glsl"
+
+uint byte_at(uint data[], uint byte_idx, uint total_bytes) {
+    if (byte_idx >= total_bytes) return 0u;
+    return (data[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
+}
+
+int i8_at(uint data[], uint byte_idx, uint total_bytes) {
+    uint v = byte_at(data, byte_idx, total_bytes);
+    return v < 128u ? int(v) : int(v) - 256;
+}
+
+float f16(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) return (s != 0u ? -1.0 : 1.0) * (float(m) * exp2(-24.0));
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) * exp2(float(e) - 15.0);
+}
+
+float q8_value(uint token, uint block, uint i) {
+    uint words = pc.q8_blocks * 73u;
+    uint base = (token * pc.q8_blocks + block) * 73u;
+    uint bits = b0[base + 0u];
+    float d = uintBitsToFloat(bits);
+    int q = i8_at(b0, (base + 1u) * 4u + i, words * 4u);
+    return d * float(q);
+}
+
+/* Q8_0 activations use a padded 36-byte temporary block: f32 d + qs[32]. */
+float q8_0_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) {
+    float total = 0.0;
+    for (uint block = 0u; block < input_blocks; ++block) {
+        uint wb = row_byte + block * 34u;
+        uint xb = input_token * input_blocks * 36u + block * 36u;
+        uint wscale = byte_at(data, wb, 0xffffffffu) |
+                      (byte_at(data, wb + 1u, 0xffffffffu) << 8u);
+        float d = f16(wscale) * uintBitsToFloat(b0[xb / 4u]);
+        uint count = min(32u, pc.in_dim - block * 32u);
+        for (uint i = 0u; i < count; ++i)
+            total += d * float(i8_at(data, wb + 2u + i, 0xffffffffu)) *
+                     float(i8_at(b0, xb + 4u + i, 0xffffffffu));
+    }
+    return total;
+}
+
+float q2_dot(uint data[], uint row_byte, uint row_bytes, uint input_token, uint input_blocks) {
+    float total = 0.0;
+    for (uint block = 0u; block < input_blocks; ++block) {
+        uint wb = row_byte + block * 84u;
+        uint xb = (input_token * input_blocks + block) * 73u;
+        uint dword = byte_at(data, wb + 80u, 0xffffffffu) | (byte_at(data, wb + 81u, 0xffffffffu) << 8u);
+        uint dminword = byte_at(data, wb + 82u, 0xffffffffu) | (byte_at(data, wb + 83u, 0xffffffffu) << 8u);
+        float dall = uintBitsToFloat(b0[xb]) * f16(dword);
+        float dmin = uintBitsToFloat(b0[xb]) * f16(dminword);
+        int isum = 0;
+        int summs = 0;
+        for (uint j = 0u; j < 16u; ++j) {
+            uint raw = b0[xb + 65u + (j >> 1u)];
+            int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
+            if (bsum >= 32768) bsum -= 65536;
+            summs += bsum * int(byte_at(data, wb + j, 0xffffffffu) >> 4u);
+        }
+        for (uint half_block = 0u; half_block < 2u; ++half_block) {
+            uint q2base = wb + 16u + half_block * 32u;
+            uint q8base = (xb + 1u) * 4u + half_block * 128u;
+            for (uint j = 0u; j < 4u; ++j) {
+                uint shift = j * 2u;
+                uint scale0 = byte_at(data, wb + half_block * 8u + j * 2u, 0xffffffffu) & 15u;
+                uint scale1 = byte_at(data, wb + half_block * 8u + j * 2u + 1u, 0xffffffffu) & 15u;
+                for (uint k = 0u; k < 16u; ++k) {
+                    uint q0 = (byte_at(data, q2base + k, 0xffffffffu) >> shift) & 3u;
+                    uint q1 = (byte_at(data, q2base + 16u + k, 0xffffffffu) >> shift) & 3u;
+                    uint q8group = q8base + j * 32u;
+                    isum += int(scale0) * int(q0) * i8_at(b0, q8group + k, 0xffffffffu);
+                    isum += int(scale1) * int(q1) * i8_at(b0, q8group + 16u + k, 0xffffffffu);
+                }
+            }
+        }
+        total += dall * float(isum) - dmin * float(summs);
+    }
+    return total;
+}
+
+float iq2_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) {
+    float total = 0.0;
+    for (uint block = 0u; block < input_blocks; ++block) {
+        uint wb = row_byte + block * 66u;
+        uint xb = (input_token * input_blocks + block) * 73u;
+        uint dword = byte_at(data, wb, 0xffffffffu) | (byte_at(data, wb + 1u, 0xffffffffu) << 8u);
+        float d = uintBitsToFloat(b0[xb]) * f16(dword);
+        int sum = 0;
+        for (uint ib = 0u; ib < 8u; ++ib) {
+            uint qbase = wb + 2u + ib * 8u;
+            uint q = byte_at(data, qbase, 0xffffffffu) |
+                     (byte_at(data, qbase + 1u, 0xffffffffu) << 8u) |
+                     (byte_at(data, qbase + 2u, 0xffffffffu) << 16u) |
+                     (byte_at(data, qbase + 3u, 0xffffffffu) << 24u);
+            uint a = byte_at(data, qbase + 4u, 0xffffffffu) |
+                     (byte_at(data, qbase + 5u, 0xffffffffu) << 8u) |
+                     (byte_at(data, qbase + 6u, 0xffffffffu) << 16u) |
+                     (byte_at(data, qbase + 7u, 0xffffffffu) << 24u);
+            uint ls = 2u * (a >> 28u) + 1u;
+            for (uint pair = 0u; pair < 2u; ++pair) {
+                uint s0 = (a >> (14u * pair)) & 127u;
+                uint s1 = (a >> (14u * pair + 7u)) & 127u;
+                uint g0 = (q >> (16u * pair)) & 255u;
+                uint g1 = (q >> (16u * pair + 8u)) & 255u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    int v0 = int((iq2_grid[g0] >> (8u * j)) & 255ul);
+                    int v1 = int((iq2_grid[g1] >> (8u * j)) & 255ul);
+                    if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
+                    if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
+                    int q80 = i8_at(b0, (xb + 1u) * 4u + ib * 32u + pair * 16u + j, 0xffffffffu);
+                    int q81 = i8_at(b0, (xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j, 0xffffffffu);
+                    sum += int(ls) * (v0 * q80 + v1 * q81);
+                }
+            }
+        }
+        total += 0.125 * d * float(sum);
+    }
+    return total;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint token = gl_WorkGroupID.y;
+    if (pc.mode == 5u) {
+        if (token < pc.n_tokens && lid < pc.n_selected &&
+            b0[token * pc.n_selected + lid] >= pc.n_total_expert)
+            atomicOr(b4[0], 1u);
+        return;
+    }
+    if (pc.mode == 0u) {
+        uint block = gl_WorkGroupID.x;
+        if (token >= pc.n_tokens || block >= pc.q8_blocks) return;
+        uint count = pc.gate_type == 8u ? 32u : 256u;
+        uint input_index = block * count + lid;
+        q8_values[lid] = lid < count && input_index < pc.in_dim ?
+            uintBitsToFloat(b0[token * pc.in_dim + input_index]) : 0.0;
+        barrier();
+        if (lid == 0u) {
+            float maximum = 0.0;
+            float selected = 0.0;
+            for (uint i = 0u; i < 256u; ++i) {
+            if (abs(q8_values[i]) > maximum) { maximum = abs(q8_values[i]); selected = q8_values[i]; }
+            }
+            uint stride = pc.gate_type == 8u ? 36u : 292u;
+            uint base = token * pc.q8_blocks * stride + block * stride;
+            float inv = pc.gate_type == 8u
+                ? (maximum == 0.0 ? 0.0 : 127.0 / maximum)
+                : (selected == 0.0 ? 0.0 : -127.0 / selected);
+            b4[base / 4u] = floatBitsToUint(inv == 0.0 ? 0.0 : 1.0 / inv);
+            uint q8_count = pc.gate_type == 8u ? 32u : 256u;
+            for (uint i = 0u; i < q8_count; i += 4u) {
+                uint packed = 0u;
+                for (uint j = 0u; j < 4u; ++j)
+                    packed |= (uint(clamp(roundEven(q8_values[i + j] * inv), -128.0, 127.0)) & 255u) << (8u * j);
+                b4[base / 4u + 1u + i / 4u] = packed;
+            }
+            if (pc.gate_type != 8u) {
+                for (uint i = 0u; i < 16u; ++i) {
+                    int s = 0;
+                    for (uint j = 0u; j < 16u; ++j)
+                        s += int(clamp(roundEven(q8_values[i * 16u + j] * inv), -128.0, 127.0));
+                    uint word = base / 4u + 65u + (i >> 1u);
+                    if ((i & 1u) == 0u) b4[word] = uint(s) & 65535u;
+                    else b4[word] |= (uint(s) & 65535u) << 16u;
+                }
+            }
+        }
+        return;
+    }
+    if (pc.mode == 1u) {
+        uint row = gl_WorkGroupID.x;
+        uint rank = gl_WorkGroupID.z;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
+        uint expert = b3[token * pc.n_selected + rank];
+        if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; b5[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; return; }
+        uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
+        float g = pc.gate_type == 8u ? q8_0_dot(b1, rb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(b1, rb, token, pc.q8_blocks) : q2_dot(b1, rb, pc.gate_row_bytes, token, pc.q8_blocks);
+        uint upb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
+        float u = pc.gate_type == 8u ? q8_0_dot(b2, upb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(b2, upb, token, pc.q8_blocks) : q2_dot(b2, upb, pc.gate_row_bytes, token, pc.q8_blocks);
+        if (pc.clamp_value > 1.0e-6) {
+            g = min(g, pc.clamp_value);
+            u = clamp(u, -pc.clamp_value, pc.clamp_value);
+        }
+        b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = floatBitsToUint(g);
+        b5[(token * pc.n_selected + rank) * pc.mid_dim + row] = floatBitsToUint(u);
+        return;
+    }
+    if (pc.mode == 2u) {
+        uint row = gl_WorkGroupID.x;
+        uint rank = gl_WorkGroupID.z;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
+        uint at = (token * pc.n_selected + rank) * pc.mid_dim + row;
+        float g = uintBitsToFloat(b0[at]);
+        float u = uintBitsToFloat(b1[at]);
+        float c = pc.clamp_value > 0.0 ? pc.clamp_value : 3.402823e38;
+        g = min(g, c); u = clamp(u, -c, c);
+        b4[at] = floatBitsToUint((g / (1.0 + exp(-g))) * u * uintBitsToFloat(b2[token * pc.n_selected + rank]));
+        return;
+    }
+    if (pc.mode == 3u) {
+        uint row = gl_WorkGroupID.x;
+        uint rank = gl_WorkGroupID.z;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim) return;
+        uint expert = b3[token * pc.n_selected + rank];
+        if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u; return; }
+        uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
+        uint q8_token = token * pc.n_selected + rank;
+        float v = pc.down_type == 8u ? q8_0_dot(b1, rb, q8_token, pc.q8_blocks) : pc.down_type == 16u ? iq2_dot(b1, rb, q8_token, pc.q8_blocks) : q2_dot(b1, rb, pc.down_row_bytes, q8_token, pc.q8_blocks);
+        b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
+        return;
+    }
+    if (pc.mode == 4u) {
+        uint row = gl_WorkGroupID.x;
+        if (token >= pc.n_tokens || row >= pc.out_dim || lid != 0u) return;
+        float v = 0.0;
+        for (uint rank = 0u; rank < pc.n_selected; ++rank) v += uintBitsToFloat(b1[(token * pc.n_selected + rank) * pc.out_dim + row]);
+        if (pc.add_enabled != 0u) v += uintBitsToFloat(b0[row]);
+        b4[token * pc.out_dim + row] = floatBitsToUint(v);
+    }
+}

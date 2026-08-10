@@ -6,8 +6,8 @@
  *   ds4_gpu_head_rms_norm_tensor
  *   ds4_gpu_head_rms_norm_rope_tail_tensor
  *
- * All five are host-side in the backend (they operate on tensor->ptr
- * directly), so the tests do NOT wrap the calls in begin/end_commands.
+ * The Vulkan backend dispatches all five operations and synchronizes before
+ * returning, so the tests can read the tensors immediately after each call.
  * The CPU reference is copied verbatim from ds4.c (rms_norm_no_weight,
  * rms_norm_weight, head_rms_norm_inplace, rope_tail_ext_inplace), so this
  * validates the exact eps / layout / RoPE frequency semantics of the
@@ -100,7 +100,7 @@ static void ref_rope_tail(float *x, uint32_t n_tok, uint32_t n_head,
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t h = 0; h < n_head; h++) {
             float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
-            float theta_extrap = (float)pos;
+            float theta_extrap = (float)(pos + t);
             for (uint32_t i = 0; i < n_rot; i += 2) {
                 const float theta_interp = freq_scale * theta_extrap;
                 float theta = theta_interp;
@@ -362,8 +362,23 @@ static int test_head_rms_norm_rope_tail(void) {
         if (ds4_gpu_tensor_read(x, 0, got, sizeof(got)) != 0)
             rc = check_f32("head_rms_norm_rope_tail", got, want, (uint32_t)elems);
     }
+    std::memcpy(want, xv, sizeof(xv));
+    ref_head_rms_norm(want, n_tok, n_head, head_dim, eps);
+    ref_rope_tail(want, n_tok, n_head, head_dim, n_rot, 9000, 16384,
+                  10000.0f, 0.25f, 1.0f, 1.0f, 32.0f, 1.0f, true);
+    int yarn_rc = 1;
+    if (ds4_gpu_tensor_write(x, 0, xv, sizeof(xv)) != 0 &&
+        ds4_gpu_head_rms_norm_rope_tail_tensor(x, n_tok, n_head, head_dim,
+                                               n_rot, 9000, 16384, true,
+                                               10000.0f, 0.25f, 1.0f, 1.0f,
+                                               32.0f, 1.0f, eps) != 0) {
+        float got[elems];
+        if (ds4_gpu_tensor_read(x, 0, got, sizeof(got)) != 0)
+            yarn_rc = check_f32("head_rms_norm_rope_tail/yarn-inv", got, want,
+                                (uint32_t)elems);
+    }
     ds4_gpu_tensor_free(x);
-    return rc;
+    return rc || yarn_rc;
 }
 REGISTER_TEST(head_rms_norm_rope_tail, test_head_rms_norm_rope_tail);
 

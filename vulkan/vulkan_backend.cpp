@@ -362,7 +362,8 @@ static int load_all_shaders(void) {
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
         {"rms_norm_weight_rows", 12, 6},
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
-        {"rope_tail", 44, 6},     /* 11 x uint32 */
+        {"rope_tail", 52, 6},      /* 7 x uint32 + 6 x float */
+        {"head_rms_norm_rope_tail", 56, 6}, /* 7 x uint32 + 7 x float */
         {"hc_weighted_sum", 16, 6}, /* n_embd, n_hc, rows, reserved */
         {"hc_expand", 36, 6}, /* shape, strides, add/split/half flags */
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
@@ -1115,6 +1116,41 @@ static int release_simple_descriptors(VkDescriptorSet set) {
     return vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
 }
 
+static bool checked_head_f32_layout(uint32_t n_tok, uint32_t n_head,
+                                    uint32_t head_dim, uint64_t &row_bytes,
+                                    uint64_t &total_bytes) {
+    if (n_tok == 0 || n_head == 0 || head_dim == 0 ||
+        (uint64_t)n_head > UINT64_MAX / head_dim)
+        return false;
+    const uint64_t row_elems = (uint64_t)n_head * head_dim;
+    if (row_elems > UINT64_MAX / sizeof(float)) return false;
+    row_bytes = row_elems * sizeof(float);
+    if ((uint64_t)n_tok > UINT64_MAX / row_bytes) return false;
+    total_bytes = (uint64_t)n_tok * row_bytes;
+    return true;
+}
+
+static bool make_head_tile_descriptor(VkBuffer buffer, VkDeviceSize base_offset,
+                                      uint64_t row_bytes, uint32_t token_base,
+                                      uint32_t tile_tokens,
+                                      VkDescriptorBufferInfo &info) {
+    if (row_bytes == 0 || token_base > UINT64_MAX / row_bytes ||
+        tile_tokens > UINT64_MAX / row_bytes)
+        return false;
+    const uint64_t tile_offset = (uint64_t)token_base * row_bytes;
+    const uint64_t tile_bytes = (uint64_t)tile_tokens * row_bytes;
+    if ((uint64_t)base_offset > UINT64_MAX - tile_offset ||
+        (VkDeviceSize)((uint64_t)base_offset + tile_offset) !=
+            (uint64_t)base_offset + tile_offset)
+        return false;
+    const VkDeviceSize offset = base_offset + (VkDeviceSize)tile_offset;
+    const VkDeviceSize alignment =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (alignment != 0 && offset % alignment != 0) return false;
+    info = {buffer, offset, (VkDeviceSize)tile_bytes};
+    return true;
+}
+
 static int fail_simple_dispatch(VulkanCommandCtx &ctx) {
     if (ctx.recording && ctx.command_count == 0) (void)submit_and_wait();
     return 0;
@@ -1654,29 +1690,108 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x,
     float freq_scale, float ext_factor, float attn_factor, float beta_fast,
     float beta_slow, float eps)
 {
-    (void)n_ctx_orig; (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    if (ds4_gpu_head_rms_norm_tensor(x, n_tok, n_head, head_dim, eps) == 0) return 0;
-    return ds4_gpu_rope_tail_tensor(x, n_tok, n_head, head_dim, n_rot, pos0,
-                                     n_ctx_orig, (int)inverse, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+    DS4_VK_TRACE_KERNEL("head_rms_norm_rope_tail");
+    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0 || freq_base <= 0.0f ||
+        freq_scale <= 0.0f) return 0;
+    uint64_t row_bytes, total_bytes;
+    if (n_head > 65535u ||
+        !checked_head_f32_layout(n_tok, n_head, head_dim, row_bytes, total_bytes) ||
+        total_bytes > x->bytes ||
+        (n_tok > 1 && pos0 > UINT32_MAX - (n_tok - 1u))) return 0;
+    auto si = g_vk.shader_map.find("head_rms_norm_rope_tail");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer buffer; VkDeviceSize offset;
+    if (!find_tensor_buffer(x, buffer, offset)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    const uint32_t tile_tokens = std::max(1u, 65535u / n_head);
+    const VkDeviceSize alignment =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (n_tok > tile_tokens && alignment != 0 && row_bytes % alignment != 0)
+        return 0;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    int ok = 1;
+    for (uint32_t token_base = 0; token_base < n_tok; ) {
+        const uint32_t tile_n = std::min(tile_tokens, n_tok - token_base);
+        if (!ctx.recording && !begin_cmd()) return 0;
+        VkDescriptorBufferInfo info;
+        if (!make_head_tile_descriptor(buffer, offset, row_bytes, token_base,
+                                       tile_n, info)) return fail_simple_dispatch(ctx);
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (!allocate_simple_descriptors(shader, &info, 1, set))
+            return fail_simple_dispatch(ctx);
+        vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                shader.layout, 0, 1, &set, 0, nullptr);
+        struct Push {
+            uint32_t n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig;
+            int32_t inverse;
+            float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps;
+        } push = {tile_n, n_head, head_dim, n_rot, pos0 + token_base, n_ctx_orig,
+                  inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
+                  beta_fast, beta_slow, eps};
+        vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+        vkCmdDispatch(ctx.cmd, tile_n * n_head, 1, 1);
+        ok = finish_simple_dispatch(ctx, resume_recording);
+        if (!release_simple_descriptors(set)) ok = 0;
+        if (!ok) return 0;
+        token_base += tile_n;
+    }
+    return ok;
 }
 
 /* ---- head_rms_norm_tensor dispatch ---- */
 int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
                                   uint32_t n_head, uint32_t head_dim, float eps)
 {
-    if (!x || !x->ptr) return 0;
-    /* CPU implementation */
-    float *d = (float*)x->ptr;
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t h = 0; h < n_head; h++) {
-            uint64_t off = ((uint64_t)t * n_head + h) * head_dim;
-            double sum = 0.0; for (uint32_t i = 0; i < head_dim; i++) sum += (double)d[off + i] * d[off + i];
-            float rcp = 1.0f / sqrtf((float)(sum / head_dim) + eps);
-            for (uint32_t i = 0; i < head_dim; i++) d[off + i] *= rcp;
-        }
+    DS4_VK_TRACE_KERNEL("head_rms_norm");
+    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0) return 0;
+    uint64_t row_bytes, total_bytes;
+    if (n_head > 65535u ||
+        !checked_head_f32_layout(n_tok, n_head, head_dim, row_bytes, total_bytes) ||
+        total_bytes > x->bytes) return 0;
+    auto si = g_vk.shader_map.find("head_rms_norm");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer buffer; VkDeviceSize offset;
+    if (!find_tensor_buffer(x, buffer, offset)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    const uint32_t tile_tokens = std::max(1u, 65535u / n_head);
+    const VkDeviceSize alignment =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (n_tok > tile_tokens && alignment != 0 && row_bytes % alignment != 0)
+        return 0;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    int ok = 1;
+    for (uint32_t token_base = 0; token_base < n_tok; ) {
+        const uint32_t tile_n = std::min(tile_tokens, n_tok - token_base);
+        if (!ctx.recording && !begin_cmd()) return 0;
+        VkDescriptorBufferInfo info;
+        if (!make_head_tile_descriptor(buffer, offset, row_bytes, token_base,
+                                       tile_n, info)) return fail_simple_dispatch(ctx);
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (!allocate_simple_descriptors(shader, &info, 1, set))
+            return fail_simple_dispatch(ctx);
+        vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                shader.layout, 0, 1, &set, 0, nullptr);
+        struct Push { uint32_t n_tok, n_head, head_dim; float eps; } push =
+            {tile_n, n_head, head_dim, eps};
+        vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+        vkCmdDispatch(ctx.cmd, tile_n * n_head, 1, 1);
+        ok = finish_simple_dispatch(ctx, resume_recording);
+        if (!release_simple_descriptors(set)) ok = 0;
+        if (!ok) return 0;
+        token_base += tile_n;
     }
-    return 1;
+    return ok;
 }
 
 /* ---- rope_tail_tensor dispatch ---- */
@@ -1696,52 +1811,67 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
                               float freq_scale, float ext_factor, float attn_factor,
                               float beta_fast, float beta_slow)
 {
-    if (!x || !x->ptr) return 0;
-    const uint32_t n_nope = head_dim - n_rot;
-    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
-    const float sin_sign = inverse ? -1.0f : 1.0f;
-    const float k_pi = 3.14159265358979323846f;
-    float corr_dims[2] = { 0.0f, 0.0f };
-    if (ext_factor != 0.0f) {
-        /* ds4.c rope_yarn_corr_dims(n_rot, n_ctx_orig, freq_base, ...). */
-        const float start = floorf((float)n_rot *
-            logf((float)n_ctx_orig / (beta_fast * 2.0f * k_pi)) /
-            (2.0f * logf(freq_base)));
-        const float end = ceilf((float)n_rot *
-            logf((float)n_ctx_orig / (beta_slow * 2.0f * k_pi)) /
-            (2.0f * logf(freq_base)));
-        corr_dims[0] = fmaxf(0.0f, start);
-        corr_dims[1] = fminf((float)(n_rot - 1), end);
-    }
-    float *d = (float*)x->ptr;
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t h = 0; h < n_head; h++) {
-            float *tail = d + ((uint64_t)t * n_head + h) * head_dim + n_nope;
-            float theta_extrap = (float)pos0;
-            for (uint32_t i = 0; i < n_rot; i += 2) {
-                const float theta_interp = freq_scale * theta_extrap;
-                float theta = theta_interp;
-                float mscale = attn_factor;
-                if (ext_factor != 0.0f) {
-                    /* ds4.c rope_yarn_ramp(corr_dims[0], corr_dims[1], i). */
-                    const float y = ((float)(i / 2) - corr_dims[0]) /
-                        fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
-                    const float ramp_mix =
-                        (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
-                    theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-                    mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-                }
-                const float c = cosf(theta) * mscale;
-                const float s = sin_sign * sinf(theta) * mscale;
-                const float x0 = tail[i];
-                const float x1 = tail[i + 1];
-                tail[i] = x0 * c - x1 * s;
-                tail[i + 1] = x0 * s + x1 * c;
-                theta_extrap *= theta_scale;
-            }
+    DS4_VK_TRACE_KERNEL("rope_tail");
+    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || n_rot == 0 ||
+        n_rot > head_dim || (n_rot & 1u) != 0 || freq_base <= 0.0f ||
+        freq_scale <= 0.0f) return 0;
+    uint64_t row_bytes, total_bytes;
+    if (!checked_head_f32_layout(n_tok, n_head, head_dim, row_bytes, total_bytes) ||
+        total_bytes > x->bytes ||
+        (n_tok > 1 && pos0 > UINT32_MAX - (n_tok - 1u))) return 0;
+    auto si = g_vk.shader_map.find("rope_tail");
+    if (si == g_vk.shader_map.end()) return 0;
+    VkBuffer buffer; VkDeviceSize offset;
+    if (!find_tensor_buffer(x, buffer, offset)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    const uint64_t pairs_per_token = (uint64_t)n_head * (n_rot / 2u);
+    if (pairs_per_token == 0 || pairs_per_token > UINT64_MAX / 256u) return 0;
+    const uint32_t tile_tokens = (uint32_t)std::min<uint64_t>(n_tok,
+        (65535ull * 256ull) / pairs_per_token);
+    if (tile_tokens == 0) return 0;
+    const VkDeviceSize alignment =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (n_tok > tile_tokens && alignment != 0 && row_bytes % alignment != 0)
+        return 0;
+    int ok = 1;
+    for (uint32_t token_base = 0; token_base < n_tok; ) {
+        const uint32_t tile_n = std::min(tile_tokens, n_tok - token_base);
+        if (!ctx.recording && !begin_cmd()) return 0;
+        VkDescriptorBufferInfo info;
+        if (!make_head_tile_descriptor(buffer, offset, row_bytes, token_base,
+                                       tile_n, info)) return fail_simple_dispatch(ctx);
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (!allocate_simple_descriptors(shader, &info, 1, set))
+            return fail_simple_dispatch(ctx);
+        vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                shader.layout, 0, 1, &set, 0, nullptr);
+        struct Push {
+            uint32_t n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig;
+            int32_t inverse;
+            float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+        } push = {tile_n, n_head, head_dim, n_rot, pos0 + token_base, n_ctx_orig,
+                  inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
+                  beta_fast, beta_slow};
+        vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+        const uint64_t tile_pairs = (uint64_t)tile_n * pairs_per_token;
+        const uint32_t groups = (uint32_t)((tile_pairs + 255u) / 256u);
+        if (groups == 0 || groups > 65535u) {
+            if (!release_simple_descriptors(set)) return 0;
+            return fail_simple_dispatch(ctx);
         }
+        vkCmdDispatch(ctx.cmd, groups, 1, 1);
+        ok = finish_simple_dispatch(ctx, resume_recording);
+        if (!release_simple_descriptors(set)) ok = 0;
+        if (!ok) return 0;
+        token_base += tile_n;
     }
-    return 1;
+    return ok;
 }
 
 static void ds4_embed_f16_row(float *out, const uint8_t *row, uint64_t n_embd);

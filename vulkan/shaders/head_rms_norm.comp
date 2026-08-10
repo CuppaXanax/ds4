@@ -12,12 +12,17 @@ void main() {
     uint t = gl_WorkGroupID.x / pc.n_head;
     uint h = gl_WorkGroupID.x % pc.n_head;
     uint lid = gl_LocalInvocationIndex;
-    if (t >= pc.n_tok) return;
     uint off = (t * pc.n_head + h) * pc.head_dim;
-    double sum = 0.0;
+    float sum = 0.0;
     for (uint i = lid; i < pc.head_dim; i += 256u)
-        sum += double(x_buf[off + i]) * double(x_buf[off + i]);
-    float mean = float(sum / double(pc.head_dim));
+        sum += x_buf[off + i] * x_buf[off + i];
+    ssum[lid] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) ssum[lid] += ssum[lid + stride];
+        barrier();
+    }
+    float mean = ssum[0] / float(pc.head_dim);
     float rcp = inversesqrt(mean + pc.eps);
     for (uint i = lid; i < pc.head_dim; i += 256u)
         x_buf[off + i] *= rcp;

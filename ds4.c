@@ -26244,8 +26244,8 @@ static void metal_graph_trace_layer_stages(
     float *gpu_routed = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *gpu_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *gpu_after_ffn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    int gpu_selected[DS4_MAX_EXPERT_USED];
-    float gpu_expert_weight[DS4_MAX_EXPERT_USED];
+    int gpu_selected[DS4_N_EXPERT_USED];
+    float gpu_expert_weight[DS4_N_EXPERT_USED];
 
     bool ok = ds4_gpu_tensor_read(metal_graph_attn_cur(g), 0, gpu_attn_cur, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
               ds4_gpu_tensor_read(metal_graph_attn_norm(g), 0, gpu_attn_norm, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
@@ -26297,7 +26297,7 @@ static void metal_graph_trace_layer_stages(
                 rms_abs_diff(routed_mid_all, gpu_routed_mid_all, DS4_N_EXPERT_USED * down_in_dim),
                 max_abs_diff(cpu_routed, gpu_routed, DS4_N_EMBD),
                 rms_abs_diff(cpu_routed, gpu_routed, DS4_N_EMBD));
-        if (memcmp(selected, gpu_selected, sizeof(selected)) != 0) {
+        if (memcmp(selected, gpu_selected, sizeof(gpu_selected)) != 0) {
             fprintf(stderr,
                     "ds4: Metal stage layer %u router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
                     il,
@@ -26411,8 +26411,8 @@ static int metal_graph_decode_test(
     float *gpu_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *gpu_after_ffn_hc = xmalloc((size_t)hc_dim * sizeof(float));
     float *gpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
-    int gpu_selected[DS4_MAX_EXPERT_USED];
-    float gpu_expert_weight[DS4_MAX_EXPERT_USED];
+    int gpu_selected[DS4_N_EXPERT_USED];
+    float gpu_expert_weight[DS4_N_EXPERT_USED];
     float *routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * down_in_dim * sizeof(float));
     block_q8_K *routed_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
     block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(block_q8_K));
@@ -26578,7 +26578,7 @@ static int metal_graph_decode_test(
                 max_abs_diff(cpu_ffn_out, gpu_ffn_out, DS4_N_EMBD),
                 max_abs_diff(cpu_after_ffn_hc, gpu_after_ffn_hc, hc_dim),
                 max_abs_diff(cpu_logits, gpu_logits, vocab_dim));
-        if (memcmp(selected, gpu_selected, sizeof(selected)) != 0) {
+        if (memcmp(selected, gpu_selected, sizeof(gpu_selected)) != 0) {
             fprintf(stderr,
                     "ds4: Metal graph router selected mismatch: cpu=[%d,%d,%d,%d,%d,%d] gpu=[%d,%d,%d,%d,%d,%d]\n",
                     selected[0], selected[1], selected[2], selected[3], selected[4], selected[5],

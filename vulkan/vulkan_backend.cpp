@@ -4652,11 +4652,19 @@ static bool ds4gk_routed_common(
     }
     if (ok) {
         pc.mode = 1;
-        VkDescriptorBufferInfo gate_up_buffers[6] = {
-            q8_info, gate_model, up_model, selected_info, gate_info, up_info};
+        VkDescriptorBufferInfo gate_buffers[6] = {
+            q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
         ok = ds4gk_routed_dispatch("gate_up", pc,
-            gate_up_buffers,
+            gate_buffers,
             expert_mid_dim, n_tokens, n_expert);
+        if (ok) {
+            pc.add_enabled = 1;
+            VkDescriptorBufferInfo up_buffers[6] = {
+                q8_info, up_model, up_model, selected_info, up_info, up_info};
+            ok = ds4gk_routed_dispatch("up", pc,
+                up_buffers, expert_mid_dim, n_tokens, n_expert);
+            pc.add_enabled = 0;
+        }
     }
     if (ok) {
         pc.mode = 2;

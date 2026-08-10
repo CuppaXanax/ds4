@@ -1895,11 +1895,8 @@ int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     (void)q_half; (void)model_size; (void)w_off; (void)in_dim; (void)out_dim;
     (void)qr_norm; (void)n_ctx_orig; (void)inverse;
     (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    /* Fused Q_B matmul + head_rms_norm + rope.
-     * Since we implement matmul_q8_0 and head_rms_norm separately,
-     * just call them in sequence. For now, return 1 (stub).
-     * The caller has a fallback path. */
-    return 1;
+    /* Unavailable: the caller runs matmul_q8_0, head RMSNorm, and RoPE. */
+    return 0;
 }
 
 } /* extern "C" */

@@ -358,3 +358,12 @@ static int test_head_rms_norm_rope_tail(void) {
     return rc;
 }
 REGISTER_TEST(head_rms_norm_rope_tail, test_head_rms_norm_rope_tail);
+
+static int test_attn_q_b_fused_unavailable(void) {
+    return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
+               nullptr, nullptr, nullptr, 0, 0, 0, 0, nullptr,
+               0, 0, 0, 0, 0, 0, false,
+               10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0
+        ? 0 : 1;
+}
+REGISTER_TEST(attn_q_b_fused_unavailable, test_attn_q_b_fused_unavailable);

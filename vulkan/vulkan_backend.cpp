@@ -4610,8 +4610,8 @@ static bool ds4gk_routed_common(
         g_vk.caps.max_compute_work_group_invocations < 256)
         return false;
     ds4_gpu_tensor q8{}, invalid{};
-    if (!ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) ||
-        !ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t))) {
+    if (ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) != 0 ||
+        ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0) {
         ds4_gpu_tensor_free_in_place(&q8);
         return false;
     }

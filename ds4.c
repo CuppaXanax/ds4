@@ -26480,27 +26480,37 @@ static int metal_graph_decode_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc(&g, weights, layer);
+    if (!ok) fprintf(stderr, "ds4: graph test phase failed: graph_alloc\n");
     g.quality = quality;
     g.materialize_ffn_out = true;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(&g),
-                                                 model->map,
-                                                 model->size,
-                                                 weights->token_embd->abs_offset,
-                                                 (uint32_t)weights->token_embd->dim[1],
-                                                 (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
-    if (ok) ok = metal_graph_encode_decode_layer(&g,
-                                               model,
-                                               layer,
-                                               0,
-                                               0,
-                                               g.layer_raw_cache[0],
-                                               g.raw_cap,
-                                               0,
-                                               1,
-                                               token);
+    if (ok) {
+        ok = ds4_gpu_begin_commands() != 0;
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: begin_commands\n");
+    }
+    if (ok) {
+        ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(&g),
+                                           model->map,
+                                           model->size,
+                                           weights->token_embd->abs_offset,
+                                           (uint32_t)weights->token_embd->dim[1],
+                                           (uint32_t)token,
+                                           DS4_N_EMBD,
+                                           DS4_N_HC) != 0;
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: embed_token_hc\n");
+    }
+    if (ok) {
+        ok = metal_graph_encode_decode_layer(&g,
+                                              model,
+                                              layer,
+                                              0,
+                                              0,
+                                              g.layer_raw_cache[0],
+                                              g.raw_cap,
+                                              0,
+                                              1,
+                                              token);
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: encode_layer0\n");
+    }
     if (ok) {
         /* Single-tier diagnostic: swap the active-tier slots so the head
          * pipeline reads the embedded hidden state from cur_hc. */
@@ -26508,8 +26518,14 @@ static int metal_graph_decode_test(
         g.cur_hc_by_tier[g.active_tier] = g.after_ffn_hc_by_tier[g.active_tier];
         g.after_ffn_hc_by_tier[g.active_tier] = embedded_hc;
     }
-    if (ok) ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) {
+        ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: output_head\n");
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+        if (!ok) fprintf(stderr, "ds4: graph test phase failed: end_commands\n");
+    }
 
     if (ok) {
         ok = ds4_gpu_tensor_read(metal_graph_after_ffn_hc(&g), 0, gpu_hc, hc_dim * sizeof(float)) != 0 &&
@@ -26529,6 +26545,7 @@ static int metal_graph_decode_test(
              ds4_gpu_tensor_read(metal_graph_ffn_out(&g), 0, gpu_ffn_out, (uint64_t)DS4_N_EMBD * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(metal_graph_cur_hc(&g), 0, gpu_after_ffn_hc, hc_dim * sizeof(float)) != 0 &&
              ds4_gpu_tensor_read(metal_graph_logits(&g), 0, gpu_logits, vocab_dim * sizeof(float)) != 0;
+            if (!ok) fprintf(stderr, "ds4: graph test phase failed: tensor_readback\n");
     }
 
     if (ok) {

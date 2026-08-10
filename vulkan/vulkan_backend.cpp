@@ -1123,7 +1123,9 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
  * ========================================================================= */
 
+extern "C" {
 static float ds4_half_to_float(uint16_t h);
+}
 
 static void ds4_q8_exact_quantize(const float *x, int8_t *xq,
                                   float *scale, uint64_t n) {
@@ -1663,7 +1665,6 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
     return 1;
 }
 
-static float ds4_half_to_float(uint16_t h); /* defined below in this TU */
 static void ds4_embed_f16_row(float *out, const uint8_t *row, uint64_t n_embd);
 static int ds4_embed_row_ok(const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint64_t id, uint64_t row_bytes);

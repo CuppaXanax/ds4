@@ -2772,13 +2772,18 @@ static int dispatch_attention_mixed_online(
         !checked_f32_bytes(n_q, n_head, head_dim, q_bytes) ||
         !checked_f32_bytes(raw_cap, 1, head_dim, raw_bytes) ||
         !checked_u64_product(n_comp, head_dim, comp_values) ||
-        (comp_kv_f16 && (comp_values & 1u) != 0) ||
-        !checked_u64_product(comp_values, comp_kv_f16 ? sizeof(uint16_t) : sizeof(float), comp_bytes) ||
         !checked_u64_product(n_comp, sizeof(float), mask_bytes) ||
         !checked_u64_product(n_tokens, top_k, topk_values) ||
         !checked_u64_product(topk_values, sizeof(uint32_t), topk_bytes) ||
         !checked_u64_product(n_head, sizeof(float), sink_bytes))
         return 0;
+    if (comp_kv_f16) {
+        if (comp_values > UINT64_MAX - 1u ||
+            !checked_u64_product((comp_values + 1u) / 2u, sizeof(uint32_t), comp_bytes))
+            return 0;
+    } else if (!checked_u64_product(comp_values, sizeof(float), comp_bytes)) {
+        return 0;
+    }
     uint64_t max_visible = 0;
     if (ratio != 0) {
         max_visible = std::min<uint64_t>((position_end - 1u) / ratio, n_comp);

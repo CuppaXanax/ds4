@@ -226,12 +226,6 @@ static int run_prefill_case(
         }
         if (ok && ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                 heads_t, model, model_size, sinks_offset, q_t, raw_t, comp_t,
-                1, n_tokens, n_comp, window, ratio, n_head, 3) != 0) {
-            fprintf(stderr, "attention_prefill_static_mixed[%s]: odd F16 element count was accepted\n", label);
-            ok = false;
-        }
-        if (ok && ds4_gpu_attention_prefill_static_mixed_heads_tensor(
-                heads_t, model, model_size, sinks_offset, q_t, raw_t, comp_t,
                 comp_kv_f16, n_tokens, 4097, window, ratio, n_head, head_dim) != 0) {
             fprintf(stderr, "attention_prefill_static_mixed[%s]: n_comp > 4096 was accepted\n", label);
             ok = false;

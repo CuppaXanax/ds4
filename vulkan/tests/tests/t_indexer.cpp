@@ -449,7 +449,11 @@ static int test_indexed_attention_causal_filler(void) {
             const uint32_t qpos = pos0 + t;
             const uint32_t visible = (qpos + 1u) / ratio;
             std::vector<const float *> rows;
-            rows.push_back(raw + (2u + t) * dim);
+            const uint32_t first_raw_pos = pos0 + tokens - n_raw;
+            uint32_t raw_first = first_raw_pos;
+            if (qpos + 1u > 2u) raw_first = std::max(raw_first, qpos + 1u - 2u);
+            for (uint32_t raw_pos = raw_first; raw_pos <= qpos; raw_pos++)
+                rows.push_back(raw + (2u + raw_pos - first_raw_pos) * dim);
             for (uint32_t k = 0; k < top_k; k++)
                 if (topk[t * top_k + k] < visible)
                     rows.push_back(comp + topk[t * top_k + k] * dim);

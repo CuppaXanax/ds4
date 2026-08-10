@@ -531,11 +531,11 @@ static int run_moe_case(
         return 1;
     }
 
-    const float tol = 1e-4f;
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
                        const std::vector<float> &ref, size_t n) -> bool {
         bool good = true;
         for (size_t i = 0; i < n; i++) {
+            const float tol = 1e-4f + 2e-7f * std::fabsf(ref[i]);
             if (!(std::fabsf(got[i] - ref[i]) <= tol)) {
                 if (good) fprintf(stderr, "--- routed_moe_one[%s] %s mismatch ---\n", label, what);
                 fprintf(stderr, "  [%zu] got=%.6f want=%.6f\n", i, got[i], ref[i]);

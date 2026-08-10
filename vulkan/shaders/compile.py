@@ -26,11 +26,11 @@ grid_values = numbers(grid.group(1))
 if len(sign_values) != 128 or len(grid_values) != 256:
     print(f"Invalid IQ2 table counts: signs={len(sign_values)} grid={len(grid_values)}", file=sys.stderr)
     sys.exit(1)
-grid_values = [value + "ul" if value.startswith("0x") else value
-               for value in grid_values]
+grid_bytes = [str((int(value, 0) >> shift) & 0xff)
+              for value in grid_values for shift in range(0, 64, 8)]
 iq2_include.write_text(
     "const uint iq2_signs[128] = uint[](" + ",".join(sign_values) + ");\n" +
-    "const uint64_t iq2_grid[256] = uint64_t[](" + ",".join(grid_values) + ");\n",
+    "const uint iq2_grid[2048] = uint[](" + ",".join(grid_bytes) + ");\n",
     encoding="utf-8",
 )
 

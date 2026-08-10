@@ -1123,6 +1123,12 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * VkBuffer at first use. Uses thread-local descriptor set for efficiency.
  * ========================================================================= */
 
+static void ds4gk_quantize_q8_0_activation(const float *x, int8_t *xq,
+                                            float *scale, uint64_t n);
+static inline float ds4gk_dot_q8_0_row(const uint8_t *row, const int8_t *xq,
+                                       const float *xscale, uint64_t in_dim,
+                                       uint64_t blocks);
+
 /* ---- matmul_q8_0 dispatch (host-side fallback for huge output rows) ---- */
 
 int ds4_gpu_matmul_q8_0_tensor(
@@ -1137,6 +1143,37 @@ int ds4_gpu_matmul_q8_0_tensor(
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
     if (!out || !x) return 0;
+
+    /* Wide model projections are sensitive to Q8 activation rounding. Keep
+     * them on the exact host reference until the GPU path consumes a shared,
+     * prequantized activation instead of re-quantizing independently. */
+    if (in_dim == 4096u && out_dim <= 4096u) {
+        auto &commands = get_cmd_ctx();
+        if (commands.recording && commands.command_count != 0 && !submit_and_wait()) return 0;
+        if (!model_map || !out->ptr || !x->ptr) return 0;
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        const uint64_t row_bytes = blocks * 34u;
+        if (weight_offset > model_size ||
+            out_dim > (model_size - weight_offset) / row_bytes ||
+            n_tok > UINT64_MAX / in_dim ||
+            in_dim * n_tok * sizeof(float) > x->bytes ||
+            n_tok > UINT64_MAX / out_dim ||
+            out_dim * n_tok * sizeof(float) > out->bytes) return 0;
+        const uint8_t *base = (const uint8_t *)model_map + weight_offset;
+        const float *xp = (const float *)x->ptr;
+        float *op = (float *)out->ptr;
+        std::vector<int8_t> xq(blocks * 32u);
+        std::vector<float> xscale(blocks);
+        for (uint64_t t = 0; t < n_tok; t++) {
+            ds4gk_quantize_q8_0_activation(xp + t * in_dim,
+                                           xq.data(), xscale.data(), in_dim);
+            for (uint64_t o = 0; o < out_dim; o++) {
+                op[t * out_dim + o] = ds4gk_dot_q8_0_row(
+                    base + o * row_bytes, xq.data(), xscale.data(), in_dim, blocks);
+            }
+        }
+        return 1;
+    }
 
     /* The GPU dispatch is pathological for very wide output rows (the vocab
      * head, out_dim = 129280): RADV stalls for minutes and blocks the next

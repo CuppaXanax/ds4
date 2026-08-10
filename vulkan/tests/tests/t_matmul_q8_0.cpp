@@ -64,7 +64,7 @@ static float f16_to_f32(uint16_t h) {
 }
 
 static int test_matmul_q8_0(void) {
-    const uint64_t in_dim    = 1536;                /* model Q_B width: 48 blocks */
+    const uint64_t in_dim    = 4096;                /* Flash Q_A width: 128 blocks */
     const uint64_t out_dim   = 8;
     const uint64_t n_tok     = 2;
     const uint64_t n_blocks  = (in_dim + 31u) / 32u;
@@ -182,7 +182,7 @@ static int test_matmul_q8_0(void) {
                     fprintf(stderr, "out[%llu][%llu] got=%.6f want=%.6f %s\n",
                             (unsigned long long)t, (unsigned long long)o,
                             outv[t * out_dim + o], ref[t * out_dim + o],
-                            std::fabsf(outv[t * out_dim + o] - ref[t * out_dim + o]) <= 1e-2f ? "ok" : "MISMATCH");
+                            std::fabsf(outv[t * out_dim + o] - ref[t * out_dim + o]) <= 1e-6f ? "ok" : "MISMATCH");
                 }
             }
             rc = 0;
@@ -190,7 +190,7 @@ static int test_matmul_q8_0(void) {
                 for (uint64_t o = 0; o < out_dim; o++) {
                     float got = outv[t * out_dim + o];
                     float want = ref[t * out_dim + o];
-                    if (!(std::fabsf(got - want) <= 1e-2f)) rc = 1;
+                    if (!(std::fabsf(got - want) <= 1e-6f)) rc = 1;
                 }
             }
         }

@@ -444,6 +444,7 @@ static int test_compressor_store_batch(void) {
     const uint32_t width = coff * head_dim;
     const uint32_t state_rows = coff * ratio;
     CompModel m = build_comp_model(head_dim, ratio, 0); /* f32 APE */
+    if (!ds4_gpu_set_model_map(m.data.data(), m.data.size())) return 1;
 
     ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
     ds4_gpu_tensor *sc = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
@@ -499,6 +500,7 @@ static int test_compressor_store_batch_f16(void) {
     const uint32_t width = head_dim;
     const uint32_t state_rows = ratio;
     CompModel m = build_comp_model(head_dim, ratio, 1); /* f16 APE */
+    if (!ds4_gpu_set_model_map(m.data.data(), m.data.size())) return 1;
 
     ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
     ds4_gpu_tensor *sc = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));

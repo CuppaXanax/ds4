@@ -184,6 +184,7 @@ static int run_ratio4_case(const char *what, uint32_t head_dim, uint32_t pos0,
     const uint32_t width = 2u * head_dim;
     const uint32_t state_rows = 8u;
     Ratio4Model m = build_ratio4_model(head_dim, ape_type);
+    if (!ds4_gpu_set_model_map(m.data.data(), m.data.size())) return 1;
 
     ds4_gpu_tensor *kv_tail = ds4_gpu_tensor_alloc((uint64_t)ratio * width * sizeof(float));
     ds4_gpu_tensor *sc_tail = ds4_gpu_tensor_alloc((uint64_t)ratio * width * sizeof(float));

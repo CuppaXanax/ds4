@@ -1137,6 +1137,14 @@ int ds4_gpu_matmul_q8_0_tensor(
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
     if (!out || !x || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (n_tok <= UINT64_MAX / out_dim && n_tok * out_dim > 262144u) {
+        fprintf(stderr,
+                "ds4: VULKAN Q8 batch requires bounded dispatches "
+                "(tokens=%llu out_dim=%llu)\n",
+                (unsigned long long)n_tok,
+                (unsigned long long)out_dim);
+        return 0;
+    }
 
     /* The GPU dispatch is pathological for very wide output rows (the vocab
      * head, out_dim = 129280): RADV stalls for minutes and blocks the next

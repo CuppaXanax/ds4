@@ -202,3 +202,20 @@ static int test_matmul_q8_0(void) {
     return rc;
 }
 REGISTER_TEST(matmul_q8_0, test_matmul_q8_0);
+
+static int test_matmul_q8_0_rejects_unbounded_batch(void) {
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(float));
+    if (!x || !out) {
+        if (x) ds4_gpu_tensor_free(x);
+        if (out) ds4_gpu_tensor_free(out);
+        return 1;
+    }
+    const int result = ds4_gpu_matmul_q8_0_tensor(
+        out, nullptr, 0, 0, 1, 32768, x, 9);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    return result == 0 ? 0 : 1;
+}
+REGISTER_TEST(matmul_q8_0_rejects_unbounded_batch,
+              test_matmul_q8_0_rejects_unbounded_batch);

@@ -618,7 +618,8 @@ static int update_sequence(const char *what, uint32_t head_dim, uint32_t ratio,
                 m.ape_offset, 0, m.norm_offset, 0,
                 head_dim, ratio, pos, comp_row,
                 kURot, 0, kUFreqBase, kUFreqScale, kUExtFactor,
-                kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps, false)) {
+                kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps,
+                false, true, false)) {
             ok = 0;
             break;
         }
@@ -703,7 +704,8 @@ static int test_compressor_update_non_emit(void) {
             kv, sc, skv, ssc, comp, m.data.data(), m.data.size(),
             m.ape_offset, 0, m.norm_offset, 0, head_dim, ratio, pos, 0,
             kURot, 0, kUFreqBase, kUFreqScale, kUExtFactor,
-            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps, false) != 0) {
+            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps,
+            false, true, false) != 0) {
         std::vector<float> gkv((uint64_t)state_rows * width), gsc((uint64_t)state_rows * width);
         std::vector<float> gc(head_dim);
         if (ds4_gpu_tensor_read(skv, 0, gkv.data(), gkv.size() * sizeof(float)) != 0 &&
@@ -783,7 +785,8 @@ static int test_compressor_update_state_already_stored(void) {
             kv, sc, skv, ssc, comp, m.data.data(), m.data.size(),
             m.ape_offset, 0, m.norm_offset, 0, head_dim, ratio, pos, 0,
             kURot, 0, kUFreqBase, kUFreqScale, kUExtFactor,
-            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps, true) != 0) {
+            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps,
+            true, true, false) != 0) {
         std::vector<float> gkv((uint64_t)state_rows * width), gsc((uint64_t)state_rows * width);
         std::vector<float> gc(head_dim);
         if (ds4_gpu_tensor_read(skv, 0, gkv.data(), gkv.size() * sizeof(float)) != 0 &&
@@ -983,7 +986,8 @@ static int test_compressor_bounds(void) {
             kv, sc, skv, ssc, comp_small, m.data.data(), m.data.size(),
             m.ape_offset, 0, m.norm_offset, 0, head_dim, ratio, 3, 0,
             kURot, 0, kUFreqBase, kUFreqScale, kUExtFactor,
-            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps, false) != 0) {
+            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps,
+            false, true, false) != 0) {
         fprintf(stderr, "--- bounds: update accepted undersized comp_cache at emit\n");
         rc = 1;
     }
@@ -992,7 +996,8 @@ static int test_compressor_bounds(void) {
             kv, sc, skv, ssc, comp_small, m.data.data(), m.data.size(),
             m.ape_offset, 0, m.norm_offset, 0, head_dim, ratio, 0, 0,
             kURot, 0, kUFreqBase, kUFreqScale, kUExtFactor,
-            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps, false) == 0) {
+            kUAttnFactor, kUBetaFast, kUBetaSlow, kURmsEps,
+            false, true, false) == 0) {
         fprintf(stderr, "--- bounds: update failed on non-emit with small comp_cache\n");
         rc = 1;
     }

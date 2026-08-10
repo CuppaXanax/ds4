@@ -1,7 +1,7 @@
 /* Kernel tests for the Hyper-Connection (HC) family.
  *
- * Covered kernels (all host-side in the backend, like ds4_gpu_add_tensor,
- * so the tests do NOT wrap the calls in begin/end_commands):
+ * Covered kernels.  The HC split paths dispatch through Vulkan; the tests
+ * use the normal tensor write/read boundary around each operation:
  *
  *   ds4_gpu_hc_expand_tensor                    (new: hc_post_one)
  *   ds4_gpu_hc_expand_add_tensor                (new: hc_post_one + block_add)
@@ -321,8 +321,11 @@ static int test_output_hc_weights(void) {
     std::memset(model, 0xAA, header);
     float *scale = (float *)(model + scale_off);
     float *base = (float *)(model + base_off);
-    scale[0] = 0.75f;
-    for (uint32_t i = 0; i < n_hc; i++) base[i] = synth_float(i, 0.25f);
+    scale[0] = 3.0f;
+    base[0] = -100.0f;
+    base[1] = 100.0f;
+    base[2] = -0.5f;
+    base[3] = 0.5f;
     if (ds4_gpu_set_model_map(model, model_size) == 0) { free(model); return 1; }
 
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(n_hc * sizeof(float));
@@ -334,7 +337,10 @@ static int test_output_hc_weights(void) {
         return 1;
     }
     std::vector<float> prv(n_hc);
-    for (uint32_t i = 0; i < n_hc; i++) prv[i] = synth_float(i, 0.30f);
+    prv[0] = -100.0f;
+    prv[1] = 100.0f;
+    prv[2] = -0.25f;
+    prv[3] = 0.25f;
     if (!ds4_gpu_tensor_write(pre, 0, prv.data(), prv.size() * sizeof(float))) {
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(pre); free(model);
         return 1;
@@ -361,6 +367,7 @@ REGISTER_TEST(output_hc_weights, test_output_hc_weights);
 
 static int test_hc_split_weighted_sum_norm(void) {
     const uint32_t n_hc = kN_HC, n_embd = kN_EMBD;
+    const uint32_t rows = 2;
     const uint64_t hc_dim = (uint64_t)n_hc * n_embd;
     const uint64_t header = 16;
     const uint64_t scale_off = header;                              /* 3 f32 */
@@ -378,11 +385,11 @@ static int test_hc_split_weighted_sum_norm(void) {
     for (uint32_t i = 0; i < n_embd; i++) norm_w[i] = 0.5f + 0.0625f * (float)(i + 1);
     if (ds4_gpu_set_model_map(model, model_size) == 0) { free(model); return 1; }
 
-    ds4_gpu_tensor *out      = ds4_gpu_tensor_alloc(n_embd * sizeof(float));
-    ds4_gpu_tensor *norm_out = ds4_gpu_tensor_alloc(n_embd * sizeof(float));
-    ds4_gpu_tensor *split    = ds4_gpu_tensor_alloc((uint64_t)kMixHC * sizeof(float));
-    ds4_gpu_tensor *mix      = ds4_gpu_tensor_alloc((uint64_t)kMixHC * sizeof(float));
-    ds4_gpu_tensor *residual = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    ds4_gpu_tensor *out      = ds4_gpu_tensor_alloc((uint64_t)rows * n_embd * sizeof(float));
+    ds4_gpu_tensor *norm_out = ds4_gpu_tensor_alloc((uint64_t)rows * n_embd * sizeof(float));
+    ds4_gpu_tensor *split    = ds4_gpu_tensor_alloc((uint64_t)rows * kMixHC * sizeof(float));
+    ds4_gpu_tensor *mix      = ds4_gpu_tensor_alloc((uint64_t)rows * kMixHC * sizeof(float));
+    ds4_gpu_tensor *residual = ds4_gpu_tensor_alloc((uint64_t)rows * hc_dim * sizeof(float));
     if (!out || !norm_out || !split || !mix || !residual) {
         if (out) ds4_gpu_tensor_free(out);
         if (norm_out) ds4_gpu_tensor_free(norm_out);
@@ -392,9 +399,13 @@ static int test_hc_split_weighted_sum_norm(void) {
         free(model);
         return 1;
     }
-    std::vector<float> mixv(kMixHC), rh((size_t)hc_dim);
-    for (uint32_t i = 0; i < kMixHC; i++) mixv[i] = synth_float(i, 0.10f);
-    for (uint32_t i = 0; i < (uint32_t)hc_dim; i++) rh[i] = synth_float(i, 0.20f);
+    std::vector<float> mixv((size_t)rows * kMixHC), rh((size_t)rows * hc_dim);
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t i = 0; i < kMixHC; i++)
+            mixv[(size_t)row * kMixHC + i] = synth_float(i + row * 7, 0.10f);
+        for (uint32_t i = 0; i < (uint32_t)hc_dim; i++)
+            rh[(size_t)row * hc_dim + i] = synth_float(i + row * 11, 0.20f);
+    }
     if (!ds4_gpu_tensor_write(mix, 0, mixv.data(), mixv.size() * sizeof(float)) ||
         !ds4_gpu_tensor_write(residual, 0, rh.data(), rh.size() * sizeof(float))) {
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(norm_out);
@@ -404,29 +415,41 @@ static int test_hc_split_weighted_sum_norm(void) {
     }
     const float eps = 1.0e-6f, norm_eps = 1.0e-5f;
     const uint32_t sinkhorn_iters = 6;
-    std::vector<float> want_split(kMixHC), want_out(n_embd), want_norm(n_embd);
-    ref_hc_split_sinkhorn(want_split.data(), mixv.data(), scale, base,
-                          n_hc, sinkhorn_iters, eps);
-    ref_hc_weighted_sum(want_out.data(), rh.data(), want_split.data(), n_embd, n_hc);
-    ref_rms_norm_weight(want_norm.data(), want_out.data(), norm_w, n_embd, norm_eps);
+    std::vector<float> want_split((size_t)rows * kMixHC);
+    std::vector<float> want_out((size_t)rows * n_embd);
+    std::vector<float> want_norm((size_t)rows * n_embd);
+    for (uint32_t row = 0; row < rows; row++) {
+        ref_hc_split_sinkhorn(want_split.data() + (size_t)row * kMixHC,
+                              mixv.data() + (size_t)row * kMixHC, scale, base,
+                              n_hc, sinkhorn_iters, eps);
+        ref_hc_weighted_sum(want_out.data() + (size_t)row * n_embd,
+                            rh.data() + (size_t)row * hc_dim,
+                            want_split.data() + (size_t)row * kMixHC,
+                            n_embd, n_hc);
+        ref_rms_norm_weight(want_norm.data() + (size_t)row * n_embd,
+                            want_out.data() + (size_t)row * n_embd,
+                            norm_w, n_embd, norm_eps);
+    }
 
     int rc = 1;
     if (ds4_gpu_hc_split_weighted_sum_norm_tensor(
             out, norm_out, split, mix, residual, model, model_size,
             scale_off, base_off, norm_off, n_embd, n_hc, sinkhorn_iters,
             eps, norm_eps) != 0) {
-        std::vector<float> got_split(kMixHC), got_out(n_embd), got_norm(n_embd);
+        std::vector<float> got_split((size_t)rows * kMixHC);
+        std::vector<float> got_out((size_t)rows * n_embd);
+        std::vector<float> got_norm((size_t)rows * n_embd);
         if (ds4_gpu_tensor_read(split, 0, got_split.data(), got_split.size() * sizeof(float)) != 0 &&
             ds4_gpu_tensor_read(out, 0, got_out.data(), got_out.size() * sizeof(float)) != 0 &&
             ds4_gpu_tensor_read(norm_out, 0, got_norm.data(), got_norm.size() * sizeof(float)) != 0) {
             rc = check_f32("hc_split_weighted_sum_norm/split", got_split.data(),
-                           want_split.data(), kMixHC);
+                           want_split.data(), rows * kMixHC);
             if (rc == 0)
                 rc = check_f32("hc_split_weighted_sum_norm/out", got_out.data(),
-                               want_out.data(), n_embd);
+                               want_out.data(), rows * n_embd);
             if (rc == 0)
                 rc = check_f32("hc_split_weighted_sum_norm/norm", got_norm.data(),
-                               want_norm.data(), n_embd);
+                               want_norm.data(), rows * n_embd);
         }
     }
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(norm_out);

@@ -58,6 +58,7 @@ struct ShaderEntry {
     VkPipeline       pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout desc_layout  = VK_NULL_HANDLE;
     uint32_t         push_size = 0;
+    uint32_t         binding_count = 6;
 };
 
 /* Tensor header for VkBuffer/VmaAllocation tracking */
@@ -317,8 +318,8 @@ static int load_spirv(const std::string &path, std::vector<uint32_t> &out) {
 }
 
 static int create_compute_pipeline(ShaderEntry &entry) {
-    VkDescriptorSetLayoutBinding bindings[6] = {};
-    for (int i = 0; i < 6; i++) {
+    VkDescriptorSetLayoutBinding bindings[8] = {};
+    for (uint32_t i = 0; i < entry.binding_count; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -326,7 +327,7 @@ static int create_compute_pipeline(ShaderEntry &entry) {
     }
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 6; dslci.pBindings = bindings;
+    dslci.bindingCount = entry.binding_count; dslci.pBindings = bindings;
     VK_CHECK_RAW(vkCreateDescriptorSetLayout(g_vk.device, &dslci, nullptr, &entry.desc_layout));
 
     VkPushConstantRange pr{};
@@ -352,18 +353,20 @@ static int create_compute_pipeline(ShaderEntry &entry) {
 }
 
 static int load_all_shaders(void) {
-    struct { const char *name; uint32_t push_size; } list[] = {
-        {"fill_f32", 12}, {"add_f32", 4},
-        {"rms_norm", 12}, {"rms_norm_weight", 12},
-        {"swiglu", 16}, {"matmul_f32", 12},
-        {"matmul_q8_0", 20},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
-        {"matmul_q8_0_simple", 12}, /* 3 x uint32: in_dim, out_dim, blocks */
-        {"matmul_f16", 12},   /* 3 x uint32 */
-        {"rms_norm_weight_rows", 12},
-        {"head_rms_norm", 16},  /* n_tok + n_head + head_dim + eps */
-        {"rope_tail", 44},     /* 11 x uint32 */
-        {"hc_weighted_sum", 16}, /* n_embd, n_hc, rows, reserved */
-        {"hc_expand", 36}, /* shape, strides, add/split/half flags */
+    struct { const char *name; uint32_t push_size; uint32_t binding_count; } list[] = {
+        {"fill_f32", 12, 6}, {"add_f32", 4, 6},
+        {"rms_norm", 12, 6}, {"rms_norm_weight", 12, 6},
+        {"swiglu", 16, 6}, {"matmul_f32", 12, 6},
+        {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
+        {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
+        {"matmul_f16", 12, 6},   /* 3 x uint32 */
+        {"rms_norm_weight_rows", 12, 6},
+        {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
+        {"rope_tail", 44, 6},     /* 11 x uint32 */
+        {"hc_weighted_sum", 16, 6}, /* n_embd, n_hc, rows, reserved */
+        {"hc_expand", 36, 6}, /* shape, strides, add/split/half flags */
+        {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
+        {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -373,7 +376,7 @@ static int load_all_shaders(void) {
             continue;
         }
         ShaderEntry e;
-        e.name = l.name; e.push_size = l.push_size;
+        e.name = l.name; e.push_size = l.push_size; e.binding_count = l.binding_count;
         e.module = create_shader_module(spv.data(), spv.size() * 4);
         if (create_compute_pipeline(e) != 0) {
             vkDestroyShaderModule(g_vk.device, e.module, nullptr);
@@ -2924,112 +2927,11 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
     return 1;
 }
 
-/* ---- Hyper-Connection host-side helpers (CPU fallbacks) ----
+/* ---- Hyper-Connection helpers ----
  *
- * The whole HC family is host-side (like ds4_gpu_add_tensor): the tensors
- * are host-mapped and the math is small (n_hc <= 16 streams, n_embd wide),
- * so a GPU dispatch would only add submit latency without a compute win.
- * The math below is copied from ds4.c verbatim (hc_split_sinkhorn_one,
- * hc_weighted_sum_one, hc_post_one, output_hc_head_one / sigmoid_stable)
- * so the backend replicates the engine's exact numerics.
+ * HC split, weighted reduction, and fused norm use Vulkan compute below.
+ * The scalar sigmoid remains here for the output-head helper.
  */
-
-/* Stable sigmoid (ds4.c sigmoid_stable). */
-static float ds4_hc_sigmoid(float x) {
-    if (x >= 0.0f) {
-        const float e = expf(-x);
-        return 1.0f / (1.0f + e);
-    } else {
-        const float e = expf(x);
-        return e / (1.0f + e);
-    }
-}
-
-/* HC Sinkhorn split (ds4.c hc_split_sinkhorn_one).  `split` holds
- * 2*n_hc + n_hc*n_hc floats:
- *   [0,        n_hc)            pre weights  (sigmoid + eps)
- *   [n_hc,     2*n_hc)          post gates   (2*sigmoid)
- *   [2*n_hc,   2*n_hc+n_hc*n_hc) combine matrix, addressed [dst + src*n_hc],
- *                               doubly stochastic after sinkhorn_iters.
- * `scale` has 3 floats (pre/post/comb scales), `base` has mix_hc floats. */
-static void ds4_hc_split_sinkhorn(float *split, const float *mix,
-                                  const float *scale, const float *base,
-                                  uint32_t n_hc, uint32_t sinkhorn_iters,
-                                  float eps) {
-    const float pre_scale  = scale[0];
-    const float post_scale = scale[1];
-    const float comb_scale = scale[2];
-    const size_t n2 = (size_t)n_hc * n_hc;
-    std::vector<float> c(n2);
-
-    for (uint32_t i = 0; i < n_hc; i++) {
-        const float z = mix[i] * pre_scale + base[i];
-        split[i] = 1.0f / (1.0f + expf(-z)) + eps;
-    }
-    for (uint32_t i = 0; i < n_hc; i++) {
-        const float z = mix[n_hc + i] * post_scale + base[n_hc + i];
-        split[n_hc + i] = 2.0f / (1.0f + expf(-z));
-    }
-
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float row_max = -INFINITY;
-        for (uint32_t src = 0; src < n_hc; src++) {
-            const size_t idx = (size_t)src + (size_t)dst * n_hc;
-            const size_t off = 2ull * n_hc + idx;
-            const float v = mix[off] * comb_scale + base[off];
-            c[idx] = v;
-            if (v > row_max) row_max = v;
-        }
-        float row_sum = 0.0f;
-        for (uint32_t src = 0; src < n_hc; src++) {
-            const size_t idx = (size_t)src + (size_t)dst * n_hc;
-            const float v = expf(c[idx] - row_max);
-            c[idx] = v;
-            row_sum += v;
-        }
-        const float inv = 1.0f / row_sum;
-        for (uint32_t src = 0; src < n_hc; src++) {
-            const size_t idx = (size_t)src + (size_t)dst * n_hc;
-            c[idx] = c[idx] * inv + eps;
-        }
-    }
-
-    for (uint32_t src = 0; src < n_hc; src++) {
-        float sum = 0.0f;
-        for (uint32_t dst = 0; dst < n_hc; dst++) sum += c[(size_t)src + (size_t)dst * n_hc];
-        const float inv = 1.0f / (sum + eps);
-        for (uint32_t dst = 0; dst < n_hc; dst++) c[(size_t)src + (size_t)dst * n_hc] *= inv;
-    }
-
-    for (uint32_t iter = 1; iter < sinkhorn_iters; iter++) {
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            float sum = 0.0f;
-            for (uint32_t src = 0; src < n_hc; src++) sum += c[(size_t)src + (size_t)dst * n_hc];
-            const float inv = 1.0f / (sum + eps);
-            for (uint32_t src = 0; src < n_hc; src++) c[(size_t)src + (size_t)dst * n_hc] *= inv;
-        }
-        for (uint32_t src = 0; src < n_hc; src++) {
-            float sum = 0.0f;
-            for (uint32_t dst = 0; dst < n_hc; dst++) sum += c[(size_t)src + (size_t)dst * n_hc];
-            const float inv = 1.0f / (sum + eps);
-            for (uint32_t dst = 0; dst < n_hc; dst++) c[(size_t)src + (size_t)dst * n_hc] *= inv;
-        }
-    }
-
-    for (size_t i = 0; i < n2; i++) split[2ull * n_hc + i] = c[i];
-}
-
-/* Reduce the n_hc HC streams into one n_embd-wide vector (ds4.c
- * hc_weighted_sum_one): out[d] = sum_h x[h*n_embd + d] * w[h]. */
-static void ds4_hc_weighted_sum(float *out, const float *x, const float *w,
-                                uint32_t n_embd, uint32_t n_hc) {
-    for (uint32_t d = 0; d < n_embd; d++) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < n_hc; h++)
-            acc += x[(uint64_t)h * n_embd + d] * w[h];
-        out[d] = acc;
-    }
-}
 
 static int dispatch_hc_weighted_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *rhc,
     const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_hc, uint32_t rows) {
@@ -3144,36 +3046,138 @@ int ds4_gpu_hc_weighted_sum_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tens
                                                              n_embd, n_hc, (uint32_t)rows);
 }
 
+static int hc_cached_weight(uint64_t offset, uint64_t bytes,
+                            VkBuffer &buffer, VkDeviceSize &buffer_offset) {
+    if (!ensure_weight(offset, bytes)) return 0;
+    for (auto it = g_vk.weight_cache.begin(); it != g_vk.weight_cache.end(); ++it) {
+        if (offset >= it->first && offset - it->first <= it->second.size &&
+            bytes <= it->second.size - (offset - it->first)) {
+            const VkDeviceSize relative = (VkDeviceSize)(offset - it->first);
+            const VkDeviceSize alignment =
+                (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+            if (alignment != 0 && relative % alignment != 0) return 0;
+            it->second.last_used = ++g_vk.lru_counter;
+            it->second.last_gen = g_vk.cmd_gen;
+            buffer = it->second.buffer;
+            buffer_offset = relative;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int dispatch_hc_split_weighted_sum(ds4_gpu_tensor *out,
+    ds4_gpu_tensor *norm_out, ds4_gpu_tensor *split,
+    const ds4_gpu_tensor *mix, const ds4_gpu_tensor *rhc,
+    const void *model_map, uint64_t model_size, uint64_t scale_offset,
+    uint64_t base_offset, uint64_t norm_weight_offset, uint32_t n_embd,
+    uint32_t n_hc, uint32_t sinkhorn_iters, float eps, float norm_eps,
+    bool do_sum, bool do_norm) {
+    if (!out || !split || !mix || !model_map || n_hc == 0 || n_hc > 16 ||
+        n_embd == 0 || sinkhorn_iters == 0 || (do_sum && !rhc) ||
+        (do_norm && (!norm_out || norm_eps < 0.0f))) return 0;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    const uint64_t split_bytes = mix_hc * sizeof(float);
+    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
+    const uint64_t rhc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    uint64_t rows = std::min(split->bytes / split_bytes, mix->bytes / split_bytes);
+    if (do_sum) {
+        rows = std::min(rows, out->bytes / out_row_bytes);
+        rows = std::min(rows, rhc->bytes / rhc_row_bytes);
+    } else {
+        rows = std::min(rows, out->bytes / split_bytes);
+    }
+    if (do_norm) rows = std::min(rows, norm_out->bytes / out_row_bytes);
+    if (rows == 0 || rows > 65535u) return 0;
+    if (scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset ||
+        base_offset > model_size || split_bytes > model_size - base_offset) return 0;
+    if (do_norm && (norm_weight_offset > model_size ||
+                    out_row_bytes > model_size - norm_weight_offset)) return 0;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+
+    VkBuffer obuf, nbuf, sbuf, mbuf, rbuf, scale_buf, base_buf, norm_buf;
+    VkDeviceSize ooff, noff, soff, moff, roff, scale_off, base_off, norm_off;
+    if (!find_tensor_buffer(out, obuf, ooff) ||
+        !find_tensor_buffer(split, sbuf, soff) ||
+        !find_tensor_buffer(mix, mbuf, moff)) return 0;
+    if (do_sum) {
+        if (!find_tensor_buffer(rhc, rbuf, roff)) return 0;
+    } else {
+        rbuf = mbuf; roff = moff;
+    }
+    if (do_norm) {
+        if (!find_tensor_buffer(norm_out, nbuf, noff)) return 0;
+    } else {
+        nbuf = obuf; noff = ooff;
+    }
+    if (!hc_cached_weight(scale_offset, 3ull * sizeof(float), scale_buf, scale_off) ||
+        !hc_cached_weight(base_offset, split_bytes, base_buf, base_off)) return 0;
+    if (do_norm) {
+        if (!hc_cached_weight(norm_weight_offset, out_row_bytes, norm_buf, norm_off)) return 0;
+    } else {
+        norm_buf = scale_buf; norm_off = scale_off;
+    }
+
+    auto si = g_vk.shader_map.find("hc_split_weighted_sum");
+    if (si == g_vk.shader_map.end()) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorBufferInfo buffers[8] = {
+        {obuf, ooff, do_sum ? (VkDeviceSize)rows * out_row_bytes : (VkDeviceSize)split_bytes},
+        {nbuf, noff, do_norm ? (VkDeviceSize)rows * out_row_bytes : (VkDeviceSize)split_bytes},
+        {sbuf, soff, (VkDeviceSize)rows * split_bytes},
+        {mbuf, moff, (VkDeviceSize)rows * split_bytes},
+        {rbuf, roff, do_sum ? (VkDeviceSize)rows * rhc_row_bytes : (VkDeviceSize)split_bytes},
+        {scale_buf, scale_off, 3 * sizeof(float)},
+        {base_buf, base_off, split_bytes},
+        {norm_buf, norm_off, do_norm ? (VkDeviceSize)out_row_bytes : 3 * sizeof(float)},
+    };
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 8, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n_embd, n_hc, n_rows, sinkhorn_iters;
+             float eps, norm_eps; uint32_t has_sum, has_norm; } push = {
+        n_embd, n_hc, (uint32_t)rows, sinkhorn_iters, eps, norm_eps,
+        do_sum ? 1u : 0u, do_norm ? 1u : 0u};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, 1, (uint32_t)rows, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
+}
+
+int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix,
+    const void *model_map, uint64_t model_size, uint64_t scale_offset,
+    uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
+    return dispatch_hc_split_weighted_sum(out, nullptr, out, mix, nullptr,
+        model_map, model_size, scale_offset, base_offset, 0, 1, n_hc,
+        sinkhorn_iters, eps, 0.0f, false, false);
+}
+
 int ds4_gpu_hc_split_weighted_sum_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *split,
     const ds4_gpu_tensor *mix, const ds4_gpu_tensor *rhc, const void *mm,
     uint64_t ms, uint64_t so, uint64_t bo, uint32_t n_embd, uint32_t n_hc,
     uint32_t si, float eps)
 {
-    if (!out || !split || !mix || !rhc || !mm) return 0;
-    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t split_row_bytes = mix_hc * sizeof(float);
-    const uint64_t hc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
-    if (out_row_bytes == 0 || split_row_bytes == 0 || hc_row_bytes == 0) return 0;
-    uint64_t rows = out->bytes / out_row_bytes;
-    rows = std::min(rows, split->bytes / split_row_bytes);
-    rows = std::min(rows, mix->bytes / split_row_bytes);
-    rows = std::min(rows, rhc->bytes / hc_row_bytes);
-    if (rows == 0) return 0;
-    if (so > ms || 3ull * sizeof(float) > ms - so) return 0;
-    if (bo > ms || mix_hc * sizeof(float) > ms - bo) return 0;
+    return dispatch_hc_split_weighted_sum(out, nullptr, split, mix, rhc, mm, ms,
+        so, bo, 0, n_embd, n_hc, si, eps, 0.0f, true, false);
+}
 
-    const float *scale = (const float *)((const char *)mm + so);
-    const float *base = (const float *)((const char *)mm + bo);
-    for (uint64_t row = 0; row < rows; row++) {
-        float *sp = (float *)split->ptr + row * mix_hc;
-        const float *mix_row = (const float *)mix->ptr + row * mix_hc;
-        const float *hc_row = (const float *)rhc->ptr + row * n_hc * n_embd;
-        float *out_row = (float *)out->ptr + row * n_embd;
-        ds4_hc_split_sinkhorn(sp, mix_row, scale, base, n_hc, si, eps);
-        ds4_hc_weighted_sum(out_row, hc_row, sp, n_embd, n_hc);
-    }
-    return 1;
+int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out,
+    ds4_gpu_tensor *norm_out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix,
+    const ds4_gpu_tensor *rhc, const void *mm, uint64_t ms, uint64_t so,
+    uint64_t bo, uint64_t norm_weight_offset, uint32_t n_embd, uint32_t n_hc,
+    uint32_t si, float eps, float norm_eps) {
+    return dispatch_hc_split_weighted_sum(out, norm_out, split, mix, rhc, mm, ms,
+        so, bo, norm_weight_offset, n_embd, n_hc, si, eps, norm_eps, true, true);
 }
 
 int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
@@ -3242,7 +3246,7 @@ int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc,
         residual_hc, post, comb, n_embd, n_hc, (uint32_t)rows, false, false, false);
 }
 
-/* ---- Fused Q8_0 matmul + HC expand (host-side) ----
+/* ---- Fused Q8_0 matmul + HC expand ----
  *
  * ds4_gpu_matmul_q8_0_pair_tensor: two Q8_0 projections with separate
  * weight matrices in one call (engine: q+kv or gate+up paired projections).
@@ -3258,30 +3262,9 @@ int ds4_gpu_hc_expand_tensor(ds4_gpu_tensor *out_hc,
  * with post = split[n_hc .. 2*n_hc), comb = split[2*n_hc .. 2*n_hc + n_hc*n_hc)
  * (the engine's hc_split sinkhorn layout, matching the Metal fused kernel).
  *
- * Both are host-side like the rest of the HC family: the tensors are
- * host-mapped and the small decode matvecs would only add submit latency
- * without a compute win.  Host writes are visible to later GPU dispatches
- * that consume these outputs.
+ * The fused operation is composed from the real Vulkan matmul and HC expand
+ * dispatches so both output tensors retain their normal GPU synchronization.
  */
-
-/* Q8_0 row (34 B/block: f16 scale + 32 x int8) dot raw f32 vector.
- * Matches the verified matmul_q8_0 kernel: double accumulation, partial
- * last block when in_dim % 32 != 0. */
-static float ds4_q8_0_row_dot_f32(const uint8_t *row, const float *xp,
-                                  uint64_t in_dim, uint64_t blocks) {
-    double acc = 0.0;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34u, sizeof(scale_bits));
-        const float scale = ds4_half_to_float(scale_bits);
-        const int8_t *qs = (const int8_t *)(row + b * 34u + 2u);
-        const uint64_t i0 = b * 32u;
-        const uint64_t n = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        for (uint64_t i = 0; i < n; i++)
-            acc += (double)scale * (double)qs[i] * (double)xp[i0 + i];
-    }
-    return (float)acc;
-}
 
 int ds4_gpu_matmul_q8_0_pair_tensor(
     ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
@@ -3309,22 +3292,12 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
     if (n_tok > UINT64_MAX / out1_dim ||
         (uint64_t)out1_dim * n_tok * sizeof(float) > out1->bytes) return 0;
 
-    const uint8_t *base = (const uint8_t *)model_map;
-    const float *xp = (const float *)x->ptr;
-    float *o0 = (float *)out0->ptr;
-    float *o1 = (float *)out1->ptr;
-    for (uint64_t t = 0; t < n_tok; t++) {
-        const float *xt = xp + t * in_dim;
-        for (uint64_t o = 0; o < out0_dim; o++)
-            o0[t * out0_dim + o] =
-                ds4_q8_0_row_dot_f32(base + weight0_offset + o * row_bytes,
-                                     xt, in_dim, blocks);
-        for (uint64_t o = 0; o < out1_dim; o++)
-            o1[t * out1_dim + o] =
-                ds4_q8_0_row_dot_f32(base + weight1_offset + o * row_bytes,
-                                     xt, in_dim, blocks);
-    }
-    return 1;
+    if (ds4_gpu_matmul_q8_0_tensor(out0, model_map, model_size,
+                                   weight0_offset, in_dim, out0_dim,
+                                   x, n_tok) == 0) return 0;
+    return ds4_gpu_matmul_q8_0_tensor(out1, model_map, model_size,
+                                      weight1_offset, in_dim, out1_dim,
+                                      x, n_tok);
 }
 
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
@@ -3353,29 +3326,12 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         hc_bytes > out_hc->bytes ||
         mix_hc * sizeof(float) > split->bytes) return 0;
 
-    const uint8_t *base = (const uint8_t *)model_map;
-    const float *xp = (const float *)x->ptr;
-    const float *resp = (const float *)residual_hc->ptr;
-    const float *splitp = (const float *)split->ptr;
-    const float *postp = splitp + n_hc;             /* split: [pre|post|comb] */
-    const float *combp = splitp + 2ull * n_hc;
-    float *bp = (float *)block_out->ptr;
-    float *op = (float *)out_hc->ptr;
+    if (ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
+                                   weight_offset, in_dim, out_dim, x, 1) == 0)
+        return 0;
 
-    for (uint64_t d = 0; d < out_dim; d++) {
-        const float block_v =
-            ds4_q8_0_row_dot_f32(base + weight_offset + d * row_bytes,
-                                 xp, in_dim, blocks);
-        bp[d] = block_v;
-        for (uint32_t dst = 0; dst < n_hc; dst++) {
-            float acc = block_v * postp[dst];
-            for (uint32_t src = 0; src < n_hc; src++)
-                acc += combp[(size_t)dst + (size_t)src * n_hc] *
-                       resp[(uint64_t)src * n_embd + d];
-            op[(uint64_t)dst * n_embd + d] = acc;
-        }
-    }
-    return 1;
+    return ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
+                                          split, n_embd, n_hc);
 }
 
 /* ---- HC expand-add (single-token) ----
@@ -3511,55 +3467,46 @@ int ds4_gpu_hc_weighted_sum_tensor(ds4_gpu_tensor *out,
     return dispatch_hc_weighted_sum(out, residual_hc, weights, n_embd, n_hc, 1);
 }
 
-/* ---- HC split + weighted sum + RMSNorm (fused, single-token) ----
- *
- * Fuses the reference decode chain
- *   split    = hc_split_sinkhorn_one(mix, scale, base, n_hc, iters, eps)
- *   out      = hc_weighted_sum_one(residual_hc, split)
- *   norm_out = rms_norm_weight(out, norm_weights, n_embd, norm_eps)
- * into one host-side call.  `split` receives the full 2*n_hc + n_hc*n_hc
- * sinkhorn output (the engine reads post/comb from it later). */
-int ds4_gpu_hc_split_weighted_sum_norm_tensor(ds4_gpu_tensor *out,
-    ds4_gpu_tensor *norm_out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix,
-    const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size,
-    uint64_t scale_offset, uint64_t base_offset, uint64_t norm_weight_offset,
-    uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps,
-    float norm_eps)
-{
-    if (!out || !norm_out || !split || !mix || !residual_hc || !model_map) return 0;
-    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    const uint64_t out_row_bytes = (uint64_t)n_embd * sizeof(float);
-    const uint64_t split_row_bytes = mix_hc * sizeof(float);
-    const uint64_t hc_row_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
-    if (out_row_bytes == 0 || split_row_bytes == 0 || hc_row_bytes == 0) return 0;
-    uint64_t rows = out->bytes / out_row_bytes;
-    rows = std::min(rows, norm_out->bytes / out_row_bytes);
-    rows = std::min(rows, split->bytes / split_row_bytes);
-    rows = std::min(rows, mix->bytes / split_row_bytes);
-    rows = std::min(rows, residual_hc->bytes / hc_row_bytes);
-    if (rows == 0) return 0;
-    if (scale_offset > model_size || 3ull * sizeof(float) > model_size - scale_offset) return 0;
-    if (base_offset > model_size || mix_hc * sizeof(float) > model_size - base_offset) return 0;
-    if (norm_weight_offset > model_size ||
-        (uint64_t)n_embd * sizeof(float) > model_size - norm_weight_offset) return 0;
+static int dispatch_output_hc_weights(ds4_gpu_tensor *out,
+    const ds4_gpu_tensor *pre, uint64_t scale_offset, uint64_t base_offset,
+    uint32_t n_hc, uint32_t n_tokens, float eps) {
+    auto si = g_vk.shader_map.find("output_hc_weights");
+    if (si == g_vk.shader_map.end()) return 0;
 
-    const float *scale = (const float *)((const char *)model_map + scale_offset);
-    const float *base = (const float *)((const char *)model_map + base_offset);
-    const float *norm_w = (const float *)((const char *)model_map + norm_weight_offset);
-    for (uint64_t row = 0; row < rows; row++) {
-        float *sp = (float *)split->ptr + row * mix_hc;
-        float *op = (float *)out->ptr + row * n_embd;
-        float *np = (float *)norm_out->ptr + row * n_embd;
-        const float *mix_row = (const float *)mix->ptr + row * mix_hc;
-        const float *hc_row = (const float *)residual_hc->ptr + row * n_hc * n_embd;
-        ds4_hc_split_sinkhorn(sp, mix_row, scale, base, n_hc, sinkhorn_iters, eps);
-        ds4_hc_weighted_sum(op, hc_row, sp, n_embd, n_hc);
-        double ss = 0.0;
-        for (uint32_t i = 0; i < n_embd; i++) ss += (double)op[i] * op[i];
-        const float rcp = 1.0f / sqrtf((float)(ss / (double)n_embd) + norm_eps);
-        for (uint32_t i = 0; i < n_embd; i++) np[i] = op[i] * rcp * norm_w[i];
-    }
-    return 1;
+    VkBuffer obuf, pbuf, scale_buf, base_buf;
+    VkDeviceSize ooff, poff, scale_off, base_off;
+    if (!find_tensor_buffer(out, obuf, ooff) ||
+        !find_tensor_buffer(pre, pbuf, poff) ||
+        !hc_cached_weight(scale_offset, sizeof(float), scale_buf, scale_off) ||
+        !hc_cached_weight(base_offset, (uint64_t)n_hc * sizeof(float),
+                          base_buf, base_off)) return 0;
+
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorBufferInfo buffers[4] = {
+        {obuf, ooff, (VkDeviceSize)n_tokens * n_hc * sizeof(float)},
+        {pbuf, poff, (VkDeviceSize)n_tokens * n_hc * sizeof(float)},
+        {scale_buf, scale_off, sizeof(float)},
+        {base_buf, base_off, (VkDeviceSize)n_hc * sizeof(float)},
+    };
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, 4, set))
+        return fail_simple_dispatch(ctx);
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    struct { uint32_t n_hc, n_tokens; float eps; uint32_t reserved; } push = {
+        n_hc, n_tokens, eps, 0};
+    vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(push), &push);
+    vkCmdDispatch(ctx.cmd, (n_hc + 255u) / 256u, n_tokens, 1);
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 /* ---- Output-head HC weights (single-token) ----
@@ -3571,19 +3518,18 @@ int ds4_gpu_output_hc_weights_tensor(ds4_gpu_tensor *out,
     const ds4_gpu_tensor *pre, const void *model_map, uint64_t model_size,
     uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, float eps)
 {
-    if (!out || !pre || !model_map) return 0;
-    if ((uint64_t)n_hc * sizeof(float) > out->bytes) return 0;
-    if ((uint64_t)n_hc * sizeof(float) > pre->bytes) return 0;
+    if (!out || !pre || !model_map || n_hc == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_hc * sizeof(float);
+    if (row_bytes == 0 || out->bytes < row_bytes || out->bytes % row_bytes != 0 ||
+        pre->bytes < out->bytes) return 0;
     if (scale_offset > model_size || sizeof(float) > model_size - scale_offset) return 0;
-    if (base_offset > model_size || (uint64_t)n_hc * sizeof(float) > model_size - base_offset) return 0;
-
-    const float *scale = (const float *)((const char *)model_map + scale_offset);
-    const float *base = (const float *)((const char *)model_map + base_offset);
-    const float *pr = (const float *)pre->ptr;
-    float *op = (float *)out->ptr;
-    for (uint32_t i = 0; i < n_hc; i++)
-        op[i] = ds4_hc_sigmoid(pr[i] * scale[0] + base[i]) + eps;
-    return 1;
+    if (base_offset > model_size || row_bytes > model_size - base_offset) return 0;
+    const uint64_t n_tokens = out->bytes / row_bytes;
+    if (n_tokens == 0 || n_tokens > 65535u) return 0;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    return dispatch_output_hc_weights(out, pre, scale_offset, base_offset,
+                                      n_hc, (uint32_t)n_tokens, eps);
 }
 
 static float ds4_router_probability(float logit) {
@@ -4825,15 +4771,6 @@ static int ds4_shared_gate_up_swiglu_q8_0_core(
         return 0;
     }
 
-    const uint64_t blocks = (in_dim + 31) / 32;
-    const uint64_t row_bytes = blocks * 34;       /* Q8_0: f16 scale + 32 int8 */
-    if (gate_offset > model_size || up_offset > model_size ||
-        row_bytes == 0 ||
-        out_dim > (model_size - gate_offset) / row_bytes ||
-        out_dim > (model_size - up_offset) / row_bytes) {
-        return 0;
-    }
-
     const uint64_t x_bytes = in_dim * sizeof(float);
     const uint64_t out_bytes = out_dim * sizeof(float);
     if (ds4_gpu_tensor_bytes(x) < x_bytes ||
@@ -4844,38 +4781,24 @@ static int ds4_shared_gate_up_swiglu_q8_0_core(
         return 0;
     }
 
-    std::vector<int8_t> xq(blocks * 32);
-    std::vector<float> xscale(blocks);
-    ds4gk_quantize_q8_0_activation((const float *)x->ptr,
-                                   xq.data(), xscale.data(), in_dim);
-
-    const uint8_t *base = (const uint8_t *)model_map;
-    float *midp = (float *)mid->ptr;
-    float *gatep = store_gate_up ? (float *)gate->ptr : nullptr;
-    float *upp   = store_gate_up ? (float *)up->ptr : nullptr;
-    std::vector<float> gtmp, utmp;
+    ds4_gpu_tensor *owned_gate = nullptr;
+    ds4_gpu_tensor *owned_up = nullptr;
     if (!store_gate_up) {
-        gtmp.resize((size_t)out_dim);
-        utmp.resize((size_t)out_dim);
+        owned_gate = ds4_gpu_tensor_alloc(out_bytes);
+        owned_up = ds4_gpu_tensor_alloc(out_bytes);
+        gate = owned_gate;
+        up = owned_up;
     }
-
-    for (uint64_t r = 0; r < out_dim; r++) {
-        float g = ds4gk_dot_q8_0_row(base + gate_offset + r * row_bytes,
-                                     xq.data(), xscale.data(), in_dim, blocks);
-        float u = ds4gk_dot_q8_0_row(base + up_offset + r * row_bytes,
-                                     xq.data(), xscale.data(), in_dim, blocks);
-        if (store_gate_up) {
-            gatep[r] = g;
-            upp[r] = u;
-        }
-        if (clamp > 1.0e-6f) {
-            if (g > clamp) g = clamp;             /* gate: positive-only clamp */
-            if (u > clamp) u = clamp;             /* up: symmetric clamp */
-            if (u < -clamp) u = -clamp;
-        }
-        midp[r] = ds4gk_silu(g) * u;
-    }
-    return 1;
+    int ok = gate && up;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
+                                             gate_offset, in_dim, out_dim, x, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
+                                             up_offset, in_dim, out_dim, x, 1) != 0;
+    if (ok) ok = ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim,
+                                        clamp, 1.0f) != 0;
+    if (owned_up) ds4_gpu_tensor_free(owned_up);
+    if (owned_gate) ds4_gpu_tensor_free(owned_gate);
+    return ok;
 }
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
@@ -4932,55 +4855,78 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         return 0;
     }
 
-    const uint64_t blocks = (in_dim + 31) / 32;
-    const uint64_t row_bytes = blocks * 34;
-    if (weight_offset > model_size || row_bytes == 0 ||
-        out_dim > (model_size - weight_offset) / row_bytes) {
-        return 0;
-    }
-
-    const uint64_t embd_bytes = out_dim * sizeof(float);
-    const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
+    const uint64_t embd_values = (uint64_t)n_embd;
+    const uint64_t hc_values = (uint64_t)n_hc * embd_values;
     const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
-    if (ds4_gpu_tensor_bytes(shared_mid) < in_dim * sizeof(float) ||
-        ds4_gpu_tensor_bytes(shared_out) < embd_bytes ||
-        ds4_gpu_tensor_bytes(routed_out) < embd_bytes ||
-        ds4_gpu_tensor_bytes(residual_hc) < hc_bytes ||
-        ds4_gpu_tensor_bytes(split) < mix_hc * sizeof(float) ||
-        ds4_gpu_tensor_bytes(out_hc) < hc_bytes) {
-        return 0;
-    }
+    if (hc_values == 0 || mix_hc == 0 ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        embd_values > UINT64_MAX / sizeof(float) ||
+        hc_values > UINT64_MAX / sizeof(float) ||
+        mix_hc > UINT64_MAX / sizeof(float)) return 0;
 
-    std::vector<int8_t> midq(blocks * 32);
-    std::vector<float> midscale(blocks);
-    ds4gk_quantize_q8_0_activation((const float *)shared_mid->ptr,
-                                   midq.data(), midscale.data(), in_dim);
+    uint64_t rows = shared_mid->bytes / (in_dim * sizeof(float));
+    rows = std::min(rows, shared_out->bytes / (embd_values * sizeof(float)));
+    rows = std::min(rows, routed_out->bytes / (embd_values * sizeof(float)));
+    rows = std::min(rows, residual_hc->bytes / (hc_values * sizeof(float)));
+    rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
+    rows = std::min(rows, out_hc->bytes / (hc_values * sizeof(float)));
+    if (rows == 0 || rows > UINT32_MAX) return 0;
 
-    const uint8_t *base = (const uint8_t *)model_map;
-    const float *routedp = (const float *)routed_out->ptr;
-    const float *resp = (const float *)residual_hc->ptr;
-    const float *splitp = (const float *)split->ptr;
-    const float *postp = splitp + n_hc;            /* split: [pre|post|comb] */
-    const float *combp = splitp + 2 * (uint64_t)n_hc;
-    float *sharedp = (float *)shared_out->ptr;
-    float *outp = (float *)out_hc->ptr;
+    if (ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
+                                   weight_offset, in_dim, out_dim,
+                                   shared_mid, rows) == 0) return 0;
+    return ds4_gpu_hc_expand_add_split_tensor(out_hc, routed_out, shared_out,
+                                               residual_hc, split, n_embd, n_hc);
+}
 
-    for (uint64_t d = 0; d < out_dim; d++) {
-        const float shared_v = ds4gk_dot_q8_0_row(
-                base + weight_offset + d * row_bytes,
-                midq.data(), midscale.data(), in_dim, blocks);
-        sharedp[d] = shared_v;
-        const float block_v = routedp[d] + shared_v;
-        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
-            float acc = block_v * postp[dst_hc];
-            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-                acc += combp[dst_hc + (uint64_t)src_hc * n_hc] *
-                       resp[(uint64_t)src_hc * n_embd + d];
-            }
-            outp[(uint64_t)dst_hc * n_embd + d] = acc;
-        }
-    }
-    return 1;
+int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
+        ds4_gpu_tensor *out_hc,
+        ds4_gpu_tensor *shared_out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *routed_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t n_embd,
+        uint32_t n_hc) {
+    if (!out_hc || !shared_out || !model_map || !shared_mid || !routed_out ||
+        !routed_add || !residual_hc || !split || n_embd == 0 || n_hc == 0 ||
+        in_dim == 0 || out_dim != n_embd ||
+        out_dim > UINT64_MAX / sizeof(float)) return 0;
+
+    const uint64_t embd_values = (uint64_t)n_embd;
+    const uint64_t hc_values = (uint64_t)n_hc * embd_values;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_values == 0 || mix_hc == 0 || in_dim > UINT64_MAX / sizeof(float) ||
+        hc_values > UINT64_MAX / sizeof(float) ||
+        mix_hc > UINT64_MAX / sizeof(float)) return 0;
+
+    uint64_t rows = shared_mid->bytes / (in_dim * sizeof(float));
+    rows = std::min(rows, shared_out->bytes / (embd_values * sizeof(float)));
+    rows = std::min(rows, routed_out->bytes / (embd_values * sizeof(float)));
+    rows = std::min(rows, routed_add->bytes / (embd_values * sizeof(float)));
+    rows = std::min(rows, residual_hc->bytes / (hc_values * sizeof(float)));
+    rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
+    rows = std::min(rows, out_hc->bytes / (hc_values * sizeof(float)));
+    if (rows == 0 || rows > UINT32_MAX || rows > UINT64_MAX / embd_values ||
+        rows * embd_values > UINT32_MAX) return 0;
+
+    ds4_gpu_tensor *routed_sum = ds4_gpu_tensor_alloc(rows * embd_values * sizeof(float));
+    if (!routed_sum) return 0;
+    int ok = ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
+                                        weight_offset, in_dim, out_dim,
+                                        shared_mid, rows) != 0;
+    if (ok) ok = ds4_gpu_add_tensor(routed_sum, routed_out, routed_add,
+                                    (uint32_t)(rows * embd_values)) != 0;
+    if (ok) ok = ds4_gpu_hc_expand_add_split_tensor(
+        out_hc, shared_out, routed_sum, residual_hc, split, n_embd, n_hc) != 0;
+    ds4_gpu_tensor_free(routed_sum);
+    return ok;
 }
 
 /* =========================================================================
@@ -5560,41 +5506,9 @@ int ds4_gpu_matmul_q8_0_f16_out_tensor(
     uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
     const ds4_gpu_tensor *x, uint64_t n_tok)
 {
-    DS4_VK_TRACE_KERNEL("matmul_q8_0_f16_out");
-    if (!out_h || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0)
-        return -1;
-    if (!out_h->ptr || !x->ptr) return -1;
-
-    if (in_dim > UINT64_MAX - 31u) return -1;
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (blocks > UINT64_MAX / 34u) return -1;
-    const uint64_t row_bytes = blocks * 34u;   /* Q8_0: f16 scale + 32 x int8 */
-    if (out_dim > UINT64_MAX / row_bytes) return -1;
-    const uint64_t weight_bytes = out_dim * row_bytes;
-    /* Never read past the model mmap (SIGBUS guard), never write past
-     * tensor bytes. */
-    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
-        return -1;
-    if (n_tok > UINT64_MAX / in_dim ||
-        in_dim * n_tok > UINT64_MAX / sizeof(float) ||
-        in_dim * n_tok * sizeof(float) > x->bytes)
-        return -1;
-    if (n_tok > UINT64_MAX / out_dim ||
-        out_dim * n_tok > UINT64_MAX / sizeof(uint16_t) ||
-        out_dim * n_tok * sizeof(uint16_t) > out_h->bytes)
-        return -1;
-
-    const uint8_t *base = (const uint8_t *)model_map + weight_offset;
-    const float *xp = (const float *)x->ptr;
-    uint16_t *op = (uint16_t *)out_h->ptr;
-    for (uint64_t t = 0; t < n_tok; t++) {
-        const float *xt = xp + t * in_dim;
-        for (uint64_t o = 0; o < out_dim; o++)
-            op[t * out_dim + o] =
-                ds4_float_to_half(ds4_q8_0_row_dot_f32(base + o * row_bytes,
-                                                        xt, in_dim, blocks));
-    }
-    return 1;
+    (void)out_h; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
+    return 0;
 }
 
 /* ---- matmul_f16_pair_tensor (host-side paired f16 projections) ----

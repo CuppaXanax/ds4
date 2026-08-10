@@ -937,15 +937,6 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         uint32_t                n_rows,
         float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_rms_scale_project_f16_tensor\n"); return 0; }
-int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *mix,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                scale_offset,
-        uint64_t                base_offset,
-        uint32_t                n_hc,
-        uint32_t                sinkhorn_iters,
-        float                   eps) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_hc_split_sinkhorn_tensor\n"); return 0; }
 int ds4_gpu_indexer_scores_prefill_tensor(ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *weights,
@@ -1306,20 +1297,6 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled) { if (getenv("DS4_VULKA
 void ds4_gpu_set_glm_model(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_model\n"); }
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_mtp_verify_mode\n"); }
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_set_glm_streaming_prefill_full_layer\n"); }
-int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(ds4_gpu_tensor       *out_hc,
-        ds4_gpu_tensor       *shared_out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *shared_mid,
-        const ds4_gpu_tensor *routed_out,
-        const ds4_gpu_tensor *routed_add,
-        const ds4_gpu_tensor *residual_hc,
-        const ds4_gpu_tensor *split,
-        uint32_t                n_embd,
-        uint32_t                n_hc) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_shared_down_hc_expand_add_q8_0_tensor\n"); return 0; }
 int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,
         const void             *model_map,

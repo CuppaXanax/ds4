@@ -1,0 +1,123 @@
+#version 460 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer OutBlock { float out_val[]; };
+layout(set = 0, binding = 1) buffer NormOutBlock { float norm_out_val[]; };
+layout(set = 0, binding = 2) buffer SplitBlock { float split_val[]; };
+layout(set = 0, binding = 3) readonly buffer MixBlock { float mix_val[]; };
+layout(set = 0, binding = 4) readonly buffer ResidualBlock { float residual_val[]; };
+layout(set = 0, binding = 5) readonly buffer ScaleBlock { float scale_val[]; };
+layout(set = 0, binding = 6) readonly buffer BaseBlock { float base_val[]; };
+layout(set = 0, binding = 7) readonly buffer NormWeightBlock { float norm_weight_val[]; };
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint n_hc;
+    uint n_rows;
+    uint sinkhorn_iters;
+    float eps;
+    float norm_eps;
+    uint has_sum;
+    uint has_norm;
+} pc;
+
+shared float sinkhorn[256];
+shared float norm_partial[256];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y;
+    if (row >= pc.n_rows || pc.n_hc == 0u || pc.n_hc > 16u) return;
+
+    uint mix_stride = 2u * pc.n_hc + pc.n_hc * pc.n_hc;
+    uint mix_base = row * mix_stride;
+    uint split_base = row * mix_stride;
+
+    if (lane == 0u) {
+        for (uint i = 0u; i < pc.n_hc; ++i) {
+            float z = mix_val[mix_base + i] * scale_val[0] + base_val[i];
+            split_val[split_base + i] = 1.0 / (1.0 + exp(-z)) + pc.eps;
+        }
+        for (uint i = 0u; i < pc.n_hc; ++i) {
+            uint off = pc.n_hc + i;
+            float z = mix_val[mix_base + off] * scale_val[1] + base_val[off];
+            split_val[split_base + off] = 2.0 / (1.0 + exp(-z));
+        }
+        for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+            float row_max = -3.402823466e+38;
+            for (uint src = 0u; src < pc.n_hc; ++src) {
+                uint idx = src + dst * pc.n_hc;
+                uint off = 2u * pc.n_hc + idx;
+                float v = mix_val[mix_base + off] * scale_val[2] + base_val[off];
+                sinkhorn[idx] = v;
+                row_max = max(row_max, v);
+            }
+            float row_sum = 0.0;
+            for (uint src = 0u; src < pc.n_hc; ++src) {
+                uint idx = src + dst * pc.n_hc;
+                sinkhorn[idx] = exp(sinkhorn[idx] - row_max);
+                row_sum += sinkhorn[idx];
+            }
+            for (uint src = 0u; src < pc.n_hc; ++src) {
+                uint idx = src + dst * pc.n_hc;
+                sinkhorn[idx] = sinkhorn[idx] / row_sum + pc.eps;
+            }
+        }
+        for (uint src = 0u; src < pc.n_hc; ++src) {
+            float sum = 0.0;
+            for (uint dst = 0u; dst < pc.n_hc; ++dst)
+                sum += sinkhorn[src + dst * pc.n_hc];
+            for (uint dst = 0u; dst < pc.n_hc; ++dst)
+                sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
+        }
+        for (uint iter = 1u; iter < pc.sinkhorn_iters; ++iter) {
+            for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+                float sum = 0.0;
+                for (uint src = 0u; src < pc.n_hc; ++src)
+                    sum += sinkhorn[src + dst * pc.n_hc];
+                for (uint src = 0u; src < pc.n_hc; ++src)
+                    sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
+            }
+            for (uint src = 0u; src < pc.n_hc; ++src) {
+                float sum = 0.0;
+                for (uint dst = 0u; dst < pc.n_hc; ++dst)
+                    sum += sinkhorn[src + dst * pc.n_hc];
+                for (uint dst = 0u; dst < pc.n_hc; ++dst)
+                    sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
+            }
+        }
+        for (uint i = 0u; i < pc.n_hc * pc.n_hc; ++i)
+            split_val[split_base + 2u * pc.n_hc + i] = sinkhorn[i];
+    }
+    barrier();
+
+    if (pc.has_sum == 0u) return;
+
+    uint out_base = row * pc.n_embd;
+    uint residual_base = row * pc.n_hc * pc.n_embd;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        float value = 0.0;
+        for (uint h = 0u; h < pc.n_hc; ++h)
+            value += residual_val[residual_base + h * pc.n_embd + d] *
+                     split_val[split_base + h];
+        out_val[out_base + d] = value;
+    }
+    if (pc.has_norm == 0u) return;
+
+    float sum_sq = 0.0;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        float value = out_val[out_base + d];
+        sum_sq += value * value;
+    }
+    norm_partial[lane] = sum_sq;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < 256u; ++i) total += norm_partial[i];
+        norm_partial[0] = inversesqrt(total / float(pc.n_embd) + pc.norm_eps);
+    }
+    barrier();
+    for (uint d = lane; d < pc.n_embd; d += 256u)
+        norm_out_val[out_base + d] = out_val[out_base + d] * norm_partial[0] * norm_weight_val[d];
+}

@@ -1,0 +1,34 @@
+#version 460 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer OutBlock { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer PreBlock { float pre_val[]; };
+layout(set = 0, binding = 2) readonly buffer ScaleBlock { float scale_val[]; };
+layout(set = 0, binding = 3) readonly buffer BaseBlock { float base_val[]; };
+
+layout(push_constant) uniform PC {
+    uint n_hc;
+    uint n_tokens;
+    float eps;
+    uint reserved;
+} pc;
+
+float sigmoid_stable(float x) {
+    if (x >= 0.0) {
+        float e = exp(-x);
+        return 1.0 / (1.0 + e);
+    }
+    float e = exp(x);
+    return e / (1.0 + e);
+}
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    uint token = gl_GlobalInvocationID.y;
+    if (h >= pc.n_hc || token >= pc.n_tokens) return;
+
+    uint index = token * pc.n_hc + h;
+    float z = pre_val[index] * scale_val[0] + base_val[h];
+    out_val[index] = sigmoid_stable(z) + pc.eps;
+}

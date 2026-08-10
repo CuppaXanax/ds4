@@ -1,4 +1,4 @@
-/* Kernel tests for the fused Q8_0 matmul family (host-side in the backend).
+/* Kernel tests for the fused Q8_0 matmul family.
  *
  * Covered kernels:
  *
@@ -7,12 +7,11 @@
  *                                           hc_post_one(block_out, residual,
  *                                           post/comb from split))
  *
- * Both implementations are host-side CPU loops (like ds4_gpu_add_tensor and
- * the rest of the HC family), so the tests do NOT wrap the calls in
- * begin/end_commands.  The matmul reference dequantizes the GGUF Q8_0
- * layout exactly like the verified matmul_q8_0 kernel (f16 block scale,
- * int8 quants, raw f32 activations, double accumulation); the HC reference
- * is hc_post_one copied verbatim from ds4.c.
+ * The pair path remains host-side, while the fused HC path composes the
+ * Vulkan matmul and HC expand dispatches.  The matmul reference dequantizes
+ * the GGUF Q8_0 layout exactly like the verified matmul_q8_0 kernel (f16
+ * block scale, int8 quants, raw f32 activations, double accumulation); the
+ * HC reference is hc_post_one copied verbatim from ds4.c.
  */
 #include "../tests.h"
 #include "../../ds4_gpu.h"

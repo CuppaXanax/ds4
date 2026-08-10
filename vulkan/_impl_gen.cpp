@@ -130,8 +130,6 @@ int ds4_gpu_attention_prefill_raw_heads_range_tensor(ds4_gpu_tensor       *heads
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_attention_prefill_raw_heads_range_tensor\n"); return 0; }
-int ds4_gpu_device_is_m5_apple_silicon(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_device_is_m5_apple_silicon\n"); return 0; }
-int ds4_gpu_device_is_pre_m5_apple_silicon(void) { if (getenv("DS4_VULKAN_LOG_STUBS")) fprintf(stderr, "ds4: STUB ds4_gpu_device_is_pre_m5_apple_silicon\n"); return 0; }
 int ds4_gpu_directional_steering_project_tensor(ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
         uint32_t                layer,

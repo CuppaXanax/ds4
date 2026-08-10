@@ -54,6 +54,9 @@ COMPAT_IMPL = {
     "ds4_gpu_lookup_cache_device",
     "ds4_gpu_q8_cache_suppressed",
     "ds4_gpu_set_q8_cache_suppressed",
+    # Non-Apple builds provide these as static inline definitions in ds4_gpu.h.
+    "ds4_gpu_device_is_m5_apple_silicon",
+    "ds4_gpu_device_is_pre_m5_apple_silicon",
 }
 
 # Status queries whose honest unsupported value is nonzero.

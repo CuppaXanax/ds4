@@ -1953,6 +1953,7 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
     return ok;
 }
 
+static float ds4_half_to_float(uint16_t h);
 static void ds4_embed_f16_row(float *out, const uint8_t *row, uint64_t n_embd);
 static int ds4_embed_row_ok(const void *model_map, uint64_t model_size,
                             uint64_t weight_offset, uint64_t id, uint64_t row_bytes);
@@ -4597,7 +4598,7 @@ static bool ds4gk_routed_common(
     if (!checked_u64_product((uint64_t)n_tokens * n_expert,
                              std::max(gate_blocks, mid_blocks), q8_blocks) ||
         !checked_u64_product(q8_blocks,
-                             std::max(q8_stride, down_type == 8 ? 36ull : 292ull), q8_bytes) ||
+                             std::max<uint64_t>(q8_stride, down_type == 8 ? 36 : 292), q8_bytes) ||
         q8_bytes > UINT32_MAX * (uint64_t)sizeof(uint32_t))
         return false;
     if (gate_blocks > g_vk.caps.max_compute_work_group_count[0] ||

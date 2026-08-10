@@ -5222,22 +5222,27 @@ int ds4_gpu_matmul_q8_0_f16_out_tensor(
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0_f16_out");
     if (!out_h || !model_map || !x || in_dim == 0 || out_dim == 0 || n_tok == 0)
-        return 0;
-    if (!out_h->ptr || !x->ptr) return 0;
+        return -1;
+    if (!out_h->ptr || !x->ptr) return -1;
 
+    if (in_dim > UINT64_MAX - 31u) return -1;
     const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks > UINT64_MAX / 34u) return -1;
     const uint64_t row_bytes = blocks * 34u;   /* Q8_0: f16 scale + 32 x int8 */
+    if (out_dim > UINT64_MAX / row_bytes) return -1;
     const uint64_t weight_bytes = out_dim * row_bytes;
     /* Never read past the model mmap (SIGBUS guard), never write past
      * tensor bytes. */
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
-        return 0;
+        return -1;
     if (n_tok > UINT64_MAX / in_dim ||
-        (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes)
-        return 0;
+        in_dim * n_tok > UINT64_MAX / sizeof(float) ||
+        in_dim * n_tok * sizeof(float) > x->bytes)
+        return -1;
     if (n_tok > UINT64_MAX / out_dim ||
-        (uint64_t)out_dim * n_tok * sizeof(uint16_t) > out_h->bytes)
-        return 0;
+        out_dim * n_tok > UINT64_MAX / sizeof(uint16_t) ||
+        out_dim * n_tok * sizeof(uint16_t) > out_h->bytes)
+        return -1;
 
     const uint8_t *base = (const uint8_t *)model_map + weight_offset;
     const float *xp = (const float *)x->ptr;
@@ -5274,27 +5279,32 @@ int ds4_gpu_matmul_f16_pair_tensor(
     DS4_VK_TRACE_KERNEL("matmul_f16_pair");
     if (!out_a || !out_b || !model_map || !x ||
         in_dim == 0 || out_dim == 0 || n_tok == 0)
-        return 0;
-    if (!out_a->ptr || !out_b->ptr || !x->ptr) return 0;
+        return -1;
+    if (!out_a->ptr || !out_b->ptr || !x->ptr) return -1;
 
+    if (in_dim > UINT64_MAX / out_dim || in_dim * out_dim > UINT64_MAX / 2u)
+        return -1;
     const uint64_t weight_bytes = in_dim * out_dim * 2u;  /* f16: 2 B/elem */
     /* Never read past the model mmap (SIGBUS guard), never write past
      * tensor bytes. */
     if (weight_a_offset > model_size ||
         weight_bytes > model_size - weight_a_offset)
-        return 0;
+        return -1;
     if (weight_b_offset > model_size ||
         weight_bytes > model_size - weight_b_offset)
-        return 0;
+        return -1;
     if (n_tok > UINT64_MAX / in_dim ||
-        (uint64_t)in_dim * n_tok * sizeof(float) > x->bytes)
-        return 0;
+        in_dim * n_tok > UINT64_MAX / sizeof(float) ||
+        in_dim * n_tok * sizeof(float) > x->bytes)
+        return -1;
     if (n_tok > UINT64_MAX / out_dim ||
-        (uint64_t)out_dim * n_tok * sizeof(float) > out_a->bytes)
-        return 0;
+        out_dim * n_tok > UINT64_MAX / sizeof(float) ||
+        out_dim * n_tok * sizeof(float) > out_a->bytes)
+        return -1;
     if (n_tok > UINT64_MAX / out_dim ||
-        (uint64_t)out_dim * n_tok * sizeof(float) > out_b->bytes)
-        return 0;
+        out_dim * n_tok > UINT64_MAX / sizeof(float) ||
+        out_dim * n_tok * sizeof(float) > out_b->bytes)
+        return -1;
 
     const uint16_t *wa = (const uint16_t *)((const char *)model_map + weight_a_offset);
     const uint16_t *wb = (const uint16_t *)((const char *)model_map + weight_b_offset);

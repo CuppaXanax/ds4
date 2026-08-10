@@ -44,14 +44,16 @@ failed = 0
 for src in shaders:
     spv = OUT_DIR / f"{src.stem}.spv"
     result = subprocess.run(
-        [GLSLANG, "-V", "--target-env", "vulkan1.2", "-I", str(SRC_DIR), str(src), "-o", str(spv)],
+        [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}", str(src), "-o", str(spv)],
         capture_output=True, text=True
     )
     if result.returncode == 0:
         compiled += 1
     else:
         failed += 1
-        print(f"FAIL {src.name}: {result.stderr.strip()}", file=sys.stderr)
+        diagnostics = "\n".join(part for part in
+                                (result.stdout.strip(), result.stderr.strip()) if part)
+        print(f"FAIL {src.name}: {diagnostics}", file=sys.stderr)
 
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

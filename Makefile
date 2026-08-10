@@ -54,7 +54,7 @@ CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 VULKAN_CXX ?= g++
-VULKAN_CXXFLAGS ?= -O3 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include $(NATIVE_CPU_FLAG)
+VULKAN_CXXFLAGS ?= -O3 -ffast-math -fno-finite-math-only -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include $(NATIVE_CPU_FLAG)
 VULKAN_LDLIBS ?= -lm -pthread -lvulkan
 VULKAN_SRCS := $(wildcard vulkan/shaders/*.comp)
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)

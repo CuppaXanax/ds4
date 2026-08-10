@@ -26648,6 +26648,7 @@ static int metal_graph_decode_test(
     free(cpu_ffn_cur);
     free(cpu_after_attn_hc);
     free(cpu_qr_norm);
+    free(cpu_qr);
     free(cpu_attn_norm);
     free(cpu_comb);
     free(cpu_post);
@@ -26656,7 +26657,6 @@ static int metal_graph_decode_test(
     free(plain);
     return ok ? 0 : 1;
 }
-    free(cpu_qr);
 
 static int metal_graph_first_token_full_test(
         const ds4_model   *model,

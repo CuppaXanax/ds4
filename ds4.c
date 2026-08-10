@@ -30467,13 +30467,20 @@ static bool metal_graph_encode_layer_ffn_batch(
                                               DS4_N_HC) != 0;
     }
     else if (ok && shared_down_f16) {
-        ok = ds4_gpu_hc_expand_add_split_half_add_tensor(next_hc_view,
-                                                         metal_graph_batch_routed_out(g),
-                                                         g->batch_q_half,
-                                                         metal_graph_batch_after_attn_hc(g),
-                                                         hc_split_view,
-                                                         DS4_N_EMBD,
-                                                         DS4_N_HC) != 0;
+        const int hc_post_rc =
+            ds4_gpu_hc_expand_add_split_half_add_tensor(next_hc_view,
+                                                        metal_graph_batch_routed_out(g),
+                                                        g->batch_q_half,
+                                                        metal_graph_batch_after_attn_hc(g),
+                                                        hc_split_view,
+                                                        DS4_N_EMBD,
+                                                        DS4_N_HC);
+        ok = hc_post_rc != 0;
+        if (getenv("DS4_VULKAN_DEBUG")) {
+            fprintf(stderr,
+                    "ds4: [dbg] prefill ffn hc_post layer=%u tokens=%u rc=%d ok=%d\n",
+                    il, n_tokens, hc_post_rc, ok ? 1 : 0);
+        }
     }
     else if (ok && tp_row_split_ffn) {
         /* Shared expert already folded into the exchanged routed rows. */
@@ -30505,6 +30512,11 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
 #undef DS4_METAL_PROFILE_FFN_STAGE
+    if (getenv("DS4_VULKAN_DEBUG")) {
+        fprintf(stderr,
+                "ds4: [dbg] prefill ffn return layer=%u tokens=%u ok=%d\n",
+                il, n_tokens, ok ? 1 : 0);
+    }
     return ok;
 }
 

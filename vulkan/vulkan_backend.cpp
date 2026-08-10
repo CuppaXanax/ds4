@@ -3172,7 +3172,16 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
     uint32_t n_embd, uint32_t n_hc)
 {
     DS4_VK_TRACE_KERNEL("hc_expand_add_split_half_add");
-    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split) return 0;
+    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr,
+                    "ds4: [dbg] hc_expand_add_split_half_add missing tensor "
+                    "out=%p block=%p half=%p residual=%p split=%p\n",
+                    (void *)out_hc, (const void *)block_out,
+                    (const void *)block_add_h, (const void *)residual_hc,
+                    (const void *)split);
+        return 0;
+    }
     const uint64_t hc_bytes = (uint64_t)n_hc * n_embd * sizeof(float);
     const uint64_t embd_bytes = (uint64_t)n_embd * sizeof(float);
     const uint64_t half_bytes = (uint64_t)n_embd * sizeof(uint16_t);
@@ -3184,6 +3193,17 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
     rows = std::min(rows, block_add_h->bytes / half_bytes);
     rows = std::min(rows, residual_hc->bytes / hc_bytes);
     rows = std::min(rows, split->bytes / split_bytes);
+    if (getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr,
+                "ds4: [dbg] hc_expand_add_split_half_add shape "
+                "embd=%u hc=%u rows=%llu out=%llu block=%llu half=%llu "
+                "residual=%llu split=%llu\n",
+                n_embd, n_hc, (unsigned long long)rows,
+                (unsigned long long)out_hc->bytes,
+                (unsigned long long)block_out->bytes,
+                (unsigned long long)block_add_h->bytes,
+                (unsigned long long)residual_hc->bytes,
+                (unsigned long long)split->bytes);
     if (rows == 0) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr,
@@ -3209,6 +3229,10 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
                     w * (bo[i] + ds4_half_to_float(ba[i])) + rh[(uint64_t)h * n_embd + i];
         }
     }
+    if (getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr,
+                "ds4: [dbg] hc_expand_add_split_half_add complete rows=%llu\n",
+                (unsigned long long)rows);
     return 1;
 }
 

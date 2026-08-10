@@ -34,12 +34,16 @@ shared float q8_values[256];
 
 #include "iq2_tables.glsl"
 
-uint byte_at(uint data[], uint byte_idx, uint total_bytes) {
-    if (byte_idx >= total_bytes) return 0u;
-    return (data[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
+uint word_at(uint data, uint word_idx) {
+    return data == 0u ? b0[word_idx] : data == 1u ? b1[word_idx] : b2[word_idx];
 }
 
-int i8_at(uint data[], uint byte_idx, uint total_bytes) {
+uint byte_at(uint data, uint byte_idx, uint total_bytes) {
+    if (byte_idx >= total_bytes) return 0u;
+    return (word_at(data, byte_idx >> 2u) >> ((byte_idx & 3u) * 8u)) & 255u;
+}
+
+int i8_at(uint data, uint byte_idx, uint total_bytes) {
     uint v = byte_at(data, byte_idx, total_bytes);
     return v < 128u ? int(v) : int(v) - 256;
 }
@@ -58,12 +62,12 @@ float q8_value(uint token, uint block, uint i) {
     uint base = (token * pc.q8_blocks + block) * 73u;
     uint bits = b0[base + 0u];
     float d = uintBitsToFloat(bits);
-    int q = i8_at(b0, (base + 1u) * 4u + i, words * 4u);
+    int q = i8_at(0u, (base + 1u) * 4u + i, words * 4u);
     return d * float(q);
 }
 
 /* Q8_0 activations use a padded 36-byte temporary block: f32 d + qs[32]. */
-float q8_0_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) {
+float q8_0_dot(uint data, uint row_byte, uint input_token, uint input_blocks) {
     float total = 0.0;
     for (uint block = 0u; block < input_blocks; ++block) {
         uint wb = row_byte + block * 34u;
@@ -74,12 +78,12 @@ float q8_0_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) 
         uint count = min(32u, pc.in_dim - block * 32u);
         for (uint i = 0u; i < count; ++i)
             total += d * float(i8_at(data, wb + 2u + i, 0xffffffffu)) *
-                     float(i8_at(b0, xb + 4u + i, 0xffffffffu));
+                     float(i8_at(0u, xb + 4u + i, 0xffffffffu));
     }
     return total;
 }
 
-float q2_dot(uint data[], uint row_byte, uint row_bytes, uint input_token, uint input_blocks) {
+float q2_dot(uint data, uint row_byte, uint row_bytes, uint input_token, uint input_blocks) {
     float total = 0.0;
     for (uint block = 0u; block < input_blocks; ++block) {
         uint wb = row_byte + block * 84u;
@@ -107,8 +111,8 @@ float q2_dot(uint data[], uint row_byte, uint row_bytes, uint input_token, uint 
                     uint q0 = (byte_at(data, q2base + k, 0xffffffffu) >> shift) & 3u;
                     uint q1 = (byte_at(data, q2base + 16u + k, 0xffffffffu) >> shift) & 3u;
                     uint q8group = q8base + j * 32u;
-                    isum += int(scale0) * int(q0) * i8_at(b0, q8group + k, 0xffffffffu);
-                    isum += int(scale1) * int(q1) * i8_at(b0, q8group + 16u + k, 0xffffffffu);
+                    isum += int(scale0) * int(q0) * i8_at(0u, q8group + k, 0xffffffffu);
+                    isum += int(scale1) * int(q1) * i8_at(0u, q8group + 16u + k, 0xffffffffu);
                 }
             }
         }
@@ -117,7 +121,7 @@ float q2_dot(uint data[], uint row_byte, uint row_bytes, uint input_token, uint 
     return total;
 }
 
-float iq2_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) {
+float iq2_dot(uint data, uint row_byte, uint input_token, uint input_blocks) {
     float total = 0.0;
     for (uint block = 0u; block < input_blocks; ++block) {
         uint wb = row_byte + block * 66u;
@@ -146,8 +150,8 @@ float iq2_dot(uint data[], uint row_byte, uint input_token, uint input_blocks) {
                     int v1 = int((iq2_grid[g1] >> (8u * j)) & 255ul);
                     if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
                     if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
-                    int q80 = i8_at(b0, (xb + 1u) * 4u + ib * 32u + pair * 16u + j, 0xffffffffu);
-                    int q81 = i8_at(b0, (xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j, 0xffffffffu);
+                    int q80 = i8_at(0u, (xb + 1u) * 4u + ib * 32u + pair * 16u + j, 0xffffffffu);
+                    int q81 = i8_at(0u, (xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j, 0xffffffffu);
                     sum += int(ls) * (v0 * q80 + v1 * q81);
                 }
             }
@@ -213,9 +217,9 @@ void main() {
         uint expert = b3[token * pc.n_selected + rank];
         if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; b5[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; return; }
         uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
-        float g = pc.gate_type == 8u ? q8_0_dot(b1, rb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(b1, rb, token, pc.q8_blocks) : q2_dot(b1, rb, pc.gate_row_bytes, token, pc.q8_blocks);
+        float g = pc.gate_type == 8u ? q8_0_dot(1u, rb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(1u, rb, token, pc.q8_blocks) : q2_dot(1u, rb, pc.gate_row_bytes, token, pc.q8_blocks);
         uint upb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
-        float u = pc.gate_type == 8u ? q8_0_dot(b2, upb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(b2, upb, token, pc.q8_blocks) : q2_dot(b2, upb, pc.gate_row_bytes, token, pc.q8_blocks);
+        float u = pc.gate_type == 8u ? q8_0_dot(2u, upb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(2u, upb, token, pc.q8_blocks) : q2_dot(2u, upb, pc.gate_row_bytes, token, pc.q8_blocks);
         if (pc.clamp_value > 1.0e-6) {
             g = min(g, pc.clamp_value);
             u = clamp(u, -pc.clamp_value, pc.clamp_value);
@@ -244,7 +248,7 @@ void main() {
         if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u; return; }
         uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
         uint q8_token = token * pc.n_selected + rank;
-        float v = pc.down_type == 8u ? q8_0_dot(b1, rb, q8_token, pc.q8_blocks) : pc.down_type == 16u ? iq2_dot(b1, rb, q8_token, pc.q8_blocks) : q2_dot(b1, rb, pc.down_row_bytes, q8_token, pc.q8_blocks);
+        float v = pc.down_type == 8u ? q8_0_dot(1u, rb, q8_token, pc.q8_blocks) : pc.down_type == 16u ? iq2_dot(1u, rb, q8_token, pc.q8_blocks) : q2_dot(1u, rb, pc.down_row_bytes, q8_token, pc.q8_blocks);
         b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
         return;
     }

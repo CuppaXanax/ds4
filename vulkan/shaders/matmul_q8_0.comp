@@ -80,34 +80,26 @@ void main() {
         sx[i] = x_buf[x_off + i];
     barrier();
 
-    float sum = 0.0;
-    uint row_blk = row * pc.blocks_per_row;
-
-    for (uint b = lid; b < pc.blocks_per_row; b += 256u) {
-        uint blk_off = (row_blk + b) * 34u;              /* byte offset */
-        uint scale_bits = byte_at(blk_off) | (byte_at(blk_off + 1u) << 8u);
-        uint base = b * 32u;
-        uint count = min(32u, pc.in_dim - base);
-        float amax = 0.0;
-        for (uint i = 0u; i < count; i++)
-            amax = max(amax, abs(sx[base + i]));
-        float xd = amax / 127.0;
-        float xid = xd != 0.0 ? 1.0 / xd : 0.0;
-        int dot = 0;
-        for (uint i = 0u; i < count; i++) {
-            int xq = clamp(int(roundEven(sx[base + i] * xid)), -128, 127);
-            dot += i8_at(blk_off + 2u + i) * xq;
-        }
-        sum += f16tof32(scale_bits) * xd * float(dot);
-    }
-
-    sx[lid] = float(sum);
-    barrier();
-
     if (lid == 0u) {
-        float final = 0.0;
-        for (uint i = 0u; i < 256u; i++)
-            final += sx[i];
-        out_buf[tok * pc.out_dim + row] = final;
+        float sum = 0.0;
+        uint row_blk = row * pc.blocks_per_row;
+        for (uint b = 0u; b < pc.blocks_per_row; b++) {
+            uint blk_off = (row_blk + b) * 34u;
+            uint scale_bits = byte_at(blk_off) | (byte_at(blk_off + 1u) << 8u);
+            uint base = b * 32u;
+            uint count = min(32u, pc.in_dim - base);
+            float amax = 0.0;
+            for (uint i = 0u; i < count; i++)
+                amax = max(amax, abs(sx[base + i]));
+            float xd = amax / 127.0;
+            float xid = xd != 0.0 ? 1.0 / xd : 0.0;
+            int dot = 0;
+            for (uint i = 0u; i < count; i++) {
+                int xq = clamp(int(roundEven(sx[base + i] * xid)), -128, 127);
+                dot += i8_at(blk_off + 2u + i) * xq;
+            }
+            sum += f16tof32(scale_bits) * xd * float(dot);
+        }
+        out_buf[tok * pc.out_dim + row] = sum;
     }
 }

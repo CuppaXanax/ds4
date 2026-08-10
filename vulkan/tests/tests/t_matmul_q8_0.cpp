@@ -64,7 +64,7 @@ static float f16_to_f32(uint16_t h) {
 }
 
 static int test_matmul_q8_0(void) {
-    const uint64_t in_dim    = 64;                  /* 2 x 32-element blocks */
+    const uint64_t in_dim    = 1536;                /* model Q_B width: 48 blocks */
     const uint64_t out_dim   = 8;
     const uint64_t n_tok     = 2;
     const uint64_t n_blocks  = (in_dim + 31u) / 32u;
@@ -106,9 +106,12 @@ static int test_matmul_q8_0(void) {
 
     /* Known input activations (f32). */
     float xv[n_tok * in_dim];
-    for (uint64_t t = 0; t < n_tok; t++)
-        for (uint64_t i = 0; i < in_dim; i++)
-            xv[t * in_dim + i] = (float)(t * 8 + i + 1) * 0.125f;
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t i = 0; i < in_dim; i++) {
+            const int value = (int)((i * 37u + t * 19u) % 257u) - 128;
+            xv[t * in_dim + i] = (float)value * 0.00075f;
+        }
+    }
     if (ds4_gpu_tensor_write(x, 0, xv, sizeof(xv)) == 0) {
         free(model); ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); return 1;
     }
@@ -171,7 +174,7 @@ static int test_matmul_q8_0(void) {
                 fprintf(stderr, "\n");
             }
             fprintf(stderr, "X[0]: ");
-            for (uint64_t i = 0; i < in_dim; i++)
+            for (uint64_t i = 0; i < 64; i++)
                 fprintf(stderr, "%.3f ", xv[i]);
             fprintf(stderr, "\n");
             for (uint64_t t = 0; t < n_tok; t++) {

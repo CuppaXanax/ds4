@@ -463,12 +463,17 @@ static int test_hc_expand_split(void) {
         ds4_gpu_tensor_free(residual); ds4_gpu_tensor_free(split);
         return 1;
     }
-    /* Post gates live at split[n_hc + h]; no combine mixing (batch fast path). */
+    /* Reference: hc_post_one with post gates and the full combine matrix. */
     std::vector<float> want((size_t)hc_dim);
-    for (uint32_t h = 0; h < n_hc; h++) {
-        const float w = sp[n_hc + h];
-        for (uint32_t i = 0; i < n_embd; i++)
-            want[(uint64_t)h * n_embd + i] = w * bo[i] + rh[(uint64_t)h * n_embd + i];
+    const float *post = sp.data() + n_hc;
+    const float *comb = post + n_hc;
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        for (uint32_t i = 0; i < n_embd; i++) {
+            float acc = post[dst] * bo[i];
+            for (uint32_t src = 0; src < n_hc; src++)
+                acc += comb[dst + src * n_hc] * rh[(uint64_t)src * n_embd + i];
+            want[(uint64_t)dst * n_embd + i] = acc;
+        }
     }
     int rc = 1;
     if (ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual, split,

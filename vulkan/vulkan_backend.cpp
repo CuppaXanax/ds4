@@ -3022,11 +3022,17 @@ int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
         const float *bo = (const float *)block_out->ptr + row * n_embd;
         const float *rh = (const float *)residual_hc->ptr + row * hc_values;
         const float *sp = (const float *)split->ptr + row * mix_hc;
-        for (uint32_t h = 0; h < n_hc; h++) {
-            const float w = sp[n_hc + h];
-            for (uint32_t i = 0; i < n_embd; i++)
-                o[(uint64_t)h * n_embd + i] =
-                    w * bo[i] + rh[(uint64_t)h * n_embd + i];
+        const float *post = sp + n_hc;
+        const float *comb = post + n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            for (uint32_t i = 0; i < n_embd; i++) {
+                float acc = post[dst] * bo[i];
+                for (uint32_t src = 0; src < n_hc; src++) {
+                    acc += comb[dst + src * n_hc] *
+                           rh[(uint64_t)src * n_embd + i];
+                }
+                o[(uint64_t)dst * n_embd + i] = acc;
+            }
         }
     }
     return 1;
@@ -3057,10 +3063,15 @@ int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc,
         const float *add = (const float *)block_add->ptr + row * n_embd;
         const float *residual = (const float *)residual_hc->ptr + row * hc_values;
         const float *post = (const float *)split->ptr + row * mix_hc + n_hc;
-        for (uint32_t h = 0; h < n_hc; h++) {
+        const float *comb = post + n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
             for (uint32_t i = 0; i < n_embd; i++) {
-                const uint64_t index = (uint64_t)h * n_embd + i;
-                out[index] = post[h] * (block[i] + add[i]) + residual[index];
+                float acc = post[dst] * (block[i] + add[i]);
+                for (uint32_t src = 0; src < n_hc; src++) {
+                    acc += comb[dst + src * n_hc] *
+                           residual[(uint64_t)src * n_embd + i];
+                }
+                out[(uint64_t)dst * n_embd + i] = acc;
             }
         }
     }
@@ -3281,12 +3292,8 @@ int ds4_gpu_hc_expand_add_tensor(ds4_gpu_tensor *out_hc,
 /* ---- HC expand-split, f16 block (batch fast path) ----
  *
  * Same as ds4_gpu_hc_expand_split_tensor but the sublayer output arrives in
- * f16 (2 B/element): the engine's attn_out_f16 path writes the attention
- * block into g->batch_q_half instead of an f32 tensor.  The split layout is
- * the sinkhorn buffer [pre | post | comb] and only the post gates
- * split[n_hc + h] participate (the batch fast path, no combine mixing):
- *   out_hc[h*n_embd + i] = split[n_hc + h] * deq_f16(block_out_h[i])
- *                          + residual_hc[h*n_embd + i] */
+ * f16 (2 B/element). The split layout is [pre | post | comb], matching
+ * hc_post_one and the CUDA implementation. */
 int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
     const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc,
     const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc)
@@ -3308,11 +3315,17 @@ int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
         const uint16_t *bo = (const uint16_t *)block_out_h->ptr + row * n_embd;
         const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
         const float *sp = (const float *)split->ptr + row * mix_hc;
-        for (uint32_t h = 0; h < n_hc; h++) {
-            const float w = sp[n_hc + h];
-            for (uint32_t i = 0; i < n_embd; i++)
-                o[(uint64_t)h * n_embd + i] =
-                    w * ds4_half_to_float(bo[i]) + rh[(uint64_t)h * n_embd + i];
+        const float *post = sp + n_hc;
+        const float *comb = post + n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            for (uint32_t i = 0; i < n_embd; i++) {
+                float acc = post[dst] * ds4_half_to_float(bo[i]);
+                for (uint32_t src = 0; src < n_hc; src++) {
+                    acc += comb[dst + src * n_hc] *
+                           rh[(uint64_t)src * n_embd + i];
+                }
+                o[(uint64_t)dst * n_embd + i] = acc;
+            }
         }
     }
     return 1;
@@ -3323,10 +3336,7 @@ int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc,
  * Same as ds4_gpu_hc_expand_add_split_tensor but the second block arrives
  * in f16 (2 B/element): the engine's shared_down_f16 FFN path feeds the
  * shared-expert half from g->batch_q_half.  The split layout is the
- * sinkhorn buffer [pre | post | comb]; only the post gates split[n_hc + h]
- * participate (batch fast path):
- *   out_hc[h*n_embd + i] = split[n_hc + h] * (block_out[i] + deq_f16(block_add_h[i]))
- *                          + residual_hc[h*n_embd + i] */
+ * sinkhorn buffer [pre | post | comb], matching hc_post_one. */
 int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
     const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h,
     const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
@@ -3383,11 +3393,17 @@ int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc,
         const uint16_t *ba = (const uint16_t *)block_add_h->ptr + row * n_embd;
         const float *rh = (const float *)residual_hc->ptr + row * n_hc * n_embd;
         const float *sp = (const float *)split->ptr + row * mix_hc;
-        for (uint32_t h = 0; h < n_hc; h++) {
-            const float w = sp[n_hc + h];
-            for (uint32_t i = 0; i < n_embd; i++)
-                o[(uint64_t)h * n_embd + i] =
-                    w * (bo[i] + ds4_half_to_float(ba[i])) + rh[(uint64_t)h * n_embd + i];
+        const float *post = sp + n_hc;
+        const float *comb = post + n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            for (uint32_t i = 0; i < n_embd; i++) {
+                float acc = post[dst] * (bo[i] + ds4_half_to_float(ba[i]));
+                for (uint32_t src = 0; src < n_hc; src++) {
+                    acc += comb[dst + src * n_hc] *
+                           rh[(uint64_t)src * n_embd + i];
+                }
+                o[(uint64_t)dst * n_embd + i] = acc;
+            }
         }
     }
     if (getenv("DS4_VULKAN_DEBUG"))

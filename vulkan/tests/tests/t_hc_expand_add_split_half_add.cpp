@@ -147,16 +147,22 @@ static int test_hc_expand_add_split_half_add(void) {
         ds4_gpu_tensor_free(split);
         return 1;
     }
-    /* Reference: post gates live at split[n_hc + h]; no combine mixing
-     * (batch fast path). */
+    /* Reference: hc_post_one with post gates and the full combine matrix. */
     std::vector<float> want((uint64_t)n_tokens * hc_dim);
     for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t h = 0; h < n_hc; h++) {
-            const float w = sp[(uint64_t)t * kMixHC + n_hc + h];
+        const float *split_row = sp.data() + (uint64_t)t * kMixHC;
+        const float *post = split_row + n_hc;
+        const float *comb = post + n_hc;
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
             for (uint32_t i = 0; i < n_embd; i++) {
-                const uint64_t hc_index = (uint64_t)t * hc_dim + (uint64_t)h * n_embd + i;
                 const uint64_t embd_index = (uint64_t)t * n_embd + i;
-                want[hc_index] = w * (bo[embd_index] + f16_to_f32(bah[embd_index])) + rh[hc_index];
+                float acc = post[dst] *
+                    (bo[embd_index] + f16_to_f32(bah[embd_index]));
+                for (uint32_t src = 0; src < n_hc; src++) {
+                    acc += comb[dst + src * n_hc] *
+                           rh[(uint64_t)t * hc_dim + (uint64_t)src * n_embd + i];
+                }
+                want[(uint64_t)t * hc_dim + (uint64_t)dst * n_embd + i] = acc;
             }
         }
     }

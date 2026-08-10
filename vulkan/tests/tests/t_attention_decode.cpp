@@ -1,10 +1,9 @@
-/* Kernel test: ds4_gpu_attention_decode_heads_tensor (host-side decode
+/* Kernel test: ds4_gpu_attention_decode_heads_tensor (Vulkan decode
  * attention).
  *
  * Single-token causal decode attention over the raw ring cache plus the
- * compressed (MLA) cache.  The kernel is CPU-hosted over the host-mapped
- * tensor memory (like ds4_gpu_router_select_tensor), so no
- * begin_commands/end_commands are needed to read back the output; the
+ * compressed (MLA) cache.  The backend synchronizes the dispatch before
+ * returning, so no begin_commands/end_commands are needed to read back the output; the
  * reference below replicates the ds4.c layer_attention_mixed_one math:
  *   scale = 1/sqrt(head_dim)
  *   score_i = dot(q_head, kv_i) * scale, raw rows in ring order
@@ -21,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <vector>
 
 /* IEEE half -> float (same decode the kernel uses for comp_kv_f16). */
@@ -131,6 +131,47 @@ static void ref_attention_decode(
         }
         const float inv = 1.0f / denom;
         for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
+    }
+}
+
+static void ref_attention_decode_raw_batch(
+        float *heads, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t window,
+        uint32_t n_head, uint32_t head_dim, const float *sinks,
+        const float *q, const float *raw_kv)
+{
+    const float scale = 1.0f / std::sqrt((float)head_dim);
+    const uint32_t base_abs = pos0 + n_tokens - n_raw;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t end_abs = pos0 + t;
+        const uint32_t candidate = end_abs + 1u > window ? end_abs + 1u - window : 0u;
+        const uint32_t first_abs = std::max(base_abs, candidate);
+        const uint32_t first = raw_start + first_abs - base_abs;
+        const uint32_t count = end_abs >= first_abs ? end_abs - first_abs + 1u : 0u;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            std::vector<float> score(count);
+            for (uint32_t r = 0; r < count; r++) {
+                const uint32_t row = (first + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                score[r] = dot * scale;
+                if (score[r] > max_score) max_score = score[r];
+            }
+            float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+            std::fill(oh, oh + head_dim, 0.0f);
+            float denom = std::exp(sinks[h] - max_score);
+            for (uint32_t r = 0; r < count; r++) {
+                const uint32_t row = (first + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                const float weight = std::exp(score[r] - max_score);
+                denom += weight;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += weight * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
     }
 }
 
@@ -315,3 +356,67 @@ static int test_attention_decode(void) {
     return rc;
 }
 REGISTER_TEST(attention_decode, test_attention_decode);
+
+static int test_attention_decode_raw_batch(void) {
+    const uint32_t n_tokens = 3, pos0 = 7, n_raw = 5, raw_cap = 8;
+    const uint32_t raw_start = 6, window = 3, n_head = 2, head_dim = 4;
+    const uint64_t head_elems = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t raw_elems = (uint64_t)raw_cap * head_dim;
+    float sinks[n_head] = {0.05f, -0.1f};
+    float q[head_elems] = {
+        0.5f, -1.0f, 1.5f, 0.25f, 1.0f, 0.5f, -0.5f, 2.0f,
+        -0.25f, 0.75f, 1.25f, -1.5f, 0.8f, -0.4f, 0.6f, 1.1f,
+        1.2f, 0.3f, -0.7f, 0.9f, -0.6f, 1.4f, 0.2f, -0.8f,
+    };
+    float raw[raw_elems];
+    for (uint32_t row = 0; row < raw_cap; row++)
+        for (uint32_t d = 0; d < head_dim; d++)
+            raw[(uint64_t)row * head_dim + d] =
+                0.11f * (float)(row + 1u) - 0.07f * (float)(d + 1u);
+
+    ds4_gpu_tensor *heads_t = ds4_gpu_tensor_alloc(head_elems * sizeof(float));
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(head_elems * sizeof(float));
+    ds4_gpu_tensor *raw_t = ds4_gpu_tensor_alloc(raw_elems * sizeof(float));
+    const uint64_t sinks_offset = 16;
+    const uint64_t model_size = sinks_offset + sizeof(sinks);
+    unsigned char *model = (unsigned char *)std::malloc(model_size);
+    if (!heads_t || !q_t || !raw_t || !model) {
+        if (heads_t) ds4_gpu_tensor_free(heads_t);
+        if (q_t) ds4_gpu_tensor_free(q_t);
+        if (raw_t) ds4_gpu_tensor_free(raw_t);
+        std::free(model);
+        return 1;
+    }
+    std::memset(model, 0xAA, (size_t)sinks_offset);
+    std::memcpy(model + sinks_offset, sinks, sizeof(sinks));
+    bool ok = ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) != 0 &&
+              ds4_gpu_tensor_write(raw_t, 0, raw, sizeof(raw)) != 0 &&
+              ds4_gpu_set_model_map(model, model_size) != 0;
+    std::vector<float> want(head_elems);
+    if (ok) {
+        ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(
+                 heads_t, model, model_size, sinks_offset, q_t, raw_t,
+                 n_tokens, pos0, n_raw, raw_cap, raw_start, window,
+                 n_head, head_dim) != 0;
+    }
+    if (ok) {
+        std::vector<float> got(head_elems);
+        ok = ds4_gpu_tensor_read(heads_t, 0, got.data(), sizeof(float) * head_elems) != 0;
+        ref_attention_decode_raw_batch(want.data(), n_tokens, pos0, n_raw,
+                                       raw_cap, raw_start, window, n_head,
+                                       head_dim, sinks, q, raw);
+        for (uint32_t i = 0; ok && i < head_elems; i++) {
+            if (!(std::fabsf(got[i] - want[i]) <= 1e-3f)) {
+                fprintf(stderr, "attention_decode_raw_batch: [%u] got %.6f want %.6f\n",
+                        i, got[i], want[i]);
+                ok = false;
+            }
+        }
+    }
+    std::free(model);
+    ds4_gpu_tensor_free(raw_t);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(heads_t);
+    return ok ? 0 : 1;
+}
+REGISTER_TEST(attention_decode_raw_batch, test_attention_decode_raw_batch);

@@ -1,0 +1,57 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_val[]; };
+layout(push_constant) uniform PC { uint n_tok; uint head_dim; uint n_rot; } pc;
+shared float reduce_buf[256];
+
+float fp8_value(uint code) {
+    uint e = (code >> 3u) & 15u;
+    uint m = code & 7u;
+    if (e == 0u) return float(m) * 0.001953125;
+    return (1.0 + float(m) * 0.125) * exp2(float(e) - 7.0);
+}
+
+float fp8_roundtrip(float value) {
+    float sign = value < 0.0 ? -1.0 : 1.0;
+    float a = min(abs(value), 448.0);
+    uint lo = 0u;
+    uint hi = 126u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (fp8_value(mid) <= a) lo = mid; else hi = mid - 1u;
+    }
+    uint best = lo;
+    if (best < 126u) {
+        float d0 = abs(a - fp8_value(best));
+        float d1 = abs(a - fp8_value(best + 1u));
+        if (d1 < d0 || (d1 == d0 && ((best + 1u) & 1u) == 0u && (best & 1u) != 0u)) best++;
+    }
+    return sign * fp8_value(best);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationIndex;
+    uint nope = pc.head_dim - pc.n_rot;
+    if (row >= pc.n_tok) return;
+    uint blocks = (nope + 63u) / 64u;
+    for (uint block = 0u; block < blocks; block++) {
+        uint base = row * pc.head_dim + block * 64u;
+        uint valid = min(64u, nope - block * 64u);
+        float amax = 0.0;
+        for (uint i = lane; i < valid; i += 256u) amax = max(amax, abs(x_val[base + i]));
+        reduce_buf[lane] = amax;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) reduce_buf[lane] = max(reduce_buf[lane], reduce_buf[lane + stride]);
+            barrier();
+        }
+        float a = max(reduce_buf[0], 1.0e-4);
+        float scale = exp2(ceil(log2(a / 448.0)));
+        for (uint i = lane; i < valid; i += 256u) {
+            float v = clamp(x_val[base + i] / scale, -448.0, 448.0);
+            x_val[base + i] = fp8_roundtrip(v) * scale;
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,77 @@
+#version 460 core
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer OutBuf { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q_val[]; };
+layout(set = 0, binding = 2) readonly buffer KvBuf { float kv_val[]; };
+layout(set = 0, binding = 3) readonly buffer SinkBuf { float sink_val[]; };
+layout(push_constant) uniform PC { uint n_tokens; uint pos0; uint n_raw; uint raw_cap; uint raw_start; uint window; uint n_head; uint head_dim; } pc;
+shared float dot_reduce[64];
+shared float score[256];
+shared float weight;
+shared float denom;
+shared float max_score;
+
+uint add_mod(uint a, uint b, uint m) {
+    a %= m;
+    b %= m;
+    return a >= m - b ? a - (m - b) : a + b;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint t = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    if (t >= pc.n_tokens || h >= pc.n_head) return;
+    uint dim = pc.head_dim;
+    uint qbase = (t * pc.n_head + h) * dim;
+    uint base_abs = pc.pos0 + pc.n_tokens - pc.n_raw;
+    uint end_abs = pc.pos0 + t;
+    uint first_abs = max(base_abs, end_abs + 1u > pc.window ? end_abs + 1u - pc.window : 0u);
+    uint first = add_mod(pc.raw_start, first_abs - base_abs, pc.raw_cap);
+    uint count = end_abs >= first_abs ? end_abs - first_abs + 1u : 0u;
+    float scale = inversesqrt(float(dim));
+    for (uint r = 0u; r < count; r++) {
+        uint kbase = add_mod(first, r, pc.raw_cap) * dim;
+        float dot = 0.0;
+        for (uint d = lane; d < dim; d += 64u) dot += q_val[qbase + d] * kv_val[kbase + d];
+        dot_reduce[lane] = dot;
+        barrier();
+        for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+            if (lane < stride) dot_reduce[lane] += dot_reduce[lane + stride];
+            barrier();
+        }
+        if (lane == 0u) score[r] = dot_reduce[0] * scale;
+        barrier();
+    }
+    float lane_max = sink_val[h];
+    for (uint r = lane; r < count; r += 64u) lane_max = max(lane_max, score[r]);
+    dot_reduce[lane] = lane_max;
+    barrier();
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) dot_reduce[lane] = max(dot_reduce[lane], dot_reduce[lane + stride]);
+        barrier();
+    }
+    if (lane == 0u) max_score = dot_reduce[0];
+    barrier();
+    for (uint r = lane; r < count; r += 64u) score[r] = exp(score[r] - max_score);
+    float lane_denom = 0.0;
+    for (uint r = lane; r < count; r += 64u) lane_denom += score[r];
+    dot_reduce[lane] = lane_denom;
+    barrier();
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) dot_reduce[lane] += dot_reduce[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) denom = exp(sink_val[h] - max_score) + dot_reduce[0];
+    barrier();
+    for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] = 0.0;
+    barrier();
+    for (uint r = 0u; r < count; r++) {
+        uint kbase = add_mod(first, r, pc.raw_cap) * dim;
+        if (lane == 0u) weight = score[r];
+        barrier();
+        for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] += weight * kv_val[kbase + d];
+        barrier();
+    }
+    for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] /= denom;
+}

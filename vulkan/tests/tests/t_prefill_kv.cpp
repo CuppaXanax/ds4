@@ -5,8 +5,8 @@
  *   ds4_gpu_store_raw_kv_batch_tensor       (ring-store batch KV with f16 round trip)
  *   ds4_gpu_attention_prefill_raw_heads_tensor (causal windowed raw attention)
  *
- * All four are host-side in the backend (they operate on tensor->ptr
- * directly), so the tests do NOT wrap the calls in begin/end_commands.
+ * The Vulkan backend dispatches these operations and synchronizes before
+ * returning, so the tests can keep the direct API shape and read back here.
  * The CPU references are copied verbatim from ds4.c (rms_norm_weight,
  * dsv4_fp8_kv_quantize_row_inplace_cpu, kv_cache_push_raw f16 round trip,
  * layer_attention_prefix_batch_worker raw attention), which is the same
@@ -115,14 +115,15 @@ static float ref_e4m3fn_dequant(float x) {
 static void ref_fp8_kv_quantize_row(float *x, uint32_t head_dim, uint32_t n_rot) {
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t off = 0; off < n_nope; off += 64) {
+        const uint32_t valid = (n_nope - off < 64u) ? (n_nope - off) : 64u;
         float amax = 0.0f;
-        for (uint32_t i = 0; i < 64; i++) {
+        for (uint32_t i = 0; i < valid; i++) {
             const float av = fabsf(x[off + i]);
             if (av > amax) amax = av;
         }
         if (amax < 1.0e-4f) amax = 1.0e-4f;
         const float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
-        for (uint32_t i = 0; i < 64; i++) {
+        for (uint32_t i = 0; i < valid; i++) {
             float v = x[off + i] / scale;
             if (v > 448.0f) v = 448.0f;
             if (v < -448.0f) v = -448.0f;
@@ -308,6 +309,8 @@ static int test_fp8_kv_quantize(void) {
     if (fp8_quantize_one("fp8_kv_quantize/model", 3, 512, 64) != 0) return 1;
     /* Two full blocks. */
     if (fp8_quantize_one("fp8_kv_quantize/blocks", 2, 160, 32) != 0) return 1;
+    /* Partial final 64-value block must be quantized without touching RoPE data. */
+    if (fp8_quantize_one("fp8_kv_quantize/tail", 2, 150, 32) != 0) return 1;
     return 0;
 }
 REGISTER_TEST(dsv4_fp8_kv_quantize, test_fp8_kv_quantize);
@@ -358,7 +361,7 @@ REGISTER_TEST(store_raw_kv_batch, test_store_raw_kv_batch);
 /* ---------- attention_prefill_raw_heads ---------- */
 
 static int test_attention_prefill_raw_heads(void) {
-    const uint32_t n_tokens = 10, window = 6, n_head = 4, head_dim = 32;
+    const uint32_t n_tokens = 32, window = 8, n_head = 4, head_dim = 32;
     const uint64_t head_elems = (uint64_t)n_tokens * n_head * head_dim;
     const uint64_t kv_elems = (uint64_t)n_tokens * head_dim;
     const uint64_t sink_off = 8;

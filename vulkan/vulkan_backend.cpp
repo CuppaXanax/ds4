@@ -364,6 +364,11 @@ static int load_all_shaders(void) {
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
         {"rope_tail", 52, 6},      /* 7 x uint32 + 6 x float */
         {"head_rms_norm_rope_tail", 56, 6}, /* 7 x uint32 + 7 x float */
+        {"store_raw_kv_f16", 16, 2},
+        {"fp8_kv_quantize", 12, 1},
+        {"attention_prefill_raw", 16, 4},
+        {"attention_decode_mixed", 32, 6},
+        {"attention_decode_raw_batch", 32, 4},
         {"hc_weighted_sum", 16, 6}, /* n_embd, n_hc, rows, reserved */
         {"hc_expand", 36, 6}, /* shape, strides, add/split/half flags */
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
@@ -690,6 +695,8 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     g_vk.tensor_headers[t->ptr] = h;
     return t;
 }
+
+static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
@@ -1066,6 +1073,23 @@ static bool find_tensor_buffer(const ds4_gpu_tensor *tensor,
     return false;
 }
 
+static bool checked_f32_bytes(uint64_t a, uint64_t b, uint64_t c,
+                              uint64_t &bytes) {
+    if (a != 0 && b > UINT64_MAX / a) return false;
+    uint64_t values = a * b;
+    if (values != 0 && c > UINT64_MAX / values) return false;
+    values *= c;
+    if (values > UINT64_MAX / sizeof(float)) return false;
+    bytes = values * sizeof(float);
+    return true;
+}
+
+static bool shader_f32_domain(uint64_t a, uint64_t b, uint64_t c) {
+    if (a != 0 && b > UINT32_MAX / a) return false;
+    const uint64_t ab = a * b;
+    return ab == 0 || c <= UINT32_MAX / ab;
+}
+
 static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording) {
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1154,6 +1178,29 @@ static bool make_head_tile_descriptor(VkBuffer buffer, VkDeviceSize base_offset,
 static int fail_simple_dispatch(VulkanCommandCtx &ctx) {
     if (ctx.recording && ctx.command_count == 0) (void)submit_and_wait();
     return 0;
+}
+
+static int record_simple_shader(const char *name, const void *push, uint32_t push_size,
+                                VkDescriptorBufferInfo *buffers, uint32_t count,
+                                uint32_t gx, uint32_t gy, uint32_t gz,
+                                bool resume_recording) {
+    auto si = g_vk.shader_map.find(name);
+    if (si == g_vk.shader_map.end()) return 0;
+    auto &ctx = get_cmd_ctx();
+    auto &shader = g_vk.shaders[si->second];
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(shader, buffers, count, set)) return 0;
+    vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
+    vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            shader.layout, 0, 1, &set, 0, nullptr);
+    if (push_size)
+        vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, push_size, push);
+    vkCmdDispatch(ctx.cmd, gx, gy, gz);
+    ctx.command_count++;
+    int ok = finish_simple_dispatch(ctx, resume_recording);
+    if (!release_simple_descriptors(set)) ok = 0;
+    return ok;
 }
 
 int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
@@ -2172,49 +2219,6 @@ static float ds4_half_to_float(uint16_t h) {
     return f;
 }
 
-/* ---- E4M3FN (fp8) table helpers (ds4.c dsv4_e4m3fn_value/dequant_cpu) ---- */
-static float ds4_e4m3fn_value(int i) {
-    static const float exp_scale[16] = {
-        0.0f, 0.015625f, 0.03125f, 0.0625f,
-        0.125f, 0.25f, 0.5f, 1.0f,
-        2.0f, 4.0f, 8.0f, 16.0f,
-        32.0f, 64.0f, 128.0f, 256.0f,
-    };
-
-    const int exp = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? (float)mant * 0.001953125f
-        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
-}
-
-static float ds4_e4m3fn_dequant(float x) {
-    const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax = fminf(fabsf(x), 448.0f);
-
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (ds4_e4m3fn_value(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = fabsf(ax - ds4_e4m3fn_value(best));
-        const float next_diff = fabsf(ax - ds4_e4m3fn_value(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best++;
-        }
-    }
-
-    return sign * ds4_e4m3fn_value(best);
-}
-
 /* ---- DSV4-specific extern C implementations ---- */
 extern "C" {
 
@@ -2224,35 +2228,26 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     uint32_t head_dim,
     uint32_t n_rot)
 {
-    if (!x || !x->ptr || n_tok == 0 || head_dim == 0 || n_rot > head_dim) return 0;
-    if (x->bytes < (uint64_t)n_tok * head_dim * sizeof(float)) return 0;
-
-    /* Host-side in-place E4M3FN round trip on the non-RoPE part of every
-     * row, replicating ds4.c dsv4_fp8_kv_quantize_row_inplace_cpu and the
-     * CUDA fp8_kv_quantize_kernel exactly: 64-wide blocks, per-block amax,
-     * power-of-two scale from amax/448, then quantize/dequantize back. */
-    const uint32_t n_nope = head_dim - n_rot;
-    float *xp = (float *)x->ptr;
-    for (uint32_t t = 0; t < n_tok; t++) {
-        float *row = xp + (uint64_t)t * head_dim;
-        for (uint32_t off = 0; off < n_nope; off += 64) {
-            float amax = 0.0f;
-            for (uint32_t i = 0; i < 64; i++) {
-                const float av = fabsf(row[off + i]);
-                if (av > amax) amax = av;
-            }
-
-            if (amax < 1.0e-4f) amax = 1.0e-4f;
-            const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
-            for (uint32_t i = 0; i < 64; i++) {
-                float v = row[off + i] / scale;
-                if (v > 448.0f) v = 448.0f;
-                if (v < -448.0f) v = -448.0f;
-                row[off + i] = ds4_e4m3fn_dequant(v) * scale;
-            }
-        }
-    }
-    return 1;
+    uint64_t tensor_bytes;
+    if (!x || !x->ptr || n_tok == 0 || n_tok > 65535u ||
+        head_dim == 0 || n_rot > head_dim ||
+        !shader_f32_domain(n_tok, 1, head_dim) ||
+        !checked_f32_bytes(n_tok, 1, head_dim, tensor_bytes) ||
+        x->bytes < tensor_bytes)
+        return 0;
+    VkBuffer xbuf; VkDeviceSize xoff;
+    if (!find_tensor_buffer(x, xbuf, xoff) ||
+        (g_vk.caps.min_storage_buffer_offset_alignment != 0 &&
+         xoff % g_vk.caps.min_storage_buffer_offset_alignment != 0)) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[1] = {{xbuf, xoff, (VkDeviceSize)x->bytes}};
+    struct { uint32_t n_tok, head_dim, n_rot; } pc = {n_tok, head_dim, n_rot};
+    DS4_VK_TRACE_KERNEL("fp8_kv_quantize");
+    return record_simple_shader("fp8_kv_quantize", &pc, sizeof(pc), bufs, 1,
+                                n_tok, 1, 1, resume_recording);
 }
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
@@ -2267,62 +2262,36 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
     uint32_t n_head,
     uint32_t head_dim)
 {
-    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
-        !model_map || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        window == 0 || window > 256)
-        return 0;
-    const uint64_t head_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
-    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
+    uint64_t head_bytes, raw_bytes;
+    if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 || n_head == 0 ||
+        head_dim == 0 || window == 0 || window > 256 ||
+        n_tokens > 65535u || n_head > 65535u ||
+        !shader_f32_domain(n_tokens, n_head, head_dim) ||
+        !shader_f32_domain(n_tokens, 1, head_dim) ||
+        !checked_f32_bytes(n_tokens, n_head, head_dim, head_bytes) ||
+        !checked_f32_bytes(n_tokens, 1, head_dim, raw_bytes) ||
         heads->bytes < head_bytes || q->bytes < head_bytes ||
-        raw_kv->bytes < kv_bytes)
+        raw_kv->bytes < raw_bytes ||
+        sinks_offset > model_size || (uint64_t)n_head * sizeof(float) > model_size - sinks_offset)
         return 0;
-
-    /* Causal windowed attention over the contiguous batch KV (the chunk
-     * rows, not the ring): token t sees rows [t+1-window, t], the sink
-     * prior joins the softmax.  Replicates ds4.c
-     * layer_attention_prefix_batch_worker and the CUDA
-     * attention_prefill_raw_kernel math exactly.
-     *   raw_count = min(t+1, window); raw_start = t+1-raw_count
-     *   scale = rsqrtf(head_dim); max starts at sinks[h]
-     *   score[r] = dot(qh, kv[raw_start+r]) * scale
-     *   heads = sum exp(score - max) * kv / (exp(sinks-max) + sum exp(...)) */
-    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
-    const float *qp = (const float *)q->ptr;
-    const float *rawp = (const float *)raw_kv->ptr;
-    float *hp = (float *)heads->ptr;
-    const float scale = 1.0f / sqrtf((float)head_dim);
-    float score[256];
-
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint32_t raw_count = (t + 1u < window) ? (t + 1u) : window;
-        const uint32_t raw_start = t + 1u - raw_count;
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = qp + ((uint64_t)t * n_head + h) * head_dim;
-            float max_score = sinks[h];
-            for (uint32_t r = 0; r < raw_count; r++) {
-                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-                score[r] = dot * scale;
-                if (score[r] > max_score) max_score = score[r];
-            }
-
-            float *oh = hp + ((uint64_t)t * n_head + h) * head_dim;
-            for (uint32_t d = 0; d < head_dim; d++) oh[d] = 0.0f;
-            float denom = expf(sinks[h] - max_score);
-            for (uint32_t r = 0; r < raw_count; r++) {
-                const float w = expf(score[r] - max_score);
-                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
-                denom += w;
-                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
-            }
-            const float inv = 1.0f / denom;
-            for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
-        }
-    }
-    return 1;
+    VkBuffer obuf, qbuf, kvbuf, sbuf; VkDeviceSize ooff, qoff, kvoff, soff, ssize;
+    if (!find_tensor_buffer(heads, obuf, ooff) || !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(raw_kv, kvbuf, kvoff) ||
+        !find_model_buffer(sinks_offset, (uint64_t)n_head * sizeof(float), sbuf, soff, ssize)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | qoff | kvoff | soff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[4] = {{obuf, ooff, (VkDeviceSize)heads->bytes},
+                                      {qbuf, qoff, (VkDeviceSize)q->bytes},
+                                      {kvbuf, kvoff, (VkDeviceSize)raw_kv->bytes},
+                                      {sbuf, soff, ssize}};
+    struct { uint32_t n_tokens, window, n_head, head_dim; } pc = {n_tokens, window, n_head, head_dim};
+    DS4_VK_TRACE_KERNEL("attention_prefill_raw");
+    return record_simple_shader("attention_prefill_raw", &pc, sizeof(pc), bufs, 4,
+                                n_tokens, n_head, 1, resume_recording);
 }
 
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
@@ -2332,40 +2301,23 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
     uint64_t kvwo, uint32_t kvn, uint32_t rows, float eps)
 {
     if (!q_out || !q || !kv_out || !kv || !mm) return 0;
-    if (qn == 0 || kvn == 0 || rows == 0) return 0;
-    const uint64_t q_bytes = (uint64_t)rows * qn * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)rows * kvn * sizeof(float);
+    uint64_t q_bytes, kv_bytes;
+    if (qn == 0 || kvn == 0 || rows == 0 || rows > 65535u ||
+        !checked_f32_bytes(rows, 1, qn, q_bytes) ||
+        !checked_f32_bytes(rows, 1, kvn, kv_bytes)) return 0;
     if (qwo > ms || (uint64_t)qn * sizeof(float) > ms - qwo ||
         kvwo > ms || (uint64_t)kvn * sizeof(float) > ms - kvwo ||
         q_out->bytes < q_bytes || q->bytes < q_bytes ||
         kv_out->bytes < kv_bytes || kv->bytes < kv_bytes)
         return 0;
 
-    /* Fused Q/KV RMSNorm with learned per-channel scale (ds4.c
-     * rms_norm_weight per row, CUDA dsv4_qkv_rms_norm_rows_kernel). */
-    float *qop = (float*)q_out->ptr; const float *qp = (const float*)q->ptr;
-    const float *qw = (const float*)((const char*)mm + qwo);
-    float *kvop = (float*)kv_out->ptr; const float *kvp = (const float*)kv->ptr;
-    const float *kvw = (const float*)((const char*)mm + kvwo);
-    for (uint32_t r = 0; r < rows; r++) {
-        double qs = 0.0, kvs = 0.0;
-        for (uint32_t i = 0; i < qn; i++) qs += (double)qp[r*qn+i] * qp[r*qn+i];
-        for (uint32_t i = 0; i < kvn; i++) kvs += (double)kvp[r*kvn+i] * kvp[r*kvn+i];
-        float qr = 1.0f / sqrtf((float)(qs / qn) + eps);
-        float kvr = 1.0f / sqrtf((float)(kvs / kvn) + eps);
-        for (uint32_t i = 0; i < qn; i++) qop[r*qn+i] = qp[r*qn+i] * qr * qw[i];
-        for (uint32_t i = 0; i < kvn; i++) kvop[r*kvn+i] = kvp[r*kvn+i] * kvr * kvw[i];
-    }
-    return 1;
+    return ds4_gpu_rms_norm_weight_rows_tensor(
+               q_out, q, mm, ms, qwo, qn, rows, eps) &&
+           ds4_gpu_rms_norm_weight_rows_tensor(
+               kv_out, kv, mm, ms, kvwo, kvn, rows, eps);
 }
 
-/* Decode fused Q/KV RMSNorm + KV RoPE tail.  Composes the two verified
- * kernels exactly (CUDA dsv4_qkv_rms_norm_rows_kv_rope_kernel): first the
- * fused Q+KV per-row RMSNorm with learned weights, then the RoPE tail over
- * the kv_out tensor laid out as [rows][kv_n_head][kv_head_dim], rotating
- * the last n_rot channels of every head.  The engine calls this with
- * rows=1 per decode step (ds4.c metal_graph_encode_decode_layer), so the
- * RoPE position is pos0 for that single token. */
+/* Compose the Vulkan Q/KV RMSNorm dispatches with the Vulkan RoPE dispatch. */
 int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
     ds4_gpu_tensor *q_out, const ds4_gpu_tensor *q,
     const void *mm, uint64_t ms, uint64_t qwo, uint32_t qn,
@@ -2380,7 +2332,7 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
     if (qn == 0 || kvn == 0 || rows == 0) return 0;
     if (kv_n_head == 0 || kv_head_dim == 0 ||
         n_rot > kv_head_dim || (n_rot & 1u) ||
-        kvn != kv_n_head * kv_head_dim)
+        (uint64_t)kvn != (uint64_t)kv_n_head * kv_head_dim)
         return 0;
 
     if (!ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
@@ -2392,11 +2344,7 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         ext_factor, attn_factor, beta_fast, beta_slow);
 }
 
-/* Release decode fused KV finalizer: after the standalone RoPE kernel this
- * performs DS4's FP8 non-RoPE KV round trip in place and writes the
- * F16-rounded row into the raw attention ring cache (CUDA
- * fp8_kv_quantize_store_rows_kernel, ds4.c dsv4_fp8_kv_quantize_row_inplace_cpu
- * + kv_cache_push_raw).  Ring position is row % raw_cap. */
+/* Compose Vulkan FP8 quantization with the Vulkan raw-cache row store. */
 int ds4_gpu_kv_fp8_store_raw_tensor(
     ds4_gpu_tensor *kv,
     ds4_gpu_tensor *raw_cache,
@@ -2407,75 +2355,58 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
 {
     if (!kv || !kv->ptr || !raw_cache || !raw_cache->ptr) return 0;
     if (raw_cap == 0 || head_dim == 0 || n_rot > head_dim) return 0;
-    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
-    if (kv->bytes < row_bytes ||
-        raw_cache->bytes < (uint64_t)raw_cap * row_bytes)
+    uint64_t row_bytes, cache_bytes;
+    if (!shader_f32_domain(raw_cap, 1, head_dim) ||
+        !checked_f32_bytes(1, 1, head_dim, row_bytes) ||
+        !checked_f32_bytes(raw_cap, 1, head_dim, cache_bytes) ||
+        kv->bytes < row_bytes || raw_cache->bytes < cache_bytes)
         return 0;
 
-    /* In-place E4M3FN round trip on the non-RoPE part (64-wide blocks,
-     * per-block amax, power-of-two scale from amax/448). */
-    const uint32_t n_nope = head_dim - n_rot;
-    float *xp = (float *)kv->ptr;
-    for (uint32_t off = 0; off < n_nope; off += 64) {
-        float amax = 0.0f;
-        for (uint32_t i = 0; i < 64; i++) {
-            const float av = fabsf(xp[off + i]);
-            if (av > amax) amax = av;
-        }
-        if (amax < 1.0e-4f) amax = 1.0e-4f;
-        const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
-        for (uint32_t i = 0; i < 64; i++) {
-            float v = xp[off + i] / scale;
-            if (v > 448.0f) v = 448.0f;
-            if (v < -448.0f) v = -448.0f;
-            xp[off + i] = ds4_e4m3fn_dequant(v) * scale;
-        }
-    }
-
-    /* F16 round trip into the ring row (ds4.c kv_cache_push_raw). */
-    const uint32_t dst_row = row % raw_cap;
-    float *dst = (float *)raw_cache->ptr + (uint64_t)dst_row * head_dim;
-    for (uint32_t d = 0; d < head_dim; d++)
-        dst[d] = ds4_half_to_float(ds4_float_to_half(xp[d]));
-    return 1;
+    return ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, 1, head_dim, n_rot) &&
+           ds4_gpu_store_raw_kv_batch_tensor(raw_cache, kv, raw_cap, row, 1,
+                                              head_dim);
 }
 
 } /* extern "C" DSV4 implementations */
 
-/* ---- CPU fallbacks for remaining critical functions ---- */
+/* ---- Remaining critical functions ---- */
 extern "C" {
 
 int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv,
     uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim)
 {
-    if (!raw_cache || !raw_cache->ptr || !kv || !kv->ptr) return 0;
-    if (raw_cap == 0 || n_tokens == 0 || head_dim == 0) return 0;
-    const uint64_t row_bytes = (uint64_t)head_dim * sizeof(float);
-    if (raw_cache->bytes < (uint64_t)raw_cap * row_bytes ||
-        kv->bytes < (uint64_t)n_tokens * row_bytes)
-        return 0;
-
-    /* Ring-store batch rows at (pos0+t) % raw_cap, with the engine's f16
-     * round trip per element (ds4.c kv_cache_push_raw, CUDA
-     * store_raw_kv_batch_kernel). */
-    float *cache = (float *)raw_cache->ptr;
-    const float *kvp = (const float *)kv->ptr;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint32_t row = (pos0 + t) % raw_cap;
-        float *dst = cache + (uint64_t)row * head_dim;
-        const float *src = kvp + (uint64_t)t * head_dim;
-        for (uint32_t d = 0; d < head_dim; d++) {
-            dst[d] = ds4_half_to_float(ds4_float_to_half(src[d]));
-        }
-    }
-    return 1;
+    uint64_t cache_bytes, kv_bytes;
+    if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 || head_dim == 0 ||
+        (n_tokens > 1 && pos0 > UINT32_MAX - (n_tokens - 1u)) ||
+        !shader_f32_domain(raw_cap, 1, head_dim) ||
+        !shader_f32_domain(n_tokens, 1, head_dim) ||
+        !checked_f32_bytes(raw_cap, 1, head_dim, cache_bytes) ||
+        !checked_f32_bytes(n_tokens, 1, head_dim, kv_bytes) ||
+        raw_cache->bytes < cache_bytes || kv->bytes < kv_bytes) return 0;
+    VkBuffer rbuf, kbuf; VkDeviceSize roff, koff;
+    if (!find_tensor_buffer(raw_cache, rbuf, roff) || !find_tensor_buffer(kv, kbuf, koff)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((roff | koff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[2] = {{rbuf, roff, (VkDeviceSize)raw_cache->bytes},
+                                      {kbuf, koff, (VkDeviceSize)kv->bytes}};
+    struct { uint32_t raw_cap, pos0, n_tokens, head_dim; } pc = {raw_cap, pos0, n_tokens, head_dim};
+    const uint64_t groups = ((uint64_t)n_tokens * head_dim + 255u) / 256u;
+    if (groups == 0 || groups > 65535u) return fail_simple_dispatch(ctx);
+    DS4_VK_TRACE_KERNEL("store_raw_kv_f16");
+    return record_simple_shader("store_raw_kv_f16", &pc, sizeof(pc), bufs, 2,
+                                (uint32_t)groups,
+                                1, 1, resume_recording);
 }
 
-/* ---- ds4_gpu_attention_decode_heads_tensor (CPU-hosted) ----
+/* ---- ds4_gpu_attention_decode_heads_tensor ----
  *
  * Single-token causal decode attention over the raw ring cache plus the
- * compressed (MLA) cache.  Host-side over the host-mapped tensor memory
- * (same pattern as ds4_gpu_add_tensor / ds4_gpu_router_select_tensor).
+ * compressed (MLA) cache.  The operation is recorded and synchronized as
+ * a Vulkan compute dispatch.
  *
  * Replicates the engine's CPU reference (ds4.c layer_attention_mixed_one)
  * and the CUDA attention_decode_mixed_kernel math exactly:
@@ -2513,140 +2444,101 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim)
 {
-    DS4_VK_TRACE_KERNEL("attention_decode_heads");
-
-    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
-        !model_map || n_raw == 0 || n_head == 0 || head_dim == 0 ||
-        raw_cap < n_raw || raw_start >= raw_cap ||
-        (n_comp != 0 && (!comp_kv || !comp_kv->ptr)) ||
-        (use_mask != 0 && (!comp_mask || !comp_mask->ptr))) {
-        return 0;
-    }
-    const uint64_t head_bytes = (uint64_t)n_head * head_dim * sizeof(float);
-    const uint64_t comp_elem = comp_kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
-    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
-        heads->bytes < head_bytes || q->bytes < head_bytes ||
-        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp != 0 && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem) ||
-        (use_mask != 0 && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
-        return 0;
-    }
-
-    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
-    const float *qp = (const float *)q->ptr;
-    const float *rawp = (const float *)raw_kv->ptr;
-    const uint8_t *compp = comp_kv ? (const uint8_t *)comp_kv->ptr : nullptr;
-    const float *maskp = (use_mask && comp_mask) ? (const float *)comp_mask->ptr : nullptr;
-    float *hp = (float *)heads->ptr;
-
-    const float scale = 1.0f / sqrtf((float)head_dim);
-    const uint32_t n_total = n_raw + n_comp;
-    std::vector<float> score(n_total);
-
-    for (uint32_t h = 0; h < n_head; h++) {
-        const float *qh = qp + (uint64_t)h * head_dim;
-        const float sink = sinks[h];
-        float max_score = sink;
-
-        for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = (raw_start + r) % raw_cap;
-            const float *kv = rawp + (uint64_t)row * head_dim;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-            score[r] = dot * scale;
-            if (score[r] > max_score) max_score = score[r];
-        }
-        for (uint32_t c = 0; c < n_comp; c++) {
-            const float add = maskp ? maskp[c] : 0.0f;
-            const uint32_t idx = n_raw + c;
-            if (add <= -1.0e20f) {
-                score[idx] = -INFINITY;               /* masked comp row */
-                continue;
-            }
-            const float *kv = (const float *)(compp + (uint64_t)c * head_dim * comp_elem);
-            float dot = 0.0f;
-            if (comp_kv_f16) {
-                const uint16_t *kvh = (const uint16_t *)kv;
-                for (uint32_t d = 0; d < head_dim; d++)
-                    dot += qh[d] * ds4_half_to_float(kvh[d]);
-            } else {
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-            }
-            score[idx] = dot * scale + add;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-
-        float *oh = hp + (uint64_t)h * head_dim;
-        std::memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
-
-        float denom = expf(sink - max_score);
-        for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = (raw_start + r) % raw_cap;
-            const float *kv = rawp + (uint64_t)row * head_dim;
-            const float weight = expf(score[r] - max_score);
-            denom += weight;
-            for (uint32_t d = 0; d < head_dim; d++) oh[d] += weight * kv[d];
-        }
-        for (uint32_t c = 0; c < n_comp; c++) {
-            const uint32_t idx = n_raw + c;
-            if (score[idx] <= -1.0e20f) continue;
-            const float *kv = (const float *)(compp + (uint64_t)c * head_dim * comp_elem);
-            const float weight = expf(score[idx] - max_score);
-            denom += weight;
-            if (comp_kv_f16) {
-                const uint16_t *kvh = (const uint16_t *)kv;
-                for (uint32_t d = 0; d < head_dim; d++)
-                    oh[d] += weight * ds4_half_to_float(kvh[d]);
-            } else {
-                for (uint32_t d = 0; d < head_dim; d++) oh[d] += weight * kv[d];
-            }
-        }
-
-        const float inv = 1.0f / denom;
-        for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
-    }
-    return 1;
+    uint64_t head_bytes, raw_bytes;
+    const uint64_t comp_values = (uint64_t)n_comp * head_dim;
+    if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || n_head == 0 || head_dim == 0 ||
+        raw_cap < n_raw || raw_start >= raw_cap || (n_comp && !comp_kv) ||
+        n_raw > 1024u || n_comp > 1024u - n_raw ||
+        (use_mask && !comp_mask) || sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        n_head > 65535u ||
+        !shader_f32_domain(1, n_head, head_dim) ||
+        !shader_f32_domain(raw_cap, 1, head_dim) ||
+        !shader_f32_domain(n_comp, 1, head_dim) ||
+        !checked_f32_bytes(1, n_head, head_dim, head_bytes) ||
+        !checked_f32_bytes(raw_cap, 1, head_dim, raw_bytes) ||
+        heads->bytes < head_bytes || q->bytes < head_bytes || raw_kv->bytes < raw_bytes ||
+        (comp_kv_f16 && (comp_values & 1u) != 0) ||
+        (n_comp && (comp_values > UINT64_MAX / (comp_kv_f16 ? 2u : 4u) ||
+                comp_kv->bytes < comp_values * (comp_kv_f16 ? 2u : 4u))) ||
+        (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) return 0;
+    VkBuffer obuf, qbuf, rbuf, cbuf, mbuf, sbuf;
+    VkDeviceSize ooff, qoff, roff, coff, moff, soff, ssize;
+    if (!find_tensor_buffer(heads, obuf, ooff) || !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(raw_kv, rbuf, roff) ||
+        !find_model_buffer(sinks_offset, (uint64_t)n_head * sizeof(float), sbuf, soff, ssize)) return 0;
+    if (n_comp) {
+        if (!find_tensor_buffer(comp_kv, cbuf, coff)) return 0;
+    } else { cbuf = rbuf; coff = roff; }
+    if (use_mask) {
+        if (!find_tensor_buffer(comp_mask, mbuf, moff)) return 0;
+    } else { mbuf = rbuf; moff = roff; }
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | qoff | roff | coff | moff | soff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[6] = {
+        {obuf, ooff, (VkDeviceSize)heads->bytes}, {qbuf, qoff, (VkDeviceSize)q->bytes},
+        {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
+        {cbuf, coff, n_comp ? (VkDeviceSize)comp_kv->bytes : 4},
+        {mbuf, moff, use_mask ? (VkDeviceSize)comp_mask->bytes : 4}, {sbuf, soff, ssize}
+    };
+    struct { uint32_t n_raw, raw_cap, raw_start, n_comp, comp_f16, use_mask, n_head, head_dim; }
+        pc = {n_raw, raw_cap, raw_start, n_comp, comp_kv_f16, use_mask, n_head, head_dim};
+    DS4_VK_TRACE_KERNEL("attention_decode_mixed");
+    return record_simple_shader("attention_decode_mixed", &pc, sizeof(pc), bufs, 6,
+                                n_head, 1, 1, resume_recording);
 }
 
-int ds4_gpu_attention_decode_raw_batch_heads_tensor(ds4_gpu_tensor *heads,
-    const void *mm, uint64_t ms, uint64_t sinks_off, const ds4_gpu_tensor *q,
-    const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t pos0,
-    uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t window,
-    uint32_t n_head, uint32_t head_dim)
+int ds4_gpu_attention_decode_raw_batch_heads_tensor(
+    ds4_gpu_tensor *heads, const void *mm, uint64_t ms, uint64_t sinks_off,
+    const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens,
+    uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+    uint32_t window, uint32_t n_head, uint32_t head_dim)
 {
-    (void)mm; (void)ms; (void)sinks_off;
-    if (!heads || !q || !raw_kv) return 0;
-    float *h = (float*)heads->ptr;
-    const float *qp = (const float*)q->ptr;
-    const float *kv = (const float*)raw_kv->ptr;
-    uint64_t kv_row = (uint64_t)n_head * head_dim;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        for (uint32_t hd = 0; hd < n_head; hd++) {
-            uint64_t q_off = (uint64_t)t * kv_row + (uint64_t)hd * head_dim;
-            /* Simple dot-product attention over KV cache window */
-            double max_score = -1e38;
-            uint32_t best_kv = 0;
-            uint32_t n_kv = n_raw < window ? n_raw : window;
-            uint32_t kv_start = (n_raw >= window) ? (pos0 + n_tokens - window) : 0;
-            for (uint32_t k = 0; k < n_kv; k++) {
-                uint32_t kv_row_idx = (kv_start + k) % raw_cap;
-                double score = 0.0;
-                for (uint32_t i = 0; i < head_dim; i++)
-                    score += (double)qp[q_off + i] * (double)kv[(uint64_t)kv_row_idx * kv_row + (uint64_t)hd * head_dim + i];
-                if (score > max_score) { max_score = score; best_kv = k; }
-            }
-            /* Copy best KV value to output */
-            uint32_t best_row = (kv_start + best_kv) % raw_cap;
-            memcpy(h + (uint64_t)t * kv_row + (uint64_t)hd * head_dim,
-                   kv + (uint64_t)best_row * kv_row + (uint64_t)hd * head_dim,
-                   head_dim * sizeof(float));
-        }
-    }
-    return 1;
+    uint64_t head_bytes, raw_bytes;
+    if (!heads || !q || !raw_kv || !mm || n_tokens == 0 || n_raw == 0 ||
+        raw_cap == 0 || n_raw > raw_cap || raw_start >= raw_cap ||
+        window == 0 || window > 256 || n_head == 0 || head_dim == 0 ||
+        pos0 > UINT32_MAX - n_tokens ||
+        (uint64_t)n_raw > (uint64_t)pos0 + n_tokens ||
+        n_tokens > 65535u || n_head > 65535u ||
+        !shader_f32_domain(n_tokens, n_head, head_dim) ||
+        !shader_f32_domain(raw_cap, 1, head_dim) ||
+        !checked_f32_bytes(n_tokens, n_head, head_dim, head_bytes) ||
+        !checked_f32_bytes(raw_cap, 1, head_dim, raw_bytes) ||
+        heads->bytes < head_bytes || q->bytes < head_bytes ||
+        raw_kv->bytes < raw_bytes ||
+        sinks_off > ms || (uint64_t)n_head * sizeof(float) > ms - sinks_off)
+        return 0;
+    VkBuffer obuf, qbuf, rbuf, sbuf;
+    VkDeviceSize ooff, qoff, roff, soff, ssize;
+    if (!find_tensor_buffer(heads, obuf, ooff) || !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(raw_kv, rbuf, roff) ||
+        !find_model_buffer(sinks_off, (uint64_t)n_head * sizeof(float), sbuf, soff, ssize))
+        return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | qoff | roff | soff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[4] = {
+        {obuf, ooff, (VkDeviceSize)heads->bytes},
+        {qbuf, qoff, (VkDeviceSize)q->bytes},
+        {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
+        {sbuf, soff, ssize},
+    };
+    struct { uint32_t n_tokens, pos0, n_raw, raw_cap, raw_start, window, n_head, head_dim; }
+        pc = {n_tokens, pos0, n_raw, raw_cap, raw_start, window, n_head, head_dim};
+    DS4_VK_TRACE_KERNEL("attention_decode_raw_batch");
+    return record_simple_shader("attention_decode_raw_batch", &pc, sizeof(pc), bufs, 4,
+                                n_tokens, n_head, 1, resume_recording);
 }
 
-/* ---- attention output projections (host-side Q8_0) ----
+/* ---- attention output projections ----
  *
  * Grouped attention output (DeepSeek V4 Flash).  The n_groups attention
  * groups each own group_dim inputs (the concatenated heads of the group)
@@ -2831,7 +2723,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
     return 1;
 }
 
-/* ---- ds4_gpu_attention_output_q8_batch_f16_tensor (CPU-hosted) ----
+/* ---- ds4_gpu_attention_output_q8_batch_f16_tensor ----
  *
  * Identical math to ds4_gpu_attention_output_q8_batch_tensor above
  * (grouped Q8_0 attention output projection), but the final out_dim-wide
@@ -2931,7 +2823,7 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
     return 1;
 }
 
-/* ---- ds4_gpu_attention_prefill_static_mixed_heads_tensor (CPU-hosted) ----
+/* ---- ds4_gpu_attention_prefill_static_mixed_heads_tensor ----
  *
  * Prefill attention over the mixed key set: the raw batch KV rows of the
  * current chunk (MLA-style: one row per token, K and V share the row, as in
@@ -6052,4 +5944,24 @@ extern "C" int ds4_gpu_q8_cache_suppressed(void) {
 
 extern "C" void ds4_gpu_set_q8_cache_suppressed(int suppressed) {
     g_vk_q8_cache_suppressed = suppressed != 0;
+}
+
+static bool find_model_buffer(uint64_t offset, uint64_t bytes,
+                              VkBuffer &buffer, VkDeviceSize &buffer_offset,
+                              VkDeviceSize &range) {
+    if (bytes == 0 || offset > g_vk.model_size || bytes > g_vk.model_size - offset)
+        return false;
+    if (!ensure_weight(offset, bytes)) return false;
+    for (auto &[base, entry] : g_vk.weight_cache) {
+        if (offset >= base && offset - base <= entry.size &&
+            bytes <= entry.size - (offset - base)) {
+            buffer = entry.buffer;
+            buffer_offset = offset - base;
+            range = bytes;
+            entry.last_used = ++g_vk.lru_counter;
+            entry.last_gen = g_vk.cmd_gen;
+            return true;
+        }
+    }
+    return false;
 }

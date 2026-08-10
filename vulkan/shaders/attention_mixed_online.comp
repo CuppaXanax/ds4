@@ -1,0 +1,127 @@
+#version 460 core
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer OutBuf { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q_val[]; };
+layout(set = 0, binding = 2) readonly buffer RawBuf { float raw_val[]; };
+layout(set = 0, binding = 3) readonly buffer CompBuf { uint comp_bits[]; };
+layout(set = 0, binding = 4) readonly buffer TopKBuf { uint topk_val[]; };
+layout(set = 0, binding = 5) readonly buffer MaskBuf { float mask_val[]; };
+layout(set = 0, binding = 6) readonly buffer SinkBuf { float sink_val[]; };
+layout(set = 0, binding = 7) readonly buffer UnusedBuf { uint unused_val[]; };
+layout(push_constant) uniform PC {
+    uint n_tokens; uint pos0; uint q_row0; uint n_q;
+    uint n_raw; uint raw_cap; uint raw_start; uint n_comp;
+    uint top_k; uint window; uint ratio; uint n_head;
+    uint head_dim; uint comp_f16; uint use_mask; uint mode;
+} pc;
+shared float reduce[64];
+shared uint raw_count;
+shared uint raw_first;
+shared float online_max;
+shared float online_denom;
+shared float online_factor;
+shared float online_weight;
+
+float comp_at(uint index) {
+    if (pc.comp_f16 == 0u) return uintBitsToFloat(comp_bits[index]);
+    vec2 halves = unpackHalf2x16(comp_bits[index >> 1u]);
+    return (index & 1u) == 0u ? halves.x : halves.y;
+}
+
+void reduce_dot(inout float value) {
+    reduce[gl_LocalInvocationIndex] = value; barrier();
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (gl_LocalInvocationIndex < stride)
+            reduce[gl_LocalInvocationIndex] += reduce[gl_LocalInvocationIndex + stride];
+        barrier();
+    }
+    value = reduce[0]; barrier();
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    const uint work = gl_WorkGroupID.x;
+    const uint token = work / pc.n_head;
+    const uint head = work - token * pc.n_head;
+    if (token >= pc.n_q || head >= pc.n_head) return;
+    const uint qpos = pc.pos0 + (pc.mode == 0u ? pc.q_row0 : 0u) + token;
+    const uint dim = pc.head_dim;
+    const uint qbase = token * pc.n_head * dim + head * dim;
+    const float scale = inversesqrt(float(dim));
+
+    if (lane == 0u) {
+        raw_count = 0u;
+        raw_first = 0u;
+        if (pc.mode == 0u) {
+            raw_count = min(qpos + 1u, pc.window == 0u ? qpos + 1u : pc.window);
+            raw_first = qpos + 1u - raw_count;
+        } else if (pc.n_raw != 0u && qpos >= pc.pos0 + pc.n_tokens - pc.n_raw) {
+            const uint first_raw_pos = pc.pos0 + pc.n_tokens - pc.n_raw;
+            raw_first = first_raw_pos;
+            if (pc.window != 0u && qpos + 1u > pc.window)
+                raw_first = max(raw_first, qpos + 1u - pc.window);
+            const uint last = min(qpos, first_raw_pos + pc.n_raw - 1u);
+            if (last >= raw_first)
+                raw_count = min(last - raw_first + 1u, pc.n_raw);
+        }
+        online_max = sink_val[head];
+        online_denom = 1.0;
+    }
+    barrier();
+    for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] = 0.0;
+    barrier();
+
+    for (uint r = 0u; r < raw_count; r++) {
+        uint row = raw_first + r;
+        if (pc.mode != 0u)
+            row = (pc.raw_start + raw_first - (pc.pos0 + pc.n_tokens - pc.n_raw) + r) % pc.raw_cap;
+        float dot = 0.0;
+        for (uint d = lane; d < dim; d += 64u)
+            dot += q_val[qbase + d] * raw_val[row * dim + d];
+        reduce_dot(dot);
+        if (lane == 0u) {
+            const float score = reduce[0] * scale;
+            online_factor = score > online_max ? exp(online_max - score) : 1.0;
+            if (score > online_max) online_max = score;
+            online_weight = exp(score - online_max);
+            online_denom = online_denom * online_factor + online_weight;
+        }
+        barrier();
+        for (uint d = lane; d < dim; d += 64u)
+            out_val[qbase + d] = out_val[qbase + d] * online_factor +
+                online_weight * raw_val[row * dim + d];
+        barrier();
+    }
+
+    const uint visible = pc.ratio == 0u ? 0u : min((qpos + 1u) / pc.ratio, pc.n_comp);
+    const uint comp_rows = pc.mode == 1u ? min(pc.top_k, 512u) : visible;
+    for (uint c = 0u; c < comp_rows; c++) {
+        uint row = c;
+        if (pc.mode == 1u) {
+            row = topk_val[token * pc.top_k + c];
+            if (row >= visible) continue;
+        }
+        const float bias = pc.use_mask != 0u ? mask_val[row] : 0.0;
+        float dot = 0.0;
+        if (bias > -1.0e20)
+            for (uint d = lane; d < dim; d += 64u)
+                dot += q_val[qbase + d] * comp_at(row * dim + d);
+        reduce_dot(dot);
+        if (lane == 0u) {
+            const float score = bias <= -1.0e20 ? -1.0e30 : reduce[0] * scale + bias;
+            online_factor = score > online_max ? exp(online_max - score) : 1.0;
+            if (score > online_max) online_max = score;
+            online_weight = score <= -1.0e20 ? 0.0 : exp(score - online_max);
+            online_denom = online_denom * online_factor + online_weight;
+        }
+        barrier();
+        if (bias > -1.0e20) {
+            for (uint d = lane; d < dim; d += 64u)
+                out_val[qbase + d] = out_val[qbase + d] * online_factor +
+                    online_weight * comp_at(row * dim + d);
+        }
+        barrier();
+    }
+    for (uint d = lane; d < dim; d += 64u)
+        out_val[qbase + d] /= online_denom;
+}

@@ -368,6 +368,7 @@ static int load_all_shaders(void) {
         {"fp8_kv_quantize", 12, 1},
         {"attention_prefill_raw", 16, 4},
         {"attention_decode_mixed", 32, 6},
+        {"attention_mixed_online", 64, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
         {"indexer_qat", 4, 1},
@@ -1092,6 +1093,12 @@ static bool checked_f32_bytes(uint64_t a, uint64_t b, uint64_t c,
     values *= c;
     if (values > UINT64_MAX / sizeof(float)) return false;
     bytes = values * sizeof(float);
+    return true;
+}
+
+static bool checked_u64_product(uint64_t a, uint64_t b, uint64_t &product) {
+    if (a != 0 && b > UINT64_MAX / a) return false;
+    product = a * b;
     return true;
 }
 
@@ -2836,6 +2843,121 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
     return 1;
 }
 
+static int dispatch_attention_mixed_online(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t q_row0, uint32_t n_q,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t top_k, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, uint32_t mode) {
+    uint64_t head_count, head_bytes, q_bytes, raw_bytes, comp_values;
+    uint64_t comp_bytes, mask_bytes, topk_values, topk_bytes, sink_bytes;
+    const uint64_t position_end = (uint64_t)pos0 + q_row0 + n_q;
+    if (!heads || !q || !raw_kv || !model_map || n_q == 0 || n_tokens == 0 ||
+        n_head == 0 || head_dim == 0 || n_q > n_tokens ||
+        q_row0 > n_tokens - n_q || n_raw > raw_cap ||
+        (n_raw != 0 && raw_start >= raw_cap) || n_raw > 256u || n_comp > 4096u ||
+        top_k > 512u || (mode == 1u && top_k == 0u) ||
+        (n_comp != 0 && !comp_kv) || (mode == 1u && !topk) ||
+        (use_mask != 0u && !comp_mask) ||
+        position_end > UINT32_MAX || pos0 > UINT32_MAX - n_tokens ||
+        (uint64_t)n_raw > (uint64_t)pos0 + n_tokens ||
+        (n_raw != 0u && raw_start > UINT32_MAX - n_raw) ||
+        !checked_u64_product(n_q, n_head, head_count) || head_count > 65535u ||
+        !shader_f32_domain(n_q, n_head, head_dim) ||
+        !shader_f32_domain(n_tokens, n_head, head_dim) ||
+        !shader_f32_domain(raw_cap, 1, head_dim) ||
+        !shader_f32_domain(n_comp, 1, head_dim) ||
+        (mode == 1u && !shader_f32_domain(n_tokens, top_k, 1)) ||
+        !checked_f32_bytes(n_q, n_head, head_dim, head_bytes) ||
+        !checked_f32_bytes(n_q, n_head, head_dim, q_bytes) ||
+        !checked_f32_bytes(raw_cap, 1, head_dim, raw_bytes) ||
+        !checked_u64_product(n_comp, head_dim, comp_values) ||
+        (comp_kv_f16 && (comp_values & 1u) != 0) ||
+        !checked_u64_product(comp_values, comp_kv_f16 ? sizeof(uint16_t) : sizeof(float), comp_bytes) ||
+        !checked_u64_product(n_comp, sizeof(float), mask_bytes) ||
+        !checked_u64_product(n_tokens, top_k, topk_values) ||
+        !checked_u64_product(topk_values, sizeof(uint32_t), topk_bytes) ||
+        !checked_u64_product(n_head, sizeof(float), sink_bytes))
+        return 0;
+    uint64_t max_visible = 0;
+    if (ratio != 0) {
+        max_visible = std::min<uint64_t>((position_end - 1u) / ratio, n_comp);
+    }
+    const uint64_t visible_limit = (mode == 0u && use_mask == 0u) ? 512u : 4096u;
+    if (max_visible > visible_limit || raw_bytes < 4u) return 0;
+    if (heads->bytes < head_bytes || q->bytes < q_bytes ||
+        raw_kv->bytes < raw_bytes ||
+        (n_comp && comp_kv->bytes < comp_bytes) ||
+        (mode == 1u && topk->bytes < topk_bytes) ||
+        (use_mask && comp_mask->bytes < mask_bytes) ||
+        sinks_offset > model_size || sink_bytes > model_size - sinks_offset)
+        return 0;
+    VkBuffer obuf, qbuf, rbuf, cbuf, tbuf, mbuf, sbuf;
+    VkDeviceSize ooff, qoff, roff, coff, toff, moff, soff, ssize;
+    if (!find_tensor_buffer(heads, obuf, ooff) || !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(raw_kv, rbuf, roff) ||
+        !find_model_buffer(sinks_offset, sink_bytes, sbuf, soff, ssize)) return 0;
+    if (n_comp && !find_tensor_buffer(comp_kv, cbuf, coff)) return 0;
+    if (!n_comp) { cbuf = rbuf; coff = roff; }
+    if (mode == 1u && !find_tensor_buffer(topk, tbuf, toff)) return 0;
+    if (mode != 1u) { tbuf = rbuf; toff = roff; }
+    if (use_mask && !find_tensor_buffer(comp_mask, mbuf, moff)) return 0;
+    if (!use_mask) { mbuf = rbuf; moff = roff; }
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | qoff | roff | coff | toff | moff | soff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo bufs[8] = {
+        {obuf, ooff, (VkDeviceSize)heads->bytes},
+        {qbuf, qoff, (VkDeviceSize)q->bytes},
+        {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
+        {cbuf, coff, n_comp ? (VkDeviceSize)comp_kv->bytes : 4},
+        {tbuf, toff, mode == 1u ? (VkDeviceSize)topk->bytes : 4},
+        {mbuf, moff, use_mask ? (VkDeviceSize)comp_mask->bytes : 4},
+        {sbuf, soff, ssize}, {rbuf, roff, 4}
+    };
+    struct { uint32_t n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
+             top_k, window, ratio, n_head, head_dim, comp_f16, use_mask, mode; } pc = {
+        n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
+        top_k, window, ratio, n_head, head_dim, comp_kv_f16, use_mask, mode};
+    DS4_VK_TRACE_KERNEL("attention_mixed_online");
+    return record_simple_shader("attention_mixed_online", &pc, sizeof(pc), bufs, 8,
+                                (uint32_t)head_count, 1, 1, resume_recording);
+}
+
+int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim) {
+    return dispatch_attention_mixed_online(heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv, comp_kv_f16, nullptr, comp_mask, use_comp_mask,
+        n_tokens, pos0, 0, n_tokens, n_raw, raw_cap, raw_start, n_comp, 0,
+        window, ratio, n_head, head_dim, 2);
+}
+
+int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16, const ds4_gpu_tensor *topk,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t top_k, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    return dispatch_attention_mixed_online(heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv, comp_kv_f16, topk, nullptr, 0, n_tokens, pos0, 0,
+        n_tokens, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio,
+        n_head, head_dim, 1);
+}
+
 /* ---- ds4_gpu_attention_prefill_static_mixed_heads_tensor ----
  *
  * Prefill attention over the mixed key set: the raw batch KV rows of the
@@ -2871,95 +2993,34 @@ int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim)
 {
-    DS4_VK_TRACE_KERNEL("attention_prefill_static_mixed");
-    if (!heads || !heads->ptr || !q || !q->ptr || !raw_kv || !raw_kv->ptr ||
-        !model_map || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        (n_comp != 0 && (!comp_kv || !comp_kv->ptr)))
-        return 0;
-    const uint64_t head_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t kv_bytes = (uint64_t)n_tokens * head_dim * sizeof(float);
-    const uint64_t comp_elem = comp_kv_f16 ? sizeof(uint16_t) : sizeof(float);
-    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
-    if (sinks_offset > model_size || sink_bytes > model_size - sinks_offset ||
-        heads->bytes < head_bytes || q->bytes < head_bytes ||
-        raw_kv->bytes < kv_bytes ||
-        (n_comp != 0 && comp_kv->bytes < (uint64_t)n_comp * head_dim * comp_elem))
-        return 0;
+    return dispatch_attention_mixed_online(heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv, comp_kv_f16, nullptr, nullptr, 0,
+        n_tokens, 0, 0, n_tokens, n_tokens, n_tokens, 0, n_comp, 0,
+        window, ratio, n_head, head_dim, 0);
+}
 
-    const float *sinks = (const float *)((const char *)model_map + sinks_offset);
-    const float *qp = (const float *)q->ptr;
-    const float *rawp = (const float *)raw_kv->ptr;
-    const uint8_t *compp = (n_comp && comp_kv) ? (const uint8_t *)comp_kv->ptr : nullptr;
-    float *hp = (float *)heads->ptr;
-    const float scale = 1.0f / sqrtf((float)head_dim);
+int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16, uint32_t q_row0,
+        uint32_t n_q, uint32_t n_tokens, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    return dispatch_attention_mixed_online(heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv, comp_kv_f16, nullptr, nullptr, 0, n_tokens, 0,
+        q_row0, n_q, n_tokens, n_tokens, 0, n_comp, 0, window, ratio,
+        n_head, head_dim, 0);
+}
 
-    std::vector<float> score;
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const uint32_t raw_count = (window != 0 && t + 1u > window) ? window : (t + 1u);
-        const uint32_t raw_start = t + 1u - raw_count;
-        uint32_t comp_count = 0;
-        if (n_comp != 0 && ratio != 0) {
-            comp_count = (t + 1u) / ratio;
-            if (comp_count > n_comp) comp_count = n_comp;
-        }
-        const uint32_t n_total = raw_count + comp_count;
-        score.resize(n_total);
-
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = qp + ((uint64_t)t * n_head + h) * head_dim;
-            float max_score = sinks[h];
-
-            for (uint32_t r = 0; r < raw_count; r++) {
-                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
-                score[r] = dot * scale;
-                if (score[r] > max_score) max_score = score[r];
-            }
-            for (uint32_t c = 0; c < comp_count; c++) {
-                const uint32_t idx = raw_count + c;
-                const uint8_t *kv = compp + (uint64_t)c * head_dim * comp_elem;
-                float dot = 0.0f;
-                if (comp_kv_f16) {
-                    const uint16_t *kvh = (const uint16_t *)kv;
-                    for (uint32_t d = 0; d < head_dim; d++)
-                        dot += qh[d] * ds4_half_to_float(kvh[d]);
-                } else {
-                    const float *kvf = (const float *)kv;
-                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvf[d];
-                }
-                score[idx] = dot * scale;
-                if (score[idx] > max_score) max_score = score[idx];
-            }
-
-            float *oh = hp + ((uint64_t)t * n_head + h) * head_dim;
-            std::memset(oh, 0, (size_t)head_dim * sizeof(oh[0]));
-            float denom = expf(sinks[h] - max_score);
-            for (uint32_t r = 0; r < raw_count; r++) {
-                const float w = expf(score[r] - max_score);
-                const float *kv = rawp + (uint64_t)(raw_start + r) * head_dim;
-                denom += w;
-                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
-            }
-            for (uint32_t c = 0; c < comp_count; c++) {
-                const uint32_t idx = raw_count + c;
-                const uint8_t *kv = compp + (uint64_t)c * head_dim * comp_elem;
-                const float w = expf(score[idx] - max_score);
-                denom += w;
-                if (comp_kv_f16) {
-                    const uint16_t *kvh = (const uint16_t *)kv;
-                    for (uint32_t d = 0; d < head_dim; d++)
-                        oh[d] += w * ds4_half_to_float(kvh[d]);
-                } else {
-                    const float *kvf = (const float *)kv;
-                    for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kvf[d];
-                }
-            }
-            const float inv = 1.0f / denom;
-            for (uint32_t d = 0; d < head_dim; d++) oh[d] *= inv;
-        }
-    }
-    return 1;
+int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv, uint32_t comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask, uint32_t n_tokens, uint32_t n_comp,
+        uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    return dispatch_attention_mixed_online(heads, model_map, model_size, sinks_offset,
+        q, raw_kv, comp_kv, comp_kv_f16, nullptr, comp_mask, 1, n_tokens, 0,
+        0, n_tokens, n_tokens, n_tokens, 0, n_comp, 0, window, ratio,
+        n_head, head_dim, 0);
 }
 
 /* ---- Hyper-Connection helpers ----

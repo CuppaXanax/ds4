@@ -408,3 +408,75 @@ done:
     return rc;
 }
 REGISTER_TEST(indexer_end_to_end, test_indexer_end_to_end);
+
+static int test_indexed_attention_causal_filler(void) {
+    const uint32_t tokens = 2, heads = 1, dim = 4, raw_cap = 4, n_raw = 2;
+    const uint32_t n_comp = 3, top_k = 3, pos0 = 1, ratio = 2;
+    const float sinks[1] = {0.0f};
+    const float q[] = {1.0f, 0.0f, 0.0f, 0.0f,
+                       0.5f, 0.5f, 0.0f, 0.0f};
+    const float raw[] = {0.0f, 0.0f, 0.0f, 0.0f,
+                         0.0f, 0.0f, 0.0f, 0.0f,
+                         2.0f, 0.0f, 0.0f, 0.0f,
+                         0.0f, 2.0f, 0.0f, 0.0f};
+    const float comp[] = {3.0f, 0.0f, 0.0f, 0.0f,
+                          0.0f, 3.0f, 0.0f, 0.0f,
+                          0.0f, 0.0f, 3.0f, 0.0f};
+    const uint32_t topk[] = {0u, 99u, 1u, 0u, 99u, 1u};
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(float) * tokens * heads * dim);
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *rt = ds4_gpu_tensor_alloc(sizeof(raw));
+    ds4_gpu_tensor *ct = ds4_gpu_tensor_alloc(sizeof(comp));
+    ds4_gpu_tensor *tt = ds4_gpu_tensor_alloc(sizeof(topk));
+    unsigned char model[sizeof(sinks) + 16] = {};
+    std::memcpy(model + 16, sinks, sizeof(sinks));
+    int rc = 1;
+    if (!out || !qt || !rt || !ct || !tt ||
+        !ds4_gpu_set_model_map(model, sizeof(model)) ||
+        !ds4_gpu_tensor_write(qt, 0, q, sizeof(q)) ||
+        !ds4_gpu_tensor_write(rt, 0, raw, sizeof(raw)) ||
+        !ds4_gpu_tensor_write(ct, 0, comp, sizeof(comp)) ||
+        !ds4_gpu_tensor_write(tt, 0, topk, sizeof(topk)) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            out, model, sizeof(model), 16, qt, rt, ct, 0, tt, tokens, pos0,
+            n_raw, raw_cap, 2, n_comp, top_k, 2, ratio, heads, dim))
+        goto done;
+    {
+        std::vector<float> got(tokens * heads * dim);
+        if (!ds4_gpu_tensor_read(out, 0, got.data(), sizeof(float) * got.size())) goto done;
+        const float scale = 0.5f;
+        for (uint32_t t = 0; t < tokens; t++) {
+            const uint32_t qpos = pos0 + t;
+            const uint32_t visible = (qpos + 1u) / ratio;
+            std::vector<const float *> rows;
+            rows.push_back(raw + (2u + t) * dim);
+            for (uint32_t k = 0; k < top_k; k++)
+                if (topk[t * top_k + k] < visible)
+                    rows.push_back(comp + topk[t * top_k + k] * dim);
+            std::vector<float> score(rows.size());
+            float max_score = sinks[0];
+            for (size_t i = 0; i < rows.size(); i++) {
+                for (uint32_t d = 0; d < dim; d++) score[i] += q[t * dim + d] * rows[i][d];
+                score[i] *= scale;
+                max_score = std::max(max_score, score[i]);
+            }
+            float denom = std::exp(sinks[0] - max_score);
+            for (float &s : score) { s = std::exp(s - max_score); denom += s; }
+            for (uint32_t d = 0; d < dim; d++) {
+                float want = 0.0f;
+                for (size_t i = 0; i < rows.size(); i++) want += score[i] * rows[i][d];
+                want /= denom;
+                if (std::fabs(got[t * dim + d] - want) > 1e-3f) goto done;
+            }
+        }
+        rc = 0;
+    }
+done:
+    if (tt) ds4_gpu_tensor_free(tt);
+    if (ct) ds4_gpu_tensor_free(ct);
+    if (rt) ds4_gpu_tensor_free(rt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (out) ds4_gpu_tensor_free(out);
+    return rc;
+}
+REGISTER_TEST(indexed_attention_causal_filler, test_indexed_attention_causal_filler);

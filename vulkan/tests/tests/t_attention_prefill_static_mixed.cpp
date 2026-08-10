@@ -224,6 +224,18 @@ static int run_prefill_case(
                 }
             }
         }
+        if (ok && ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+                heads_t, model, model_size, sinks_offset, q_t, raw_t, comp_t,
+                1, n_tokens, n_comp, window, ratio, n_head, 3) != 0) {
+            fprintf(stderr, "attention_prefill_static_mixed[%s]: odd F16 element count was accepted\n", label);
+            ok = false;
+        }
+        if (ok && ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+                heads_t, model, model_size, sinks_offset, q_t, raw_t, comp_t,
+                comp_kv_f16, n_tokens, 4097, window, ratio, n_head, head_dim) != 0) {
+            fprintf(stderr, "attention_prefill_static_mixed[%s]: n_comp > 4096 was accepted\n", label);
+            ok = false;
+        }
     }
 
     if (model) std::free(model);
@@ -285,6 +297,26 @@ static int test_attention_prefill_static_mixed(void) {
     rc |= run_prefill_case(n_tokens, n_comp, n_head, head_dim, window, 0,
                            sinks, qv.data(), kvv.data(), comp_f32, comp_f16, 1,
                            "mixed-ratio0");
+
+    /* A chunk-sized case keeps the static path honest beyond the tiny
+     * correctness vectors while remaining cheap for the kernel harness. */
+    {
+        const uint32_t long_tokens = 32, long_comp = 20;
+        std::vector<float> long_q((uint64_t)long_tokens * n_head * head_dim);
+        std::vector<float> long_raw((uint64_t)long_tokens * head_dim);
+        std::vector<float> long_comp_data((uint64_t)long_comp * head_dim);
+        std::vector<uint16_t> long_comp_half((uint64_t)long_comp * head_dim);
+        for (size_t i = 0; i < long_q.size(); i++) long_q[i] = 0.01f * (float)((i * 17) % 101 - 50);
+        for (size_t i = 0; i < long_raw.size(); i++) long_raw[i] = 0.02f * (float)((i * 13) % 73 - 36);
+        for (size_t i = 0; i < long_comp_data.size(); i++) {
+            long_comp_data[i] = 0.015f * (float)((i * 11) % 89 - 44);
+            long_comp_half[i] = float_to_half(long_comp_data[i]);
+        }
+        rc |= run_prefill_case(long_tokens, long_comp, n_head, head_dim, 16, 4,
+                               sinks, long_q.data(), long_raw.data(),
+                               long_comp_data.data(), long_comp_half.data(), 1,
+                               "static-32-token-mixed");
+    }
 
     /* Case 5: error path - null pointers must return 0. */
     if (ds4_gpu_attention_prefill_static_mixed_heads_tensor(

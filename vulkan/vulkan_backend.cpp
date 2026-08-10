@@ -1262,10 +1262,18 @@ int ds4_gpu_matmul_f16_tensor(
 {
     DS4_VK_TRACE_KERNEL("matmul_f16");
     (void)model_map; (void)model_size;
-    if (!out || !x) return 0;
+    if (!out || !x) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] matmul_f16 missing tensor\n");
+        return 0;
+    }
 
     auto si = g_vk.shader_map.find("matmul_f16");
-    if (si == g_vk.shader_map.end()) return 0;
+    if (si == g_vk.shader_map.end()) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] matmul_f16 shader unavailable\n");
+        return 0;
+    }
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
@@ -1279,7 +1287,18 @@ int ds4_gpu_matmul_f16_tensor(
         return false;
     };
     VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
-    if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
+    if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr,
+                    "ds4: [dbg] matmul_f16 tensor buffer lookup failed "
+                    "in=%llu out=%llu tok=%llu x=%p dst=%p\n",
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    (unsigned long long)n_tok,
+                    x->ptr,
+                    out->ptr);
+        return 0;
+    }
     /* Lazy weight upload with LRU eviction: find the range in the cache or
      * upload it from the model mmap on first use. */
     VkBuffer wbuf; uint64_t wbuf_off;
@@ -1295,9 +1314,27 @@ int ds4_gpu_matmul_f16_tensor(
         wbuf_off = weight_offset - wit->first;
     } else {
         /* W_f16 is a half-precision matrix: 2 bytes per element. */
-        if (!ensure_weight(weight_offset, (uint64_t)out_dim * in_dim * 2u)) return 0;
+        if (!ensure_weight(weight_offset, (uint64_t)out_dim * in_dim * 2u)) {
+            if (getenv("DS4_VULKAN_DEBUG"))
+                fprintf(stderr,
+                        "ds4: [dbg] matmul_f16 weight upload failed "
+                        "offset=%llu bytes=%llu used=%llu budget=%llu gen=%llu\n",
+                        (unsigned long long)weight_offset,
+                        (unsigned long long)((uint64_t)out_dim * in_dim * 2u),
+                        (unsigned long long)g_vk.weight_used,
+                        (unsigned long long)g_vk.weight_budget,
+                        (unsigned long long)g_vk.cmd_gen);
+            return 0;
+        }
         wit = g_vk.weight_cache.find(weight_offset);
-        if (wit == g_vk.weight_cache.end()) return 0;
+        if (wit == g_vk.weight_cache.end()) {
+            if (getenv("DS4_VULKAN_DEBUG"))
+                fprintf(stderr,
+                        "ds4: [dbg] matmul_f16 uploaded weight missing from cache "
+                        "offset=%llu\n",
+                        (unsigned long long)weight_offset);
+            return 0;
+        }
         wbuf = wit->second.buffer;
         wbuf_off = 0;
     }
@@ -1309,7 +1346,14 @@ int ds4_gpu_matmul_f16_tensor(
         dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
         dai.pSetLayouts = &sh.desc_layout;
-        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+        const VkResult alloc_result = vkAllocateDescriptorSets(g_vk.device, &dai, &ds);
+        if (alloc_result != VK_SUCCESS) {
+            if (getenv("DS4_VULKAN_DEBUG"))
+                fprintf(stderr,
+                        "ds4: [dbg] matmul_f16 descriptor allocation failed: %d\n",
+                        alloc_result);
+            return 0;
+        }
     }
     VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(

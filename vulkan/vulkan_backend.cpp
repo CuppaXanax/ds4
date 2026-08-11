@@ -378,6 +378,8 @@ static int load_all_shaders(void) {
         {"swiglu", 16, 6}, {"matmul_f32", 12, 6},
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
+        {"quantize_q8_0_prequant", 12, 2},
+        {"matmul_q8_0_prequant", 16, 3},
         {"group_copy", 24, 6},
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
         {"rms_norm_weight_rows", 12, 6},
@@ -1581,6 +1583,78 @@ int ds4_gpu_matmul_q8_0_tensor(
         if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) return 0;
     }
     return 1;
+}
+
+int ds4_gpu_quantize_q8_0_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        uint64_t in_dim, uint64_t n_tok) {
+    DS4_VK_TRACE_KERNEL("quantize_q8_0_prequant");
+    if (!out || !x || in_dim == 0 || n_tok == 0 || in_dim > UINT32_MAX ||
+        n_tok > 65535u) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks > UINT32_MAX || n_tok > UINT64_MAX / blocks ||
+        n_tok * blocks > UINT64_MAX / 36u ||
+        n_tok * in_dim > x->bytes / sizeof(float) ||
+        n_tok * blocks * 36u > out->bytes) return 0;
+
+    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
+    if (!find_tensor_buffer(x, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
+    const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if ((align && ((xoff | ooff) % align) != 0) ||
+        n_tok * in_dim * sizeof(float) > UINT32_MAX ||
+        n_tok * blocks * 36u > UINT32_MAX) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[2] = {
+        {xbuf, xoff, (VkDeviceSize)(n_tok * in_dim * sizeof(float))},
+        {obuf, ooff, (VkDeviceSize)(n_tok * blocks * 36u)}};
+    struct { uint32_t in_dim, blocks_per_row, n_tok; } pc = {
+        (uint32_t)in_dim, (uint32_t)blocks, (uint32_t)n_tok};
+    return record_simple_shader("quantize_q8_0_prequant", &pc, sizeof(pc),
+                                buffers, 2, (uint32_t)blocks, 1,
+                                (uint32_t)n_tok, resume_recording);
+}
+
+int ds4_gpu_matmul_q8_0_prequant_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x_q8, uint64_t n_tok) {
+    DS4_VK_TRACE_KERNEL("matmul_q8_0_prequant");
+    if (!out || !x_q8 || !model_map || in_dim == 0 || out_dim == 0 ||
+        n_tok == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok > 65535u) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks > UINT32_MAX || out_dim > UINT64_MAX / blocks ||
+        out_dim * blocks > UINT64_MAX / 34u) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    const uint64_t q_bytes = n_tok * blocks * 36u;
+    if (weight_bytes > UINT32_MAX || (weight_bytes & 3u) != 0 ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        q_bytes > x_q8->bytes || n_tok > UINT64_MAX / out_dim ||
+        n_tok * out_dim > out->bytes / sizeof(float)) return 0;
+
+    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
+    if (!find_tensor_buffer(x_q8, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
+    const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((xoff | ooff) % align) != 0) return 0;
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    if (!ensure_weight(weight_offset, weight_bytes)) return 0;
+    auto wit = g_vk.weight_cache.find(weight_offset);
+    if (wit == g_vk.weight_cache.end()) return 0;
+    VkDescriptorBufferInfo buffers[3] = {
+        {xbuf, xoff, (VkDeviceSize)q_bytes},
+        {wit->second.buffer, 0, (VkDeviceSize)weight_bytes},
+        {obuf, ooff, (VkDeviceSize)(n_tok * out_dim * sizeof(float))}};
+    struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row; } pc = {
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks};
+    return record_simple_shader("matmul_q8_0_prequant", &pc, sizeof(pc),
+                                buffers, 3, (uint32_t)out_dim, 1,
+                                (uint32_t)n_tok, resume_recording);
 }
 
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */

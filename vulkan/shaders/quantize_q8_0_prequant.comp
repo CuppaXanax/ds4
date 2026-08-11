@@ -1,0 +1,43 @@
+#version 460 core
+
+/* F32 -> reusable Q8_0 activation rows.
+ * Each block is 36 bytes: uintBitsToFloat(scale), then eight uint words
+ * containing the 32 little-endian int8 values. */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_buf[]; };
+layout(set = 0, binding = 1) buffer QBuf { uint q_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint blocks_per_row;
+    uint n_tok;
+} pc;
+
+void main() {
+    if (gl_LocalInvocationIndex != 0u) return;
+    uint block = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.z;
+    if (block >= pc.blocks_per_row || tok >= pc.n_tok) return;
+
+    uint base = block * 32u;
+    uint count = min(32u, pc.in_dim - base);
+    uint x_off = tok * pc.in_dim + base;
+    float amax = 0.0;
+    for (uint i = 0u; i < count; i++)
+        amax = max(amax, abs(x_buf[x_off + i]));
+    float scale = amax / 127.0;
+    float inv_scale = scale != 0.0 ? 1.0 / scale : 0.0;
+    uint out_off = (tok * pc.blocks_per_row + block) * 9u;
+    q_buf[out_off] = floatBitsToUint(scale);
+    for (uint word = 0u; word < 8u; word++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            uint i = word * 4u + j;
+            int q = 0;
+            if (i < count)
+                q = clamp(int(roundEven(x_buf[x_off + i] * inv_scale)), -128, 127);
+            packed |= (uint(q) & 0xffu) << (j * 8u);
+        }
+        q_buf[out_off + 1u + word] = packed;
+    }
+}

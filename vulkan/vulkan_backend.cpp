@@ -34,11 +34,19 @@
  * PART 1: Vulkan Device State & Infrastructure
  * ===================================================================== */
 
+struct RoutedTimestamp {
+    const char *stage = nullptr;
+    uint32_t first_query = 0;
+};
+
 struct VulkanCommandCtx {
     VkCommandPool   pool     = VK_NULL_HANDLE;
     VkCommandBuffer cmd      = VK_NULL_HANDLE;
     VkFence         fence    = VK_NULL_HANDLE;
     VkSemaphore     semaphore = VK_NULL_HANDLE;
+    VkQueryPool     timestamp_pool = VK_NULL_HANDLE;
+    uint32_t        timestamp_cursor = 0;
+    std::vector<RoutedTimestamp> routed_timestamps;
     uint64_t        event_counter = 0;
     uint32_t        command_count = 0;
     bool            submitted = false;
@@ -132,6 +140,8 @@ static struct {
     uint32_t            expert_cache_budget = 0;
     uint64_t            expert_cache_expert_bytes = 0;
     uint32_t            streamed_experts = 0;
+    float               timestamp_period_ns = 0.0f;
+    uint32_t            timestamp_valid_bits = 0;
     bool                initialized    = false;
 } g_vk;
 
@@ -241,6 +251,10 @@ static int create_logical_device(void) {
         if (qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qf = i; break; }
     if (qf < 0) { fprintf(stderr, "ds4: VULKAN no compute queue\n"); return -1; }
     g_vk.queue_family = qf;
+    g_vk.timestamp_valid_bits = qprops[qf].timestampValidBits;
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g_vk.phys_device, &props);
+    g_vk.timestamp_period_ns = props.limits.timestampPeriod;
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -442,8 +456,44 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     if (vkCreateFence(g_vk.device, &fci, nullptr, &ctx.fence) != VK_SUCCESS) abort();
     VkSemaphoreCreateInfo sci{}; sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     if (vkCreateSemaphore(g_vk.device, &sci, nullptr, &ctx.semaphore) != VK_SUCCESS) abort();
+    if (getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") && g_vk.timestamp_valid_bits != 0) {
+        VkQueryPoolCreateInfo qpci{};
+        qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 256;
+        if (vkCreateQueryPool(g_vk.device, &qpci, nullptr,
+                              &ctx.timestamp_pool) != VK_SUCCESS) {
+            fprintf(stderr, "ds4: VULKAN routed timestamp query pool unavailable\n");
+        }
+    }
     g_vk.cmd_ctxs[tid] = ctx;
     return g_vk.cmd_ctxs[tid];
+}
+
+static void report_routed_timestamps(VulkanCommandCtx &ctx) {
+    if (ctx.timestamp_pool == VK_NULL_HANDLE || ctx.routed_timestamps.empty()) return;
+    std::vector<uint64_t> ticks(ctx.timestamp_cursor);
+    VkResult result = vkGetQueryPoolResults(
+        g_vk.device, ctx.timestamp_pool, 0, ctx.timestamp_cursor,
+        ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "ds4: VULKAN routed timestamp read failed: %d\n", result);
+        ctx.routed_timestamps.clear();
+        return;
+    }
+    const uint64_t mask = g_vk.timestamp_valid_bits >= 64
+        ? UINT64_MAX : ((1ull << g_vk.timestamp_valid_bits) - 1ull);
+    fprintf(stderr, "ds4: VULKAN routed_moe_gpu_ms");
+    for (const RoutedTimestamp &timestamp : ctx.routed_timestamps) {
+        const uint64_t begin = ticks[timestamp.first_query] & mask;
+        const uint64_t end = ticks[timestamp.first_query + 1] & mask;
+        const uint64_t elapsed = (end - begin) & mask;
+        const double ms = (double)elapsed * g_vk.timestamp_period_ns / 1.0e6;
+        fprintf(stderr, " %s=%.3f", timestamp.stage, ms);
+    }
+    fputc('\n', stderr);
+    ctx.routed_timestamps.clear();
 }
 
 static int begin_cmd(void) {
@@ -451,6 +501,7 @@ static int begin_cmd(void) {
     if (c.recording) return 1;
     if (c.submitted) {
         VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+        report_routed_timestamps(c);
         VK_CHECK_RAW(vkResetFences(g_vk.device, 1, &c.fence));
         c.submitted = false;
         /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
@@ -465,6 +516,11 @@ static int begin_cmd(void) {
         } else {
             c.cmd_rot_idx = (c.cmd_rot_idx + 1) % 4;
         }
+    }
+    if (c.timestamp_pool != VK_NULL_HANDLE) {
+        vkResetQueryPool(g_vk.device, c.timestamp_pool, 0, 256);
+        c.timestamp_cursor = 0;
+        c.routed_timestamps.clear();
     }
     /* Allocate or reuse CB */
     VkCommandBuffer &cb = c.cmd_rots[c.cmd_rot_idx];
@@ -520,6 +576,7 @@ static int wait_cmd(void) {
     auto &c = get_cmd_ctx();
     if (!c.submitted) return 1;
     VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+    report_routed_timestamps(c);
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
         (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
@@ -633,6 +690,7 @@ void ds4_gpu_cleanup(void) {
     if (!g_vk.initialized) return;
     vkDeviceWaitIdle(g_vk.device);
     for (auto &[_, c] : g_vk.cmd_ctxs) {
+        if (c.timestamp_pool) vkDestroyQueryPool(g_vk.device, c.timestamp_pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
         if (c.fence) vkDestroyFence(g_vk.device, c.fence, nullptr);
         if (c.pool) vkDestroyCommandPool(g_vk.device, c.pool, nullptr);
@@ -4500,7 +4558,6 @@ static bool ds4gk_routed_dispatch(const char *stage,
                                   VkDescriptorBufferInfo *buffers,
                                   uint32_t gx, uint32_t gy, uint32_t gz,
                                   std::vector<VkDescriptorSet> &sets) {
-    (void)stage;
     auto si = g_vk.shader_map.find("routed_moe");
     if (si == g_vk.shader_map.end()) return false;
     auto &ctx = get_cmd_ctx();
@@ -4513,6 +4570,13 @@ static bool ds4gk_routed_dispatch(const char *stage,
                             shader.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
+    uint32_t first_query = UINT32_MAX;
+    if (ctx.timestamp_pool != VK_NULL_HANDLE && ctx.timestamp_cursor <= 254) {
+        first_query = ctx.timestamp_cursor;
+        ctx.timestamp_cursor += 2;
+        vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            ctx.timestamp_pool, first_query);
+    }
     vkCmdDispatch(ctx.cmd, gx, gy, gz);
     ctx.command_count++;
     VkMemoryBarrier barrier{};
@@ -4522,6 +4586,16 @@ static bool ds4gk_routed_dispatch(const char *stage,
     vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
                          0, nullptr, 0, nullptr);
+    if (first_query != UINT32_MAX) {
+        vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            ctx.timestamp_pool, first_query + 1);
+        ctx.routed_timestamps.push_back({stage, first_query});
+        /* Profiling mode serializes query boundaries so adjacent dispatch
+         * intervals cannot overlap or double-count GPU time. */
+        vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr,
+                             0, nullptr, 0, nullptr);
+    }
     sets.push_back(set);
     return true;
 }
@@ -4684,7 +4758,7 @@ static bool ds4gk_routed_common(
         pc.mode = 1;
         VkDescriptorBufferInfo gate_buffers[6] = {
             q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
-        ok = ds4gk_routed_dispatch("gate_up", pc,
+        ok = ds4gk_routed_dispatch("gate", pc,
             gate_buffers,
             expert_mid_dim, n_tokens, n_expert, sets);
         if (ok) {
@@ -4710,7 +4784,7 @@ static bool ds4gk_routed_common(
         pc.n_tokens = n_tokens * n_expert;
         VkDescriptorBufferInfo mid_quantize_buffers[6] = {
             mid_info, mid_info, mid_info, mid_info, q8_info, q8_info};
-        ok = ds4gk_routed_dispatch("quantize_mid", pc,
+        ok = ds4gk_routed_dispatch("requantization", pc,
             mid_quantize_buffers,
             mid_blocks, n_tokens * n_expert, 1, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
@@ -4742,7 +4816,7 @@ static bool ds4gk_routed_common(
         pc.mode = 4; pc.add_enabled = add_in ? 1u : 0u;
         VkDescriptorBufferInfo reduce_buffers[6] = {
             add_info, exp_info, out_info, out_info, out_info, out_info};
-        ok = ds4gk_routed_dispatch("reduce", pc,
+        ok = ds4gk_routed_dispatch("reduction", pc,
             reduce_buffers,
             (out_dim + 255u) / 256u, n_tokens, 1, sets);
     }

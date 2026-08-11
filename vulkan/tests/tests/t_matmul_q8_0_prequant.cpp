@@ -92,8 +92,7 @@ static int test_matmul_q8_0_prequant() {
         ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(x);
         return rc;
     };
-    if (!ds4_gpu_set_model_map(model.data(), model.size()) ||
-        !ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)) ||
+    if (!ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)) ||
         !ds4_gpu_begin_commands() ||
         !ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok) ||
         !ds4_gpu_end_commands()) return cleanup();

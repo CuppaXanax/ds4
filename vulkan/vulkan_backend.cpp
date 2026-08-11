@@ -1666,6 +1666,8 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         (q_bytes > g_vk.caps.max_storage_buffer_range ||
          weight_bytes > g_vk.caps.max_storage_buffer_range ||
          output_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
     auto &ctx = get_cmd_ctx();
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;

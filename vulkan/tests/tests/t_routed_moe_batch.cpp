@@ -549,7 +549,7 @@ static int test_routed_moe_batch(void) {
         const uint32_t n_tokens = 2;
         const float clamp = 0.25f;
         const uint64_t gate_row_bytes = 66;          /* 1 IQ2_XXS block */
-        const uint64_t down_row_bytes = 84;          /* 1 Q2_K block */
+        const uint64_t down_row_bytes = 8 * 84;      /* 8 Q2_K blocks */
         const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
         const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
         const uint64_t header = 16;
@@ -575,21 +575,24 @@ static int test_routed_moe_batch(void) {
                             &blk, sizeof(blk));
             }
             for (uint32_t r2 = 0; r2 < out_dim; r2++) {
-                q2k_block blk;
-                blk.d = f32_to_f16(0.125f);
-                blk.dmin = 0;
-                for (uint32_t g = 0; g < 16; g++) blk.scales[g] = 0x02;   /* scale 2 */
-                for (uint32_t k = 0; k < 64; k++) {
-                    uint8_t byte = 0;
-                    for (uint32_t t = 0; t < 4; t++) {
-                        const uint32_t i = k * 4 + t;
-                        const uint32_t q = (i * 3 + r2 * 7 + e * 11) % 4;
-                        byte |= (uint8_t)(q << (2 * t));
+                for (uint32_t b = 0; b < 8; b++) {
+                    q2k_block blk;
+                    blk.d = f32_to_f16(0.125f);
+                    blk.dmin = 0;
+                    for (uint32_t g = 0; g < 16; g++) blk.scales[g] = 0x02;   /* scale 2 */
+                    for (uint32_t k = 0; k < 64; k++) {
+                        uint8_t byte = 0;
+                        for (uint32_t t = 0; t < 4; t++) {
+                            const uint32_t i = b * 256 + k * 4 + t;
+                            const uint32_t q = (i * 3 + r2 * 7 + e * 11) % 4;
+                            byte |= (uint8_t)(q << (2 * t));
+                        }
+                        blk.qs[k] = byte;
                     }
-                    blk.qs[k] = byte;
+                    std::memcpy(model.data() + down_offset + (uint64_t)e * down_expert_bytes +
+                                (uint64_t)r2 * down_row_bytes + (uint64_t)b * sizeof(blk),
+                                &blk, sizeof(blk));
                 }
-                std::memcpy(model.data() + down_offset + (uint64_t)e * down_expert_bytes + (uint64_t)r2 * down_row_bytes,
-                            &blk, sizeof(blk));
             }
         }
 

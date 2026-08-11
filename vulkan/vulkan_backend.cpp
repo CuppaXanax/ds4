@@ -4600,6 +4600,14 @@ static bool ds4gk_routed_dispatch(const char *stage,
     return true;
 }
 
+static uint32_t ds4gk_routed_projection_groups(uint32_t rows,
+                                               uint32_t blocks) {
+    uint32_t lanes = 8;
+    while (lanes < blocks && lanes < 256u) lanes <<= 1u;
+    const uint32_t rows_per_group = 256u / lanes;
+    return (rows + rows_per_group - 1u) / rows_per_group;
+}
+
 static bool ds4gk_routed_flush(std::vector<VkDescriptorSet> &sets) {
     if (sets.empty()) return true;
     bool ok = submit_and_wait() != 0;
@@ -4760,13 +4768,16 @@ static bool ds4gk_routed_common(
             q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
         ok = ds4gk_routed_dispatch("gate", pc,
             gate_buffers,
-            expert_mid_dim, n_tokens, n_expert, sets);
+            ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
+            n_tokens, n_expert, sets);
         if (ok) {
             pc.add_enabled = 1;
             VkDescriptorBufferInfo up_buffers[6] = {
                 q8_info, up_model, up_model, selected_info, up_info, up_info};
             ok = ds4gk_routed_dispatch("up", pc,
-                up_buffers, expert_mid_dim, n_tokens, n_expert, sets);
+                up_buffers,
+                ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
+                n_tokens, n_expert, sets);
             pc.add_enabled = 0;
         }
     }
@@ -4804,7 +4815,8 @@ static bool ds4gk_routed_common(
             q8_info, down_model, down_model, selected_info, exp_info, exp_info};
         ok = ds4gk_routed_dispatch("down", pc,
             down_buffers,
-            out_dim, n_tokens, n_expert, sets);
+            ds4gk_routed_projection_groups(out_dim, pc.q8_blocks),
+            n_tokens, n_expert, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
             ok = ds4gk_routed_flush(sets);
             float value = 0.0f;

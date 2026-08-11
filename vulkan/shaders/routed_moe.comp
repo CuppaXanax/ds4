@@ -165,6 +165,18 @@ float reduce_sum(float value) {
     return q8_values[0];
 }
 
+float reduce_row_sum(float value, uint lanes_per_row) {
+    uint lid = gl_LocalInvocationIndex;
+    uint lane = lid & (lanes_per_row - 1u);
+    q8_values[lid] = value;
+    barrier();
+    for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) q8_values[lid] += q8_values[lid + stride];
+        barrier();
+    }
+    return q8_values[lid - lane];
+}
+
 void main() {
     uint lid = gl_LocalInvocationIndex;
     uint token = gl_WorkGroupID.y;
@@ -216,25 +228,36 @@ void main() {
         return;
     }
     if (pc.mode == 1u) {
-        uint row = gl_WorkGroupID.x;
+        uint lanes_per_row = pc.q8_blocks <= 8u ? 8u :
+                             pc.q8_blocks <= 16u ? 16u :
+                             pc.q8_blocks <= 32u ? 32u :
+                             pc.q8_blocks <= 64u ? 64u :
+                             pc.q8_blocks <= 128u ? 128u : 256u;
+        uint lane = lid & (lanes_per_row - 1u);
+        uint rows_per_group = 256u / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + lid / lanes_per_row;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected) return;
+        bool row_valid = row < pc.mid_dim;
         uint expert = b3[token * pc.n_selected + rank];
         if (expert >= pc.n_total_expert) {
-            if (lid == 0u) b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u;
+            if (row_valid && lane == 0u)
+                b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u;
             return;
         }
         uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
         float partial = 0.0;
-        for (uint block = lid; block < pc.q8_blocks; block += 256u) {
-            partial += pc.gate_type == 8u
-                ? q8_0_block_dot(rb, token, pc.q8_blocks, block)
-                : (pc.gate_type == 16u
-                    ? iq2_block_dot(rb, token, pc.q8_blocks, block)
-                    : q2_block_dot(rb, token, pc.q8_blocks, block));
+        if (row_valid) {
+            for (uint block = lane; block < pc.q8_blocks; block += lanes_per_row) {
+                partial += pc.gate_type == 8u
+                    ? q8_0_block_dot(rb, token, pc.q8_blocks, block)
+                    : (pc.gate_type == 16u
+                        ? iq2_block_dot(rb, token, pc.q8_blocks, block)
+                        : q2_block_dot(rb, token, pc.q8_blocks, block));
+            }
         }
-        float g = reduce_sum(partial);
-        if (lid == 0u) {
+        float g = reduce_row_sum(partial, lanes_per_row);
+        if (row_valid && lane == 0u) {
             if (pc.clamp_value > 1.0e-6) {
                 g = pc.add_enabled != 0u
                     ? clamp(g, -pc.clamp_value, pc.clamp_value)
@@ -257,26 +280,37 @@ void main() {
         return;
     }
     if (pc.mode == 3u) {
-        uint row = gl_WorkGroupID.x;
+        uint lanes_per_row = pc.q8_blocks <= 8u ? 8u :
+                             pc.q8_blocks <= 16u ? 16u :
+                             pc.q8_blocks <= 32u ? 32u :
+                             pc.q8_blocks <= 64u ? 64u :
+                             pc.q8_blocks <= 128u ? 128u : 256u;
+        uint lane = lid & (lanes_per_row - 1u);
+        uint rows_per_group = 256u / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + lid / lanes_per_row;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected) return;
+        bool row_valid = row < pc.out_dim;
         uint expert = b3[token * pc.n_selected + rank];
         if (expert >= pc.n_total_expert) {
-            if (lid == 0u) b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u;
+            if (row_valid && lane == 0u)
+                b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u;
             return;
         }
         uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
         uint q8_token = token * pc.n_selected + rank;
         float partial = 0.0;
-        for (uint block = lid; block < pc.q8_blocks; block += 256u) {
-            partial += pc.down_type == 8u
-                ? q8_0_block_dot(rb, q8_token, pc.q8_blocks, block)
-                : (pc.down_type == 16u
-                    ? iq2_block_dot(rb, q8_token, pc.q8_blocks, block)
-                    : q2_block_dot(rb, q8_token, pc.q8_blocks, block));
+        if (row_valid) {
+            for (uint block = lane; block < pc.q8_blocks; block += lanes_per_row) {
+                partial += pc.down_type == 8u
+                    ? q8_0_block_dot(rb, q8_token, pc.q8_blocks, block)
+                    : (pc.down_type == 16u
+                        ? iq2_block_dot(rb, q8_token, pc.q8_blocks, block)
+                        : q2_block_dot(rb, q8_token, pc.q8_blocks, block));
+            }
         }
-        float v = reduce_sum(partial);
-        if (lid == 0u)
+        float v = reduce_row_sum(partial, lanes_per_row);
+        if (row_valid && lane == 0u)
             b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
         return;
     }

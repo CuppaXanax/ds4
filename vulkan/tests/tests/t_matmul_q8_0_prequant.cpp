@@ -105,7 +105,7 @@ static int test_matmul_q8_0_prequant() {
     for (uint32_t i = 0; i < 36u; i++)
         if (zero_block[i] != 0) return cleanup();
     const uint8_t *tail_block = packed.data() + 36u;
-    for (uint32_t i = 4u + 15u; i < 36u; i++)
+    for (uint32_t i = 4u + 16u; i < 36u; i++)
         if (tail_block[i] != 0) return cleanup();
 
     if (!ds4_gpu_begin_commands() ||

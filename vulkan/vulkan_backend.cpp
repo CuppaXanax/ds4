@@ -1482,10 +1482,15 @@ int ds4_gpu_matmul_q8_0_tensor(
         n_tok > UINT64_MAX / out_dim ||
         out_dim * n_tok > out->bytes / sizeof(float)) return 0;
 
-    if (getenv("DS4_VULKAN_Q8_PREQUANT") &&
-        strcmp(getenv("DS4_VULKAN_Q8_PREQUANT"), "1") == 0) {
-        if (n_tok > UINT64_MAX / n_blocks ||
-            n_tok * n_blocks > UINT64_MAX / 36u) return 0;
+    const char *prequant = getenv("DS4_VULKAN_Q8_PREQUANT");
+    const bool prequant_eligible =
+        n_tok <= 65535u && n_blocks <= 256u &&
+        n_tok <= UINT64_MAX / n_blocks &&
+        n_tok * n_blocks <= UINT64_MAX / 36u &&
+        n_tok * n_blocks * 36u <= UINT32_MAX &&
+        g_vk.caps.max_compute_work_group_size[0] >= 256u &&
+        g_vk.caps.max_compute_work_group_invocations >= 256u;
+    if (prequant && strcmp(prequant, "1") == 0 && prequant_eligible) {
         ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * n_blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -1702,12 +1707,15 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
-    if (!ensure_weight(weight_offset, weight_bytes)) return 0;
-    auto wit = g_vk.weight_cache.find(weight_offset);
-    if (wit == g_vk.weight_cache.end()) return 0;
+    VkBuffer weight_buffer = VK_NULL_HANDLE;
+    VkDeviceSize weight_buffer_offset = 0;
+    VkDeviceSize weight_range = 0;
+    if (!find_model_buffer(weight_offset, weight_bytes, weight_buffer,
+                           weight_buffer_offset, weight_range) ||
+        (align && weight_buffer_offset % align != 0)) return 0;
     VkDescriptorBufferInfo buffers[3] = {
         {xbuf, xoff, (VkDeviceSize)q_bytes},
-        {wit->second.buffer, 0, (VkDeviceSize)weight_bytes},
+        {weight_buffer, weight_buffer_offset, weight_range},
         {obuf, ooff, (VkDeviceSize)(n_tok * out_dim * sizeof(float))}};
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks, y_scale};

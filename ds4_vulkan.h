@@ -28,6 +28,7 @@ struct ds4_vulkan_shader_cache;
 struct ds4_vulkan_pipeline_cache;
 struct ds4_vulkan_descriptor_cache;
 struct ds4_vulkan_submission;
+struct ds4_gpu_tensor;
 
 /* -----------------------------------------------------------------------
  * Backend capability flags set during ds4_gpu_init()
@@ -282,6 +283,25 @@ struct ds4_gpu_tensor    *ds4_vulkan_tensor_to_gpu(struct ds4_vulkan_tensor *vt)
 /* Debug / reporting */
 void ds4_vulkan_print_memory_report(const char *label);
 void ds4_vulkan_report_caps(void);
+
+/* Diagnostic Vulkan path: quantize F32 rows once into padded Q8_0 blocks.
+ * Each block is exactly 36 bytes: F32 scale followed by 32 packed int8 values. */
+int ds4_gpu_quantize_q8_0_tensor(
+    struct ds4_gpu_tensor *out,
+    const struct ds4_gpu_tensor *x,
+    uint64_t in_dim,
+    uint64_t n_tok);
+
+/* Consume the reusable Q8 activation blocks against a GGUF Q8_0 matrix. */
+int ds4_gpu_matmul_q8_0_prequant_tensor(
+    struct ds4_gpu_tensor *out,
+    const void *model_map,
+    uint64_t model_size,
+    uint64_t weight_offset,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const struct ds4_gpu_tensor *x_q8,
+    uint64_t n_tok);
 
 #ifdef __cplusplus
 }

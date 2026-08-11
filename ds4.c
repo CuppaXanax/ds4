@@ -3004,7 +3004,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     return true;
 }
 
-static bool accelerator_cache_q8_tensors(const ds4_model *m,
+static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
                                          const uint64_t *span_offsets,
                                          const uint64_t *span_sizes,
                                          uint32_t span_count) {

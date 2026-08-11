@@ -5543,7 +5543,12 @@ int ds4_gpu_compressor_prefill_tensor(
         head_dim == 0 || ratio == 0 || ratio > 4u || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u || n_tokens > 65535u)
+    {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] compressor_prefill invalid args head=%u ratio=%u tokens=%u rot=%u ape=%u norm=%u\n",
+                    head_dim, ratio, n_tokens, n_rot, ape_type, norm_type);
         return 0;
+    }
     const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
     const uint32_t state_rows = (ratio == 4u ? 2u : 1u) * ratio;
     const uint32_t n_comp = n_tokens / ratio;
@@ -5558,12 +5563,25 @@ int ds4_gpu_compressor_prefill_tensor(
         norm_offset > model_size || norm_bytes > model_size - norm_offset ||
         kv->bytes < kv_bytes || sc->bytes < kv_bytes ||
         state_kv->bytes < state_bytes || state_score->bytes < state_bytes ||
-        (n_comp != 0 && comp_cache->bytes < comp_bytes)) return 0;
+        (n_comp != 0 && comp_cache->bytes < comp_bytes)) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] compressor_prefill bounds comp=%llu/%llu state=%llu/%llu kv=%llu/%llu\n",
+                    (unsigned long long)comp_cache->bytes, (unsigned long long)comp_bytes,
+                    (unsigned long long)state_kv->bytes, (unsigned long long)state_bytes,
+                    (unsigned long long)kv->bytes, (unsigned long long)kv_bytes);
+        return 0;
+    }
     set_model_map_identity(model_map, model_size);
     VkBuffer ape_buf; VkDeviceSize ape_off, ape_range;
-    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) return 0;
+    if (!find_model_buffer(ape_offset, ape_bytes, ape_buf, ape_off, ape_range)) {
+        if (getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill ape upload failed\n");
+        return 0;
+    }
     if (!compressor_clear_vk(state_kv, state_score, state_rows * width,
-                             0.0f, -INFINITY)) return 0;
+                             0.0f, -INFINITY)) {
+        if (getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill clear failed\n");
+        return 0;
+    }
     int ok = 1;
     if (ratio == 4u) {
         if (cutoff >= ratio)
@@ -5583,16 +5601,23 @@ int ds4_gpu_compressor_prefill_tensor(
         ok = compressor_pool_vk(comp_cache, kv, sc, state_kv, state_score,
                                 ape_buf, ape_off, ape_type, head_dim, ratio, pos0,
                                 n_comp, false);
+    if (!ok && getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill pool/state failed\n");
+    if (!ok) return 0;
     if (ok && n_comp != 0)
         ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache, model_map,
                                                   model_size, norm_offset, head_dim,
                                                   n_comp, rms_eps);
+    if (!ok && getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill norm failed\n");
+    if (!ok) return 0;
     if (ok && n_comp != 0 && n_rot != 0)
         ok = compressor_rope_stride_vk(comp_cache, n_comp, head_dim, n_rot, pos0, ratio,
                                        n_ctx_orig, freq_base, freq_scale, ext_factor,
                                        attn_factor, beta_fast, beta_slow);
+    if (!ok && getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill rope failed\n");
+    if (!ok) return 0;
     if (ok && n_comp != 0 && quantize_fp8)
         ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot);
+    if (!ok && getenv("DS4_VULKAN_DEBUG")) fprintf(stderr, "ds4: [dbg] compressor_prefill fp8 failed\n");
     return ok;
 #if 0
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||

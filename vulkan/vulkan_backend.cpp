@@ -1562,14 +1562,8 @@ int ds4_gpu_matmul_q8_0_tensor(
         vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
         vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
         vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
-        uint32_t lanes_per_row = 8u;
-        while (lanes_per_row < n_blocks && lanes_per_row < 256u)
-            lanes_per_row <<= 1u;
-        const uint32_t rows_per_group = 256u / lanes_per_row;
-        const uint32_t row_groups =
-            ((uint32_t)out_dim + rows_per_group - 1u) / rows_per_group;
-        const uint32_t y_scale = std::min(row_groups, 65534u);
-        const uint32_t y_cnt = (row_groups + y_scale - 1u) / y_scale;
+        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
+        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
         struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
             (uint32_t)in_dim, (uint32_t)out_dim, tile_n, (uint32_t)n_blocks, y_scale
         };

@@ -2,9 +2,8 @@
 
 /* Q8_0 matrix-vector: out[tok][row] = Q8_0(x[tok][*]) · W_Q8[row][*]
  *
- * Grid: packed output-row groups split over x/y, with one z slice per token.
- * Rows use the smallest power-of-two lane count covering their quant blocks,
- * so narrow decode projections share a 256-lane workgroup.
+ * Grid: (y_scale, ceil(out_dim/y_scale), n_tok). 2D grid for out_dim up to 4G.
+ * row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale
  *
  * Q8_0 block (GGUF, matches ds4.c / ds4_test.c): 34 bytes =
  *   f16 scale d (2 bytes) + int8 qs[32] (32 bytes).
@@ -72,28 +71,19 @@ int i8_at(uint byte_idx) {
 }
 
 void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale;
     uint tok = gl_WorkGroupID.z;
     uint lid = gl_LocalInvocationIndex;
-    uint lanes_per_row = pc.blocks_per_row <= 8u ? 8u :
-                         pc.blocks_per_row <= 16u ? 16u :
-                         pc.blocks_per_row <= 32u ? 32u :
-                         pc.blocks_per_row <= 64u ? 64u :
-                         pc.blocks_per_row <= 128u ? 128u : 256u;
-    uint lane = lid & (lanes_per_row - 1u);
-    uint rows_per_group = 256u / lanes_per_row;
-    uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale;
-    uint row = group * rows_per_group + lid / lanes_per_row;
 
-    if (tok >= pc.n_tok) return;
-    bool row_valid = row < pc.out_dim;
+    if (row >= pc.out_dim || tok >= pc.n_tok) return;
 
     float weight_scale = 0.0;
     float activation_scale = 0.0;
     int block_dot = 0;
-    if (row_valid && lane < pc.blocks_per_row) {
-        uint blk_off = (row * pc.blocks_per_row + lane) * 34u;
+    if (lid < pc.blocks_per_row) {
+        uint blk_off = (row * pc.blocks_per_row + lid) * 34u;
         uint scale_bits = byte_at(blk_off) | (byte_at(blk_off + 1u) << 8u);
-        uint base = lane * 32u;
+        uint base = lid * 32u;
         uint count = min(32u, pc.in_dim - base);
         uint x_off = tok * pc.in_dim + base;
         float amax = 0.0;
@@ -112,13 +102,10 @@ void main() {
     block_dots[lid] = block_dot;
     barrier();
 
-    if (row_valid && lane == 0u) {
+    if (lid == 0u) {
         float sum = 0.0;
-        uint shared_base = lid - lane;
         for (uint b = 0u; b < pc.blocks_per_row; b++)
-            sum += weight_scales[shared_base + b] *
-                   activation_scales[shared_base + b] *
-                   float(block_dots[shared_base + b]);
+            sum += weight_scales[b] * activation_scales[b] * float(block_dots[b]);
         out_buf[tok * pc.out_dim + row] = sum;
     }
 }

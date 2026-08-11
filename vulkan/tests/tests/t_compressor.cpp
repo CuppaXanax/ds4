@@ -289,7 +289,8 @@ static void ref_prefill_pool(std::vector<float> &comp, const std::vector<float> 
     const uint32_t width = coff * head_dim;
     for (uint32_t c = 0; c < n_comp; c++) {
         for (uint32_t d = 0; d < head_dim; d++) {
-            float vals[8], scores[8];
+            std::vector<float> vals(ratio == 4u ? 8u : ratio);
+            std::vector<float> scores(vals.size());
             uint32_t n_cand = 0;
             float max_s = -INFINITY;
             if (ratio == 4u) {

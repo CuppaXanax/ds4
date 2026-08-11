@@ -136,7 +136,7 @@ which includes `_impl_gen.cpp` (no-op stubs) at the end.
   regenerated with `python3 vulkan/kernel_status.py >> vulkan/STATUS.md`
   (after truncating the old table).
 - Harness compile command (no GPU needed):
-  `g++ -O2 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include -DDS4_VULKAN_BUILD vulkan/tests/harness.cpp vulkan/tests/tests.cpp vulkan/tests/tests/*.cpp vulkan/vulkan_backend.cpp -lm -pthread -lvulkan -o vulkan-tests`
+  `g++ -O2 -g -std=c++17 -pthread -I. -Ivulkan -Ivulkan/include -DDS4_VULKAN_BUILD vulkan/tests/harness.cpp vulkan/tests/tests.cpp vulkan/tests/tests/*.cpp vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.cpp -lm -pthread -lvulkan -o vulkan-tests`
 - `ds4_gpu_add_tensor` is a CPU-hosted implementation (host add on mapped
   memory), NOT a GPU dispatch — do not assume "real" means GPU.
 

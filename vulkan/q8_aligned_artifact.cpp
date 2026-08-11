@@ -18,8 +18,8 @@ int ds4_vulkan_q8_aligned_build(
     ds4_vulkan_q8_aligned_artifact *artifact, const void *model_map,
     uint64_t model_size, uint64_t source_offset, uint64_t in_dim,
     uint64_t out_dim, uint64_t min_storage_buffer_offset_alignment) {
-    if (!artifact || !model_map || !ds4_vulkan_q8_aligned_enabled() ||
-        in_dim == 0 || out_dim == 0 || min_storage_buffer_offset_alignment == 0)
+    if (!artifact || !model_map || in_dim == 0 || out_dim == 0 ||
+        min_storage_buffer_offset_alignment == 0)
         return 0;
     if (in_dim > 8192 || in_dim > UINT64_MAX - 31) return 0;
     const uint64_t blocks = (in_dim + 31) / 32;

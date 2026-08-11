@@ -1,44 +1,78 @@
-#version 450
+#version 460 core
 
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
-layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; };
-layout(set = 0, binding = 1, std430) readonly buffer S { uint scale[]; };
-layout(set = 0, binding = 2, std430) readonly buffer W { int payload[]; };
-layout(set = 0, binding = 3, std430) buffer Y { float y[]; };
+/* Q8_0 matrix-vector using reusable 36-byte activation blocks and a lossless
+ * weight artifact split into contiguous f16 scales and aligned int8 blocks. */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf { float out_buf[]; };
 
-layout(push_constant) uniform Params {
+layout(push_constant) uniform PC {
     uint in_dim;
     uint out_dim;
     uint n_tok;
-    uint blocks;
+    uint blocks_per_row;
     uint y_scale;
-} p;
+} pc;
 
-float half_value(uint word) { return unpackHalf2x16(word).x; }
+shared float weight_scales[256];
+shared float activation_scales[256];
+shared int block_dots[256];
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    uint value = (payload_buf[word] >> (byte_index * 8u)) & 0xffu;
+    return value < 128u ? int(value) : int(value) - 256;
+}
+
+int x_i8(uint word, uint byte_index) {
+    uint value = (x_q8_buf[word] >> (byte_index * 8u)) & 0xffu;
+    return value < 128u ? int(value) : int(value) - 256;
+}
 
 void main() {
-    uint row = gl_WorkGroupID.x;
-    uint output_row = gl_WorkGroupID.y * p.y_scale + row;
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale;
     uint token = gl_WorkGroupID.z;
-    if (output_row >= p.out_dim || token >= p.n_tok) return;
-    float sum = 0.0;
-    for (uint block = 0; block < p.blocks; ++block) {
-        uint count = min(32u, p.in_dim - block * 32u);
-        float amax = 0.0;
-        for (uint i = 0; i < count; ++i)
-            amax = max(amax, abs(x[token * p.in_dim + block * 32u + i]));
-        float activation_scale = amax / 127.0;
-        float inverse = activation_scale != 0.0 ? 1.0 / activation_scale : 0.0;
-        int dot = 0;
-        uint record = output_row * p.blocks + block;
-        for (uint i = 0; i < count; ++i) {
-            int q = int(round(clamp(x[token * p.in_dim + block * 32u + i] * inverse,
-                                    -128.0, 127.0)));
-            int w = int((uint(W.payload[record * 8u + i / 4u]) >> ((i % 4u) * 8u)) & 255u);
-            if (w >= 128) w -= 256;
-            dot += w * q;
+    uint lid = gl_LocalInvocationIndex;
+    if (row >= pc.out_dim || token >= pc.n_tok) return;
+
+    float weight_scale = 0.0;
+    float activation_scale = 0.0;
+    int block_dot = 0;
+    if (lid < pc.blocks_per_row) {
+        uint record = row * pc.blocks_per_row + lid;
+        uint scale_word = scale_buf[record >> 1u];
+        uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+        uint x_off = (token * pc.blocks_per_row + lid) * 9u;
+        uint count = min(32u, pc.in_dim - lid * 32u);
+        for (uint i = 0u; i < count; i++) {
+            block_dot += i8_at(record * 8u + (i >> 2u), i & 3u) *
+                         x_i8(x_off + 1u + (i >> 2u), i & 3u);
         }
-        sum += half_value(S.scale[record / 2u] >> ((record % 2u) * 16u)) * activation_scale * float(dot);
+        weight_scale = f16tof32(scale_bits);
+        activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
     }
-    y[token * p.out_dim + output_row] = sum;
+    weight_scales[lid] = weight_scale;
+    activation_scales[lid] = activation_scale;
+    block_dots[lid] = block_dot;
+    barrier();
+
+    if (lid == 0u) {
+        float sum = 0.0;
+        for (uint block = 0u; block < pc.blocks_per_row; block++)
+            sum += weight_scales[block] * activation_scales[block] *
+                   float(block_dots[block]);
+        out_buf[token * pc.out_dim + row] = sum;
+    }
 }

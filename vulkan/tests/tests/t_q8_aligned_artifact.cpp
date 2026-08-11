@@ -1,5 +1,5 @@
 #include "../tests.h"
-#include "../../ds4_gpu.h"
+#include "../../../ds4_gpu.h"
 #include "../../q8_aligned_artifact.h"
 
 #include <cmath>

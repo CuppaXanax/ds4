@@ -67,98 +67,102 @@ float q8_value(uint token, uint block, uint i) {
 }
 
 /* Q8_0 activations use a padded 36-byte temporary block: f32 d + qs[32]. */
-float q8_0_dot(uint row_byte, uint input_token, uint input_blocks) {
+float q8_0_block_dot(uint row_byte, uint input_token, uint input_blocks,
+                     uint block) {
+    uint wb = row_byte + block * 34u;
+    uint xb = input_token * input_blocks * 36u + block * 36u;
+    uint wscale = weight_byte(wb, 0xffffffffu) |
+              (weight_byte(wb + 1u, 0xffffffffu) << 8u);
+    float d = f16(wscale) * uintBitsToFloat(b0[xb / 4u]);
+    uint count = min(32u, pc.in_dim - block * 32u);
     float total = 0.0;
-    for (uint block = 0u; block < input_blocks; ++block) {
-        uint wb = row_byte + block * 34u;
-        uint xb = input_token * input_blocks * 36u + block * 36u;
-        uint wscale = weight_byte(wb, 0xffffffffu) |
-                  (weight_byte(wb + 1u, 0xffffffffu) << 8u);
-        float d = f16(wscale) * uintBitsToFloat(b0[xb / 4u]);
-        uint count = min(32u, pc.in_dim - block * 32u);
-        for (uint i = 0u; i < count; ++i)
-            total += d * float(weight_i8(wb + 2u + i, 0xffffffffu)) *
-                     float(input_i8(xb + 4u + i));
-    }
+    for (uint i = 0u; i < count; ++i)
+        total += d * float(weight_i8(wb + 2u + i, 0xffffffffu)) *
+                 float(input_i8(xb + 4u + i));
     return total;
 }
 
-float q2_dot(uint row_byte, uint row_bytes, uint input_token, uint input_blocks) {
-    float total = 0.0;
-    for (uint block = 0u; block < input_blocks; ++block) {
-        uint wb = row_byte + block * 84u;
-        uint xb = (input_token * input_blocks + block) * 73u;
-        uint dword = weight_byte(wb + 80u, 0xffffffffu) | (weight_byte(wb + 81u, 0xffffffffu) << 8u);
-        uint dminword = weight_byte(wb + 82u, 0xffffffffu) | (weight_byte(wb + 83u, 0xffffffffu) << 8u);
-        float dall = uintBitsToFloat(b0[xb]) * f16(dword);
-        float dmin = uintBitsToFloat(b0[xb]) * f16(dminword);
-        int isum = 0;
-        int summs = 0;
-        for (uint j = 0u; j < 16u; ++j) {
-            uint raw = b0[xb + 65u + (j >> 1u)];
-            int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
-            if (bsum >= 32768) bsum -= 65536;
-            summs += bsum * int(weight_byte(wb + j, 0xffffffffu) >> 4u);
-        }
-        for (uint half_block = 0u; half_block < 2u; ++half_block) {
-            uint q2base = wb + 16u + half_block * 32u;
-            uint q8base = (xb + 1u) * 4u + half_block * 128u;
-            for (uint j = 0u; j < 4u; ++j) {
-                uint shift = j * 2u;
-                uint scale0 = weight_byte(wb + half_block * 8u + j * 2u, 0xffffffffu) & 15u;
-                uint scale1 = weight_byte(wb + half_block * 8u + j * 2u + 1u, 0xffffffffu) & 15u;
-                for (uint k = 0u; k < 16u; ++k) {
-                    uint q0 = (weight_byte(q2base + k, 0xffffffffu) >> shift) & 3u;
-                    uint q1 = (weight_byte(q2base + 16u + k, 0xffffffffu) >> shift) & 3u;
-                    uint q8group = q8base + j * 32u;
-                    isum += int(scale0) * int(q0) * input_i8(q8group + k);
-                    isum += int(scale1) * int(q1) * input_i8(q8group + 16u + k);
-                }
+float q2_block_dot(uint row_byte, uint input_token, uint input_blocks,
+                   uint block) {
+    uint wb = row_byte + block * 84u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    uint dword = weight_byte(wb + 80u, 0xffffffffu) | (weight_byte(wb + 81u, 0xffffffffu) << 8u);
+    uint dminword = weight_byte(wb + 82u, 0xffffffffu) | (weight_byte(wb + 83u, 0xffffffffu) << 8u);
+    float dall = uintBitsToFloat(b0[xb]) * f16(dword);
+    float dmin = uintBitsToFloat(b0[xb]) * f16(dminword);
+    int isum = 0;
+    int summs = 0;
+    for (uint j = 0u; j < 16u; ++j) {
+        uint raw = b0[xb + 65u + (j >> 1u)];
+        int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
+        if (bsum >= 32768) bsum -= 65536;
+        summs += bsum * int(weight_byte(wb + j, 0xffffffffu) >> 4u);
+    }
+    for (uint half_block = 0u; half_block < 2u; ++half_block) {
+        uint q2base = wb + 16u + half_block * 32u;
+        uint q8base = (xb + 1u) * 4u + half_block * 128u;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint shift = j * 2u;
+            uint scale0 = weight_byte(wb + half_block * 8u + j * 2u, 0xffffffffu) & 15u;
+            uint scale1 = weight_byte(wb + half_block * 8u + j * 2u + 1u, 0xffffffffu) & 15u;
+            for (uint k = 0u; k < 16u; ++k) {
+                uint q0 = (weight_byte(q2base + k, 0xffffffffu) >> shift) & 3u;
+                uint q1 = (weight_byte(q2base + 16u + k, 0xffffffffu) >> shift) & 3u;
+                uint q8group = q8base + j * 32u;
+                isum += int(scale0) * int(q0) * input_i8(q8group + k);
+                isum += int(scale1) * int(q1) * input_i8(q8group + 16u + k);
             }
         }
-        total += dall * float(isum) - dmin * float(summs);
     }
-    return total;
+    return dall * float(isum) - dmin * float(summs);
 }
 
-float iq2_dot(uint row_byte, uint input_token, uint input_blocks) {
-    float total = 0.0;
-    for (uint block = 0u; block < input_blocks; ++block) {
-        uint wb = row_byte + block * 66u;
-        uint xb = (input_token * input_blocks + block) * 73u;
-        uint dword = weight_byte(wb, 0xffffffffu) | (weight_byte(wb + 1u, 0xffffffffu) << 8u);
-        float d = uintBitsToFloat(b0[xb]) * f16(dword);
-        int sum = 0;
-        for (uint ib = 0u; ib < 8u; ++ib) {
-            uint qbase = wb + 2u + ib * 8u;
-            uint q = weight_byte(qbase, 0xffffffffu) |
-                     (weight_byte(qbase + 1u, 0xffffffffu) << 8u) |
-                     (weight_byte(qbase + 2u, 0xffffffffu) << 16u) |
-                     (weight_byte(qbase + 3u, 0xffffffffu) << 24u);
-            uint a = weight_byte(qbase + 4u, 0xffffffffu) |
-                     (weight_byte(qbase + 5u, 0xffffffffu) << 8u) |
-                     (weight_byte(qbase + 6u, 0xffffffffu) << 16u) |
-                     (weight_byte(qbase + 7u, 0xffffffffu) << 24u);
-            uint ls = 2u * (a >> 28u) + 1u;
-            for (uint pair = 0u; pair < 2u; ++pair) {
-                uint s0 = (a >> (14u * pair)) & 127u;
-                uint s1 = (a >> (14u * pair + 7u)) & 127u;
-                uint g0 = (q >> (16u * pair)) & 255u;
-                uint g1 = (q >> (16u * pair + 8u)) & 255u;
-                for (uint j = 0u; j < 8u; ++j) {
-                    int v0 = int(iq2_grid[g0 * 8u + j]);
-                    int v1 = int(iq2_grid[g1 * 8u + j]);
-                    if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
-                    if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
-                    int q80 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + j);
-                    int q81 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j);
-                    sum += int(ls) * (v0 * q80 + v1 * q81);
-                }
+float iq2_block_dot(uint row_byte, uint input_token, uint input_blocks,
+                    uint block) {
+    uint wb = row_byte + block * 66u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    uint dword = weight_byte(wb, 0xffffffffu) | (weight_byte(wb + 1u, 0xffffffffu) << 8u);
+    float d = uintBitsToFloat(b0[xb]) * f16(dword);
+    int sum = 0;
+    for (uint ib = 0u; ib < 8u; ++ib) {
+        uint qbase = wb + 2u + ib * 8u;
+        uint q = weight_byte(qbase, 0xffffffffu) |
+                 (weight_byte(qbase + 1u, 0xffffffffu) << 8u) |
+                 (weight_byte(qbase + 2u, 0xffffffffu) << 16u) |
+                 (weight_byte(qbase + 3u, 0xffffffffu) << 24u);
+        uint a = weight_byte(qbase + 4u, 0xffffffffu) |
+                 (weight_byte(qbase + 5u, 0xffffffffu) << 8u) |
+                 (weight_byte(qbase + 6u, 0xffffffffu) << 16u) |
+                 (weight_byte(qbase + 7u, 0xffffffffu) << 24u);
+        uint ls = 2u * (a >> 28u) + 1u;
+        for (uint pair = 0u; pair < 2u; ++pair) {
+            uint s0 = (a >> (14u * pair)) & 127u;
+            uint s1 = (a >> (14u * pair + 7u)) & 127u;
+            uint g0 = (q >> (16u * pair)) & 255u;
+            uint g1 = (q >> (16u * pair + 8u)) & 255u;
+            for (uint j = 0u; j < 8u; ++j) {
+                int v0 = int(iq2_grid[g0 * 8u + j]);
+                int v1 = int(iq2_grid[g1 * 8u + j]);
+                if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
+                if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
+                int q80 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + j);
+                int q81 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j);
+                sum += int(ls) * (v0 * q80 + v1 * q81);
             }
         }
-        total += 0.125 * d * float(sum);
     }
-    return total;
+    return 0.125 * d * float(sum);
+}
+
+float reduce_sum(float value) {
+    uint lid = gl_LocalInvocationIndex;
+    q8_values[lid] = value;
+    barrier();
+    for (uint stride = 128u; stride != 0u; stride >>= 1u) {
+        if (lid < stride) q8_values[lid] += q8_values[lid + stride];
+        barrier();
+    }
+    return q8_values[0];
 }
 
 void main() {
@@ -214,23 +218,36 @@ void main() {
     if (pc.mode == 1u) {
         uint row = gl_WorkGroupID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim || lid != 0u) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
         uint expert = b3[token * pc.n_selected + rank];
-        if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; b5[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u; return; }
-        uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
-        float g = pc.gate_type == 8u ? q8_0_dot(rb, token, pc.q8_blocks) : pc.gate_type == 16u ? iq2_dot(rb, token, pc.q8_blocks) : q2_dot(rb, pc.gate_row_bytes, token, pc.q8_blocks);
-        if (pc.clamp_value > 1.0e-6) {
-            g = pc.add_enabled != 0u
-                ? clamp(g, -pc.clamp_value, pc.clamp_value)
-                : min(g, pc.clamp_value);
+        if (expert >= pc.n_total_expert) {
+            if (lid == 0u) b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u;
+            return;
         }
-        b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = floatBitsToUint(g);
+        uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
+        float partial = 0.0;
+        for (uint block = lid; block < pc.q8_blocks; block += 256u) {
+            partial += pc.gate_type == 8u
+                ? q8_0_block_dot(rb, token, pc.q8_blocks, block)
+                : (pc.gate_type == 16u
+                    ? iq2_block_dot(rb, token, pc.q8_blocks, block)
+                    : q2_block_dot(rb, token, pc.q8_blocks, block));
+        }
+        float g = reduce_sum(partial);
+        if (lid == 0u) {
+            if (pc.clamp_value > 1.0e-6) {
+                g = pc.add_enabled != 0u
+                    ? clamp(g, -pc.clamp_value, pc.clamp_value)
+                    : min(g, pc.clamp_value);
+            }
+            b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = floatBitsToUint(g);
+        }
         return;
     }
     if (pc.mode == 2u) {
-        uint row = gl_WorkGroupID.x;
+        uint row = gl_GlobalInvocationID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim || lid != 0u) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.mid_dim) return;
         uint at = (token * pc.n_selected + rank) * pc.mid_dim + row;
         float g = uintBitsToFloat(b0[at]);
         float u = uintBitsToFloat(b1[at]);
@@ -242,18 +259,30 @@ void main() {
     if (pc.mode == 3u) {
         uint row = gl_WorkGroupID.x;
         uint rank = gl_WorkGroupID.z;
-        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim || lid != 0u) return;
+        if (token >= pc.n_tokens || rank >= pc.n_selected || row >= pc.out_dim) return;
         uint expert = b3[token * pc.n_selected + rank];
-        if (expert >= pc.n_total_expert) { b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u; return; }
+        if (expert >= pc.n_total_expert) {
+            if (lid == 0u) b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u;
+            return;
+        }
         uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
         uint q8_token = token * pc.n_selected + rank;
-        float v = pc.down_type == 8u ? q8_0_dot(rb, q8_token, pc.q8_blocks) : pc.down_type == 16u ? iq2_dot(rb, q8_token, pc.q8_blocks) : q2_dot(rb, pc.down_row_bytes, q8_token, pc.q8_blocks);
-        b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
+        float partial = 0.0;
+        for (uint block = lid; block < pc.q8_blocks; block += 256u) {
+            partial += pc.down_type == 8u
+                ? q8_0_block_dot(rb, q8_token, pc.q8_blocks, block)
+                : (pc.down_type == 16u
+                    ? iq2_block_dot(rb, q8_token, pc.q8_blocks, block)
+                    : q2_block_dot(rb, q8_token, pc.q8_blocks, block));
+        }
+        float v = reduce_sum(partial);
+        if (lid == 0u)
+            b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
         return;
     }
     if (pc.mode == 4u) {
-        uint row = gl_WorkGroupID.x;
-        if (token >= pc.n_tokens || row >= pc.out_dim || lid != 0u) return;
+        uint row = gl_GlobalInvocationID.x;
+        if (token >= pc.n_tokens || row >= pc.out_dim) return;
         float v = 0.0;
         for (uint rank = 0u; rank < pc.n_selected; ++rank) v += uintBitsToFloat(b1[(token * pc.n_selected + rank) * pc.out_dim + row]);
         if (pc.add_enabled != 0u) v += uintBitsToFloat(b0[row]);

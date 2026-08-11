@@ -4687,7 +4687,7 @@ static bool ds4gk_routed_common(
             gate_info, up_info, weights_info, weights_info, mid_info, mid_info};
         ok = ds4gk_routed_dispatch("swiglu", pc,
             swiglu_buffers,
-            expert_mid_dim, n_tokens, n_expert);
+            (expert_mid_dim + 255u) / 256u, n_tokens, n_expert);
     }
     if (ok) {
         pc.mode = 0; pc.gate_type = down_type; pc.in_dim = expert_mid_dim;
@@ -4727,7 +4727,7 @@ static bool ds4gk_routed_common(
             add_info, exp_info, out_info, out_info, out_info, out_info};
         ok = ds4gk_routed_dispatch("reduce", pc,
             reduce_buffers,
-            out_dim, n_tokens, 1);
+            (out_dim + 255u) / 256u, n_tokens, 1);
     }
     ds4_gpu_tensor_free_in_place(&invalid);
     ds4_gpu_tensor_free_in_place(&q8);

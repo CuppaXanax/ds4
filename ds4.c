@@ -3041,6 +3041,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
         return false;
     }
+    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
     fprintf(stderr,
             "ds4: Vulkan startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             (double)prepared / 1073741824.0, now_sec() - t0);

@@ -196,7 +196,7 @@ rocm: strix-halo
 vulkan:
 	cd vulkan/shaders && python3 compile.py
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o vulkan/q8_aligned_artifact.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK="$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK_LIBS="$(VULKAN_LDLIBS)"
@@ -353,8 +353,11 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-ds4_vulkan.o: vulkan/vulkan_backend.cpp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp vulkan/_impl_gen.cpp vulkan/gen_impl.py
+ds4_vulkan.o: vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.h vulkan/shaders/matmul_q8_0_aligned.comp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp vulkan/_impl_gen.cpp vulkan/gen_impl.py
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/vulkan_backend.cpp
+
+vulkan/q8_aligned_artifact.o: vulkan/q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.h
+	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/q8_aligned_artifact.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

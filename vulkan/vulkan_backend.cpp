@@ -423,7 +423,7 @@ static int load_all_shaders(void) {
         {"hc_split_weighted_sum", 32, 8}, /* shape, sinkhorn, eps, sum/norm flags */
         {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
         {"router_select", 24, 7}, /* n_tokens, hash_rows, token, bias/hash, scale */
-        {"routed_moe", 64, 6}, /* canonical Q8_K/IQ2_XXS/Q2_K routed MoE */
+        {"routed_moe", 68, 6}, /* canonical Q8_K/IQ2_XXS/Q2_K routed MoE */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -4922,7 +4922,7 @@ struct ds4gk_routed_pc {
     uint32_t gate_expert_bytes, gate_row_bytes;
     uint32_t down_expert_bytes, down_row_bytes, q8_blocks;
     float clamp_value;
-    uint32_t add_enabled;
+    uint32_t add_enabled, q2_words;
 };
 
 static bool ds4gk_routed_buffer(const ds4_gpu_tensor *tensor,
@@ -5126,7 +5126,7 @@ static bool ds4gk_routed_common(
     pc = {0, gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
-          (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0};
+          (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
     VkDescriptorBufferInfo q8_info, invalid_info;
     ok = ds4gk_routed_buffer(&q8, q8_info) &&
          ds4gk_routed_buffer(&invalid, invalid_info);
@@ -5209,9 +5209,12 @@ static bool ds4gk_routed_common(
     }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
+        pc.q2_words = down_type == 10 && getenv("DS4_VULKAN_Q2_WORDS") &&
+                      strcmp(getenv("DS4_VULKAN_Q2_WORDS"), "1") == 0;
         VkDescriptorBufferInfo down_buffers[6] = {
             q8_info, down_model, down_model, selected_info, exp_info, exp_info};
-        ok = ds4gk_routed_dispatch("down", pc,
+        const char *down_stage = pc.q2_words ? "down_words" : "down_raw";
+        ok = ds4gk_routed_dispatch(down_stage, pc,
             down_buffers,
             ds4gk_routed_projection_groups(out_dim, pc.q8_blocks),
             n_tokens, n_expert, sets);

@@ -27,6 +27,7 @@ layout(push_constant) uniform PC {
     uint q8_blocks;
     float clamp_value;
     uint add_enabled;
+    uint q2_words;
 } pc;
 
 shared float q8_values[256];
@@ -111,6 +112,63 @@ float q2_block_dot(uint row_byte, uint input_token, uint input_blocks,
                 uint q8group = q8base + j * 32u;
                 isum += int(scale0) * int(q0) * input_i8(q8group + k);
                 isum += int(scale1) * int(q1) * input_i8(q8group + 16u + k);
+            }
+        }
+    }
+    return dall * float(isum) - dmin * float(summs);
+}
+
+float q2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
+                         uint block) {
+    uint wb = row_byte / 4u + block * 21u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    uint scale_words[4];
+    uint q_words[16];
+    uint bsum_words[8];
+    for (uint i = 0u; i < 4u; ++i) scale_words[i] = b1[wb + i];
+    for (uint i = 0u; i < 16u; ++i) q_words[i] = b1[wb + 4u + i];
+    for (uint i = 0u; i < 8u; ++i) bsum_words[i] = b0[xb + 65u + i];
+    uint dmin_dword = b1[wb + 20u];
+    uint q8_dword = b0[xb];
+    float dall = uintBitsToFloat(q8_dword) * f16(dmin_dword & 0xffffu);
+    float dmin = uintBitsToFloat(q8_dword) * f16(dmin_dword >> 16u);
+    int isum = 0;
+    int summs = 0;
+    for (uint j = 0u; j < 16u; ++j) {
+        uint raw = bsum_words[j >> 1u];
+        int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
+        if (bsum >= 32768) bsum -= 65536;
+        uint scale_word = scale_words[j >> 2u];
+        uint scale_byte = (scale_word >> ((j & 3u) * 8u)) & 255u;
+        summs += bsum * int(scale_byte >> 4u);
+    }
+    for (uint half_block = 0u; half_block < 2u; ++half_block) {
+        uint q8base = xb + 1u + half_block * 32u;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint shift = j * 2u;
+            uint scale0_index = half_block * 8u + j * 2u;
+            uint scale1_index = scale0_index + 1u;
+            uint scale0_word = scale_words[scale0_index >> 2u];
+            uint scale1_word = scale_words[scale1_index >> 2u];
+            uint scale0 = (scale0_word >> ((scale0_index & 3u) * 8u)) & 15u;
+            uint scale1 = (scale1_word >> ((scale1_index & 3u) * 8u)) & 15u;
+            uint q2base = half_block * 8u;
+            uint q8group = q8base + j * 8u;
+            uint q8_words[8];
+            for (uint i = 0u; i < 8u; ++i) q8_words[i] = b0[q8group + i];
+            for (uint k = 0u; k < 16u; ++k) {
+                uint q0_word = q_words[q2base + (k >> 2u)];
+                uint q1_word = q_words[q2base + 8u + (k >> 2u)];
+                uint q0 = (q0_word >> ((k & 3u) * 8u + shift)) & 3u;
+                uint q1 = (q1_word >> ((k & 3u) * 8u + shift)) & 3u;
+                uint q8_word0 = q8_words[k >> 2u];
+                uint q8_word1 = q8_words[4u + (k >> 2u)];
+                int x0 = int((q8_word0 >> ((k & 3u) * 8u)) & 255u);
+                int x1 = int((q8_word1 >> ((k & 3u) * 8u)) & 255u);
+                if (x0 >= 128) x0 -= 256;
+                if (x1 >= 128) x1 -= 256;
+                isum += int(scale0) * int(q0) * x0;
+                isum += int(scale1) * int(q1) * x1;
             }
         }
     }
@@ -306,7 +364,9 @@ void main() {
                     ? q8_0_block_dot(rb, q8_token, pc.q8_blocks, block)
                     : (pc.down_type == 16u
                         ? iq2_block_dot(rb, q8_token, pc.q8_blocks, block)
-                        : q2_block_dot(rb, q8_token, pc.q8_blocks, block));
+                        : (pc.q2_words != 0u
+                            ? q2_block_dot_words(rb, q8_token, pc.q8_blocks, block)
+                            : q2_block_dot(rb, q8_token, pc.q8_blocks, block)));
             }
         }
         float v = reduce_row_sum(partial, lanes_per_row);

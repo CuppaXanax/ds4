@@ -31,7 +31,16 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
+
+static void set_q2_words(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0");
+#else
+    setenv("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0", 1);
+#endif
+}
 
 /* ---------------- f16 helpers (from ds4.c / t_matmul_f16.cpp) ------------- */
 static uint16_t f32_to_f16(float f) {
@@ -135,6 +144,7 @@ static const uint32_t QK_K = 256;
 
 struct q8k_block { float d; int8_t qs[QK_K]; int16_t bsums[QK_K / 16]; };
 struct q2k_block { uint8_t scales[QK_K / 16]; uint8_t qs[QK_K / 4]; uint16_t d; uint16_t dmin; };
+struct iq2_block { uint16_t d; uint16_t qs[QK_K / 8]; };
 
 static void quantize_row_q8_K(const float *x, q8k_block *y, int64_t k) {
     const int64_t nb = k / (int64_t)QK_K;
@@ -205,6 +215,18 @@ static float vec_dot_q2_K_q8_K(int n, const q2k_block *x, const q8k_block *y) {
     return sumf;
 }
 
+static float vec_dot_iq2_fixture_q8_K(int n, const iq2_block *x, const q8k_block *y) {
+    float total = 0.0f;
+    for (int block = 0; block < n / (int)QK_K; block++) {
+        const float d = f16_to_f32(x[block].d) * y[block].d;
+        int sum = 0;
+        for (int i = 0; i < (int)QK_K; i++)
+            sum += 8 * y[block].qs[i];
+        total += 0.125f * d * (float)sum;
+    }
+    return total;
+}
+
 /* ---------------- generic row dot dispatch -------------------------------- */
 static float ref_dot_row(uint32_t type, const uint8_t *row, uint32_t in_dim,
                          const std::vector<int8_t> &xq8,
@@ -214,7 +236,9 @@ static float ref_dot_row(uint32_t type, const uint8_t *row, uint32_t in_dim,
         const uint64_t blocks = xq8.size() / 32;
         return dot_q8_0_row(row, xq8.data(), xscale8.data(), in_dim, blocks);
     }
-    return vec_dot_q2_K_q8_K((int)in_dim, (const q2k_block *)row, xqk.data());
+    if (type == 10)
+        return vec_dot_q2_K_q8_K((int)in_dim, (const q2k_block *)row, xqk.data());
+    return vec_dot_iq2_fixture_q8_K((int)in_dim, (const iq2_block *)row, xqk.data());
 }
 
 /* ---------------- CPU reference (batch: mirror of the kernel) ------------- */
@@ -327,7 +351,8 @@ static int run_moe_batch_case(
         const std::vector<uint8_t> &model,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes, uint64_t down_row_bytes)
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        bool q2_words = false, std::vector<float> *observed_out = nullptr)
 {
     ds4_gpu_tensor *out_t  = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
     ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * mid_dim * sizeof(float));
@@ -360,6 +385,7 @@ static int run_moe_batch_case(
         return 1;
     }
 
+    set_q2_words(q2_words);
     bool mid_f16 = true;
     int ok = ds4_gpu_routed_moe_batch_tensor(
             out_t, gate_t, up_t, mid_t, exp_t,
@@ -408,6 +434,7 @@ static int run_moe_batch_case(
         freet();
         return 1;
     }
+    if (observed_out) *observed_out = got_out;
 
     const float tol = 1e-3f;
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
@@ -517,13 +544,14 @@ static int test_routed_moe_batch(void) {
     /* ============ Case B: Q2_K gate/up + Q2_K down =========================
      * in=256, mid=256, out=8 (QK_K-aligned blocks, 84 B each), 2 tokens. */
     {
-        const uint32_t in_dim = 256, mid_dim = 256, out_dim = 8;
+        const uint32_t in_dim = 256, mid_dim = 2048, out_dim = 1024;
         const uint32_t n_total = 2, n_expert = 2;
         const uint32_t n_tokens = 2;
         const float clamp = 0.25f;
-        const uint64_t row_bytes = 84;               /* 1 Q2_K block (256 elems) */
-        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * row_bytes;
-        const uint64_t down_expert_bytes = (uint64_t)out_dim * row_bytes;
+        const uint64_t gate_row_bytes = 66;          /* 1 IQ2_XXS block */
+        const uint64_t down_row_bytes = 84;          /* 1 Q2_K block */
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
         const uint64_t header = 16;
         const uint64_t gate_offset = header;
         const uint64_t up_offset = gate_offset + (uint64_t)n_total * gate_expert_bytes;
@@ -533,22 +561,17 @@ static int test_routed_moe_batch(void) {
         std::vector<uint8_t> model(model_size, 0xAA);
         for (uint32_t e = 0; e < n_total; e++) {
             for (uint32_t r = 0; r < mid_dim; r++) {
-                q2k_block blk;
-                blk.d = f32_to_f16(0.5f);
-                blk.dmin = 0;
-                for (uint32_t g = 0; g < 16; g++) blk.scales[g] = 0x01;
-                for (uint32_t k = 0; k < 64; k++) {
-                    uint8_t byte = 0;
-                    for (uint32_t t = 0; t < 4; t++) {
-                        const uint32_t i = k * 4 + t;
-                        const uint32_t q = (i * 7 + r * 13 + e * 5) % 4;
-                        byte |= (uint8_t)(q << (2 * t));
-                    }
-                    blk.qs[k] = byte;
+                iq2_block blk{};
+                blk.d = f32_to_f16(4.0f);
+                for (uint32_t k = 0; k < 32; k += 4) {
+                    blk.qs[k + 0] = 0;
+                    blk.qs[k + 1] = 0;
+                    blk.qs[k + 2] = 0;
+                    blk.qs[k + 3] = 0;
                 }
-                std::memcpy(model.data() + gate_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * row_bytes,
+                std::memcpy(model.data() + gate_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * gate_row_bytes,
                             &blk, sizeof(blk));
-                std::memcpy(model.data() + up_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * row_bytes,
+                std::memcpy(model.data() + up_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * gate_row_bytes,
                             &blk, sizeof(blk));
             }
             for (uint32_t r2 = 0; r2 < out_dim; r2++) {
@@ -565,7 +588,7 @@ static int test_routed_moe_batch(void) {
                     }
                     blk.qs[k] = byte;
                 }
-                std::memcpy(model.data() + down_offset + (uint64_t)e * down_expert_bytes + (uint64_t)r2 * row_bytes,
+                std::memcpy(model.data() + down_offset + (uint64_t)e * down_expert_bytes + (uint64_t)r2 * down_row_bytes,
                             &blk, sizeof(blk));
             }
         }
@@ -576,12 +599,32 @@ static int test_routed_moe_batch(void) {
                 x[(uint64_t)t * in_dim + i] = (float)((int)((i * 13 + 5 + t * 7) % 17) - 8) * 0.125f;
         std::vector<int32_t> sel = { 1, 0,   0, 1 };
         std::vector<float> wgt = { 0.6f, 0.4f,   0.5f, 0.5f };
-        rc |= run_moe_batch_case("q2k-all", 10, 10, in_dim, mid_dim, out_dim,
+        std::vector<float> raw_out, word_out;
+        rc |= run_moe_batch_case("iq2xxs-gate-q2k-down-raw", 16, 10, in_dim, mid_dim, out_dim,
                                  n_total, n_expert, clamp, n_tokens,
                                  x, sel, wgt, model,
                                  gate_offset, up_offset, down_offset,
-                                 gate_expert_bytes, row_bytes,
-                                 down_expert_bytes, row_bytes);
+                                 gate_expert_bytes, gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes, false, &raw_out);
+        rc |= run_moe_batch_case("iq2xxs-gate-q2k-down-words", 16, 10, in_dim, mid_dim, out_dim,
+                                 n_total, n_expert, clamp, n_tokens,
+                                 x, sel, wgt, model,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes, true, &word_out);
+        if (raw_out.size() != word_out.size()) {
+            fprintf(stderr, "routed_moe_batch[q2-words]: parity output size mismatch\n");
+            rc = 1;
+        } else {
+            for (size_t i = 0; i < raw_out.size(); i++) {
+                if (!(std::fabsf(raw_out[i] - word_out[i]) <= 1e-3f)) {
+                    fprintf(stderr, "routed_moe_batch[q2-words]: parity mismatch at %zu: raw=%g words=%g\n",
+                            i, (double)raw_out[i], (double)word_out[i]);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
     }
 
     /* ============ Error paths ============================================= */

@@ -1451,6 +1451,14 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
 
 /* ---- matmul_q8_0 dispatch ---- */
 
+int ds4_gpu_quantize_q8_0_tensor(
+    ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+    uint64_t in_dim, uint64_t n_tok);
+int ds4_gpu_matmul_q8_0_prequant_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x_q8, uint64_t n_tok);
+
 int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -1473,6 +1481,28 @@ int ds4_gpu_matmul_q8_0_tensor(
         in_dim * n_tok > x->bytes / sizeof(float) ||
         n_tok > UINT64_MAX / out_dim ||
         out_dim * n_tok > out->bytes / sizeof(float)) return 0;
+
+    if (getenv("DS4_VULKAN_Q8_PREQUANT") &&
+        strcmp(getenv("DS4_VULKAN_Q8_PREQUANT"), "1") == 0) {
+        if (n_tok > UINT64_MAX / n_blocks ||
+            n_tok * n_blocks > UINT64_MAX / 36u) return 0;
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * n_blocks * 36u);
+        if (!q) return 0;
+        int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
+        if (ok)
+            ok = ds4_gpu_matmul_q8_0_prequant_tensor(
+                out, model_map, model_size, weight_offset, in_dim, out_dim, q, n_tok);
+        if (ok) {
+            /* The temporary is referenced by the matmul command, so wait before freeing it. */
+            ok = submit_and_wait();
+        } else {
+            auto &ctx = get_cmd_ctx();
+            if (ctx.recording && ctx.command_count != 0)
+                submit_and_wait();
+        }
+        ds4_gpu_tensor_free(q);
+        return ok;
+    }
 
     /* Get shader */
     auto si = g_vk.shader_map.find("matmul_q8_0");
@@ -1606,10 +1636,10 @@ int ds4_gpu_quantize_q8_0_tensor(
         (g_vk.caps.max_storage_buffer_range != 0 &&
          (n_tok * in_dim * sizeof(float) > g_vk.caps.max_storage_buffer_range ||
           n_tok * blocks * 36u > g_vk.caps.max_storage_buffer_range))) return 0;
-    if (g_vk.caps.max_compute_work_group_size[0] < 256u ||
+    if (g_vk.caps.max_compute_work_group_size[0] < 32u ||
         g_vk.caps.max_compute_work_group_size[1] < 1u ||
         g_vk.caps.max_compute_work_group_size[2] < 1u ||
-        g_vk.caps.max_compute_work_group_invocations < 256u ||
+        g_vk.caps.max_compute_work_group_invocations < 32u ||
         blocks > g_vk.caps.max_compute_work_group_count[0] ||
         n_tok > g_vk.caps.max_compute_work_group_count[2]) return 0;
     auto &ctx = get_cmd_ctx();
@@ -1635,7 +1665,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         n_tok == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
         n_tok > 65535u) return 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (blocks > UINT32_MAX || out_dim > UINT64_MAX / blocks ||
+    if (blocks > 256u || out_dim > UINT64_MAX / blocks ||
         out_dim * blocks > UINT64_MAX / 34u) return 0;
     const uint64_t weight_bytes = out_dim * blocks * 34u;
     const uint64_t q_bytes = n_tok * blocks * 36u;

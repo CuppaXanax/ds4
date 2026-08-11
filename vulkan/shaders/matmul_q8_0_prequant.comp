@@ -15,6 +15,10 @@ layout(push_constant) uniform PC {
     uint y_scale;
 } pc;
 
+shared float weight_scales[256];
+shared float activation_scales[256];
+shared int block_dots[256];
+
 float f16tof32(uint h) {
     uint s = h & 0x8000u;
     uint e = (h >> 10) & 0x1fu;
@@ -42,18 +46,32 @@ int x_i8(uint word, uint byte_i) {
 void main() {
     uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.y_scale;
     uint tok = gl_WorkGroupID.z;
+    uint lid = gl_LocalInvocationIndex;
     if (row >= pc.out_dim || tok >= pc.n_tok) return;
-    float sum = 0.0;
-    for (uint b = 0u; b < pc.blocks_per_row; b++) {
-        uint x_off = (tok * pc.blocks_per_row + b) * 9u;
-        float x_scale = uintBitsToFloat(x_q8_buf[x_off]);
-        uint w_off = (row * pc.blocks_per_row + b) * 34u;
+
+    float weight_scale = 0.0;
+    float activation_scale = 0.0;
+    int block_dot = 0;
+    if (lid < pc.blocks_per_row) {
+        uint x_off = (tok * pc.blocks_per_row + lid) * 9u;
+        uint w_off = (row * pc.blocks_per_row + lid) * 34u;
         uint scale_bits = byte_at(w_off) | (byte_at(w_off + 1u) << 8u);
-        int dot = 0;
-        for (uint i = 0u; i < 32u; i++)
-            if (b * 32u + i < pc.in_dim)
-                dot += i8_at(w_off + 2u + i) * x_i8(x_off + 1u + (i >> 2u), i & 3u);
-        sum += x_scale * f16tof32(scale_bits) * float(dot);
+        uint base = lid * 32u;
+        uint count = min(32u, pc.in_dim - base);
+        for (uint i = 0u; i < count; i++)
+            block_dot += i8_at(w_off + 2u + i) * x_i8(x_off + 1u + (i >> 2u), i & 3u);
+        weight_scale = f16tof32(scale_bits);
+        activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
     }
-    out_buf[tok * pc.out_dim + row] = sum;
+    weight_scales[lid] = weight_scale;
+    activation_scales[lid] = activation_scale;
+    block_dots[lid] = block_dot;
+    barrier();
+
+    if (lid == 0u) {
+        float sum = 0.0;
+        for (uint b = 0u; b < pc.blocks_per_row; b++)
+            sum += weight_scales[b] * activation_scales[b] * float(block_dots[b]);
+        out_buf[tok * pc.out_dim + row] = sum;
+    }
 }

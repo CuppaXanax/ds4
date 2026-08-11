@@ -8,6 +8,8 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 static uint16_t f32_to_f16(float f) {
@@ -164,6 +166,33 @@ static int test_matmul_q8_0_prequant() {
             }
         }
     }
+
+    const char *old_prequant = std::getenv("DS4_VULKAN_Q8_PREQUANT");
+    const bool had_prequant = old_prequant != nullptr;
+    const std::string saved_prequant = had_prequant ? old_prequant : "";
+#if defined(_WIN32)
+    _putenv_s("DS4_VULKAN_Q8_PREQUANT", "1");
+#else
+    setenv("DS4_VULKAN_Q8_PREQUANT", "1", 1);
+#endif
+    const bool production_ok =
+        ds4_gpu_matmul_q8_0_tensor(out_ref, model.data(), model.size(),
+                                    weight0, in_dim, out_dim, x, n_tok) != 0;
+    std::vector<float> production(n_tok * out_dim);
+    const bool production_read = production_ok &&
+        ds4_gpu_tensor_read(out_ref, 0, production.data(),
+                             production.size() * sizeof(float)) != 0;
+#if defined(_WIN32)
+    _putenv_s("DS4_VULKAN_Q8_PREQUANT", had_prequant ? saved_prequant.c_str() : "");
+#else
+    if (had_prequant) setenv("DS4_VULKAN_Q8_PREQUANT", saved_prequant.c_str(), 1);
+    else unsetenv("DS4_VULKAN_Q8_PREQUANT");
+#endif
+    if (!production_read) return cleanup();
+    for (size_t i = 0; i < production.size(); i++)
+        if (std::fabsf(production[i] - established[0][i]) > 1e-5f)
+            return cleanup();
+
     rc = 0;
     return cleanup();
 }

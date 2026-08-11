@@ -4498,7 +4498,9 @@ static bool ds4gk_routed_model(uint64_t offset, uint64_t bytes,
 static bool ds4gk_routed_dispatch(const char *stage,
                                   const ds4gk_routed_pc &pc,
                                   VkDescriptorBufferInfo *buffers,
-                                  uint32_t gx, uint32_t gy, uint32_t gz) {
+                                  uint32_t gx, uint32_t gy, uint32_t gz,
+                                  std::vector<VkDescriptorSet> &sets) {
+    (void)stage;
     auto si = g_vk.shader_map.find("routed_moe");
     if (si == g_vk.shader_map.end()) return false;
     auto &ctx = get_cmd_ctx();
@@ -4520,13 +4522,17 @@ static bool ds4gk_routed_dispatch(const char *stage,
     vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
                          0, nullptr, 0, nullptr);
-    const int submitted = submit_and_wait();
-    const int released = release_simple_descriptors(set);
-    if (!submitted) {
-        fprintf(stderr, "ds4: routed_moe: %s dispatch failed\n", stage);
-        return false;
-    }
-    return released != 0;
+    sets.push_back(set);
+    return true;
+}
+
+static bool ds4gk_routed_flush(std::vector<VkDescriptorSet> &sets) {
+    if (sets.empty()) return true;
+    bool ok = submit_and_wait() != 0;
+    for (VkDescriptorSet set : sets)
+        if (!release_simple_descriptors(set)) ok = false;
+    sets.clear();
+    return ok;
 }
 
 static bool ds4gk_routed_common(
@@ -4635,6 +4641,7 @@ static bool ds4gk_routed_common(
     }
     const bool resume_recording = get_cmd_ctx().recording;
     bool ok = true;
+    std::vector<VkDescriptorSet> sets;
     ds4gk_routed_pc pc{};
     pc = {0, gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
@@ -4649,7 +4656,8 @@ static bool ds4gk_routed_common(
             selected_info, selected_info, selected_info, selected_info,
             invalid_info, invalid_info};
         ok = ds4gk_routed_dispatch("validate_selected", pc,
-            validate_buffers, 1, n_tokens, 1);
+            validate_buffers, 1, n_tokens, 1, sets) &&
+             ds4gk_routed_flush(sets);
         uint32_t invalid_value = 0;
         if (ok) ok = ds4_gpu_tensor_read(&invalid, 0, &invalid_value,
                                           sizeof(invalid_value)) != 0 &&
@@ -4660,8 +4668,9 @@ static bool ds4gk_routed_common(
         VkDescriptorBufferInfo quantize_buffers[6] = {
             x_info, x_info, x_info, x_info, q8_info, q8_info};
         ok = ds4gk_routed_dispatch("quantize_input", pc,
-            quantize_buffers, gate_blocks, n_tokens, 1);
+            quantize_buffers, gate_blocks, n_tokens, 1, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            ok = ds4gk_routed_flush(sets);
             uint32_t words[3] = {};
             float scale = 0.0f;
             if (ds4_gpu_tensor_read(&q8, 0, words, sizeof(words))) {
@@ -4677,13 +4686,13 @@ static bool ds4gk_routed_common(
             q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
         ok = ds4gk_routed_dispatch("gate_up", pc,
             gate_buffers,
-            expert_mid_dim, n_tokens, n_expert);
+            expert_mid_dim, n_tokens, n_expert, sets);
         if (ok) {
             pc.add_enabled = 1;
             VkDescriptorBufferInfo up_buffers[6] = {
                 q8_info, up_model, up_model, selected_info, up_info, up_info};
             ok = ds4gk_routed_dispatch("up", pc,
-                up_buffers, expert_mid_dim, n_tokens, n_expert);
+                up_buffers, expert_mid_dim, n_tokens, n_expert, sets);
             pc.add_enabled = 0;
         }
     }
@@ -4693,7 +4702,7 @@ static bool ds4gk_routed_common(
             gate_info, up_info, weights_info, weights_info, mid_info, mid_info};
         ok = ds4gk_routed_dispatch("swiglu", pc,
             swiglu_buffers,
-            (expert_mid_dim + 255u) / 256u, n_tokens, n_expert);
+            (expert_mid_dim + 255u) / 256u, n_tokens, n_expert, sets);
     }
     if (ok) {
         pc.mode = 0; pc.gate_type = down_type; pc.in_dim = expert_mid_dim;
@@ -4703,8 +4712,9 @@ static bool ds4gk_routed_common(
             mid_info, mid_info, mid_info, mid_info, q8_info, q8_info};
         ok = ds4gk_routed_dispatch("quantize_mid", pc,
             mid_quantize_buffers,
-            mid_blocks, n_tokens * n_expert, 1);
+            mid_blocks, n_tokens * n_expert, 1, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            ok = ds4gk_routed_flush(sets);
             uint32_t words[3] = {};
             float scale = 0.0f;
             if (ds4_gpu_tensor_read(&q8, 0, words, sizeof(words))) {
@@ -4720,8 +4730,9 @@ static bool ds4gk_routed_common(
             q8_info, down_model, down_model, selected_info, exp_info, exp_info};
         ok = ds4gk_routed_dispatch("down", pc,
             down_buffers,
-            out_dim, n_tokens, n_expert);
+            out_dim, n_tokens, n_expert, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
+            ok = ds4gk_routed_flush(sets);
             float value = 0.0f;
             if (ds4_gpu_tensor_read(experts, 0, &value, sizeof(value)))
                 fprintf(stderr, "ds4: [dbg] routed down[0]=%g\n", (double)value);
@@ -4733,8 +4744,9 @@ static bool ds4gk_routed_common(
             add_info, exp_info, out_info, out_info, out_info, out_info};
         ok = ds4gk_routed_dispatch("reduce", pc,
             reduce_buffers,
-            (out_dim + 255u) / 256u, n_tokens, 1);
+            (out_dim + 255u) / 256u, n_tokens, 1, sets);
     }
+    if (!ds4gk_routed_flush(sets)) ok = false;
     ds4_gpu_tensor_free_in_place(&invalid);
     ds4_gpu_tensor_free_in_place(&q8);
     if (resume_recording && !get_cmd_ctx().recording && !begin_cmd()) ok = false;

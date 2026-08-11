@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1, std430) readonly buffer S { uint scale[]; };
+layout(set = 0, binding = 2, std430) readonly buffer W { int payload[]; };
+layout(set = 0, binding = 3, std430) buffer Y { float y[]; };
+
+layout(push_constant) uniform Params {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint y_scale;
+} p;
+
+float half_value(uint word) { return unpackHalf2x16(word).x; }
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint output_row = gl_WorkGroupID.y * p.y_scale + row;
+    uint token = gl_WorkGroupID.z;
+    if (output_row >= p.out_dim || token >= p.n_tok) return;
+    float sum = 0.0;
+    for (uint block = 0; block < p.blocks; ++block) {
+        uint count = min(32u, p.in_dim - block * 32u);
+        float amax = 0.0;
+        for (uint i = 0; i < count; ++i)
+            amax = max(amax, abs(x[token * p.in_dim + block * 32u + i]));
+        float activation_scale = amax / 127.0;
+        float inverse = activation_scale != 0.0 ? 1.0 / activation_scale : 0.0;
+        int dot = 0;
+        uint record = output_row * p.blocks + block;
+        for (uint i = 0; i < count; ++i) {
+            int q = int(round(clamp(x[token * p.in_dim + block * 32u + i] * inverse,
+                                    -128.0, 127.0)));
+            int w = int((uint(W.payload[record * 8u + i / 4u]) >> ((i % 4u) * 8u)) & 255u);
+            if (w >= 128) w -= 256;
+            dot += w * q;
+        }
+        sum += half_value(S.scale[record / 2u] >> ((record % 2u) * 16u)) * activation_scale * float(dot);
+    }
+    y[token * p.out_dim + output_row] = sum;
+}

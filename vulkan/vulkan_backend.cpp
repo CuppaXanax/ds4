@@ -17,6 +17,7 @@
 
 #include "../ds4_gpu.h"
 #include "../ds4_vulkan.h"
+#include "q8_aligned_artifact.cpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -119,7 +120,20 @@ static struct {
         uint64_t       last_gen = 0;   /* command-buffer generation of last use */
         VkDescriptorBufferInfo desc_info{};
     };
+    struct AlignedWeightEntry {
+        const void *model_map = nullptr;
+        uint64_t model_size = 0;
+        uint64_t source_offset = 0;
+        uint64_t in_dim = 0;
+        uint64_t out_dim = 0;
+        uint64_t blocks = 0;
+        uint64_t scale_bytes = 0;
+        uint64_t payload_offset = 0;
+        uint64_t payload_bytes = 0;
+        WeightCacheEntry gpu;
+    };
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
+    std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache;
     /* Model tensor ranges registered by cache_model_range (metadata only). */
     std::unordered_map<uint64_t, uint64_t> range_registry; /* offset -> bytes */
     uint64_t weight_budget = 40ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
@@ -377,6 +391,7 @@ static int load_all_shaders(void) {
         {"rms_norm", 12, 6}, {"rms_norm_weight", 12, 6},
         {"swiglu", 16, 6}, {"matmul_f32", 12, 6},
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
+        {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
@@ -714,6 +729,9 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, e] : g_vk.weight_cache)
         if (e.buffer) vmaDestroyBuffer(g_vk.allocator, e.buffer, e.allocation);
     g_vk.weight_cache.clear();
+    for (auto &[_, e] : g_vk.aligned_cache)
+        if (e.gpu.buffer) vmaDestroyBuffer(g_vk.allocator, e.gpu.buffer, e.gpu.allocation);
+    g_vk.aligned_cache.clear();
     g_vk.range_registry.clear();
     /* Destroy the external-host-memory model buffer (no heap budget) */
     if (g_vk.model_buffer) vkDestroyBuffer(g_vk.device, g_vk.model_buffer, nullptr);
@@ -897,8 +915,14 @@ static void clear_weight_cache(void) {
             vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
         }
         g_vk.weight_cache.clear();
-        g_vk.weight_used = 0;
     }
+    if (!g_vk.aligned_cache.empty()) {
+        (void)vkDeviceWaitIdle(g_vk.device);
+        for (auto &[_, entry] : g_vk.aligned_cache)
+            vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
+        g_vk.aligned_cache.clear();
+    }
+    g_vk.weight_used = 0;
     g_vk.range_registry.clear();
 }
 
@@ -947,7 +971,7 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off) return 0;
     set_model_map_identity(m, s);
     g_vk.range_registry[off] = bytes;
-    if (!ensure_weight(off, bytes)) return 0;
+    if (!ds4_vulkan_q8_aligned_enabled() && !ensure_weight(off, bytes)) return 0;
     for (auto &[base, entry] : g_vk.weight_cache) {
         if (off >= base && off - base <= entry.size && bytes <= entry.size - (off - base)) {
             entry.last_gen = UINT64_MAX;
@@ -1078,11 +1102,134 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
     return 1;
 }
 
+static uint64_t aligned_cache_key(const void *model_map, uint64_t model_size,
+                                  uint64_t offset, uint64_t in_dim, uint64_t out_dim) {
+    uint64_t key = (uint64_t)(uintptr_t)model_map;
+    key ^= model_size + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= offset + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= in_dim + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    key ^= out_dim + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+    return key;
+}
+
+static bool upload_aligned_artifact(const ds4_vulkan_q8_aligned_artifact &artifact,
+                                    VkBuffer &buf, VmaAllocation &alloc) {
+    VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = artifact.bytes;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo aci{}; aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaAllocationInfo ai;
+    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buf, &alloc, &ai) != VK_SUCCESS)
+        return false;
+    static VkCommandPool load_pool = VK_NULL_HANDLE;
+    if (load_pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo cpci{}; cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.queueFamilyIndex = g_vk.queue_family;
+        cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (vkCreateCommandPool(g_vk.device, &cpci, nullptr, &load_pool) != VK_SUCCESS) {
+            vmaDestroyBuffer(g_vk.allocator, buf, alloc); return false;
+        }
+    }
+    VkBufferCreateInfo sbci{}; sbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    sbci.size = artifact.bytes; sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo saci{}; saci.usage = VMA_MEMORY_USAGE_AUTO;
+    saci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo sai; VkBuffer sbuf = VK_NULL_HANDLE; VmaAllocation salloc = VK_NULL_HANDLE;
+    bool ok = vmaCreateBuffer(g_vk.allocator, &sbci, &saci, &sbuf, &salloc, &sai) == VK_SUCCESS;
+    if (ok && sai.pMappedData) memcpy(sai.pMappedData, artifact.data, (size_t)artifact.bytes);
+    if (ok) {
+        VkCommandBufferAllocateInfo cbai{}; cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = load_pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+        VkCommandBuffer cb; ok = vkAllocateCommandBuffers(g_vk.device, &cbai, &cb) == VK_SUCCESS;
+        if (ok) {
+            VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            ok = vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS;
+            if (ok) { VkBufferCopy copy{}; copy.size = artifact.bytes; vkCmdCopyBuffer(cb, sbuf, buf, 1, &copy); ok = vkEndCommandBuffer(cb) == VK_SUCCESS; }
+            VkFence fence = VK_NULL_HANDLE; VkFenceCreateInfo fci{}; fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (ok) ok = vkCreateFence(g_vk.device, &fci, nullptr, &fence) == VK_SUCCESS;
+            if (ok) { VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = 1; si.pCommandBuffers = &cb; ok = vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS; }
+            if (ok) ok = vkWaitForFences(g_vk.device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+            if (fence) vkDestroyFence(g_vk.device, fence, nullptr);
+            vkFreeCommandBuffers(g_vk.device, load_pool, 1, &cb);
+        }
+    }
+    if (sbuf) vmaDestroyBuffer(g_vk.allocator, sbuf, salloc);
+    if (!ok) { vmaDestroyBuffer(g_vk.allocator, buf, alloc); buf = VK_NULL_HANDLE; alloc = VK_NULL_HANDLE; }
+    return ok;
+}
+
+static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
+                                  uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                                  decltype(g_vk.aligned_cache)::mapped_type *&entry) {
+    const uint64_t key = aligned_cache_key(model_map, model_size, offset, in_dim, out_dim);
+    auto it = g_vk.aligned_cache.find(key);
+    if (it != g_vk.aligned_cache.end()) {
+        it->second.gpu.last_used = ++g_vk.lru_counter;
+        it->second.gpu.last_gen = g_vk.cmd_gen;
+        entry = &it->second; return true;
+    }
+    ds4_vulkan_q8_aligned_artifact artifact{};
+    if (!ds4_vulkan_q8_aligned_build(&artifact, model_map, model_size, offset, in_dim, out_dim,
+                                     g_vk.caps.min_storage_buffer_offset_alignment)) return false;
+    if (artifact.bytes > g_vk.weight_budget) { ds4_vulkan_q8_aligned_free(&artifact); return false; }
+    VkBuffer buf = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE;
+    bool ok = upload_aligned_artifact(artifact, buf, alloc);
+    if (ok) {
+        g_vk.aligned_cache[key] = {model_map, model_size, offset, in_dim, out_dim,
+            artifact.blocks_per_row, artifact.scale_bytes, artifact.payload_offset,
+            artifact.payload_bytes, {buf, alloc, artifact.bytes, ++g_vk.lru_counter, g_vk.cmd_gen, {}}};
+        g_vk.weight_used += artifact.bytes;
+        entry = &g_vk.aligned_cache.find(key)->second;
+    }
+    ds4_vulkan_q8_aligned_free(&artifact);
+    if (!ok) return false;
+    while (g_vk.weight_used > g_vk.weight_budget) {
+        uint64_t victim = UINT64_MAX, age = UINT64_MAX;
+        bool victim_aligned = false;
+        for (auto &[candidate, value] : g_vk.aligned_cache) {
+            if (candidate == key || value.gpu.last_gen == g_vk.cmd_gen) continue;
+            if (value.gpu.last_used < age) { victim = candidate; age = value.gpu.last_used; victim_aligned = true; }
+        }
+        for (auto &[candidate, value] : g_vk.weight_cache) {
+            if (value.last_gen == g_vk.cmd_gen || value.last_used >= age) continue;
+            victim = candidate; age = value.last_used; victim_aligned = false;
+        }
+        if (victim == UINT64_MAX) break;
+        if (victim_aligned) {
+            auto ai = g_vk.aligned_cache.find(victim);
+            if (ai == g_vk.aligned_cache.end()) break;
+            vmaDestroyBuffer(g_vk.allocator, ai->second.gpu.buffer, ai->second.gpu.allocation);
+            g_vk.weight_used -= ai->second.gpu.size; g_vk.aligned_cache.erase(ai); continue;
+        }
+        auto wi = g_vk.weight_cache.find(victim);
+        if (wi == g_vk.weight_cache.end()) break;
+        vmaDestroyBuffer(g_vk.allocator, wi->second.buffer, wi->second.allocation); g_vk.weight_used -= wi->second.size; g_vk.weight_cache.erase(wi);
+    }
+    return true;
+}
+
 int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes,
                                  uint64_t idim, uint64_t odim, const char *label) {
-    (void)m; (void)s; (void)off; (void)bytes; (void)idim; (void)odim; (void)label; return 0; }
+    (void)label;
+    if (!ds4_vulkan_q8_aligned_enabled())
+        return ds4_gpu_cache_model_range(m, s, off, bytes, label);
+    if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off || idim == 0 || odim == 0)
+        return 0;
+    set_model_map_identity(m, s);
+    decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
+    return ensure_aligned_weight(m, s, off, idim, odim, entry) ? 1 : 0;
+}
 
-void ds4_gpu_release_q8_f16_cache(void) {}
+void ds4_gpu_release_q8_f16_cache(void) {
+    if (g_vk.aligned_cache.empty()) return;
+    (void)vkDeviceWaitIdle(g_vk.device);
+    for (auto &[_, entry] : g_vk.aligned_cache) {
+        vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
+        g_vk.weight_used -= std::min(g_vk.weight_used, entry.gpu.size);
+    }
+    g_vk.aligned_cache.clear();
+}
 int ds4_gpu_pro_q4_expert_table_auto_available(void) { return 0; }
 
 int ds4_gpu_preload_q4_expert_tables(const void *m, uint64_t s,
@@ -1528,6 +1675,58 @@ int ds4_gpu_matmul_q8_0_tensor(
     };
     VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
     if (!find_buf(x->ptr, xbuf, xoff) || !find_buf(out->ptr, obuf, ooff)) return 0;
+
+    if (ds4_vulkan_q8_aligned_enabled()) {
+        auto asi = g_vk.shader_map.find("matmul_q8_0_aligned");
+        if (asi == g_vk.shader_map.end()) return 0;
+        decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+        if (!ensure_aligned_weight(model_map, model_size, weight_offset, in_dim, out_dim, aligned)) return 0;
+        const uint64_t tile_tokens = std::max<uint64_t>(1u, 32768u / out_dim);
+        const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
+        const uint32_t y_cnt = ((uint32_t)out_dim + y_scale - 1) / y_scale;
+        auto &ash = g_vk.shaders[asi->second];
+        const VkDeviceSize storage_align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+        for (uint64_t tile = 0; tile < n_tok; tile += tile_tokens) {
+            const uint32_t tile_n = (uint32_t)std::min<uint64_t>(tile_tokens, n_tok - tile);
+            if (!c.recording && !begin_cmd()) return 0;
+            VkDescriptorSetAllocateInfo dai{}; dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1; dai.pSetLayouts = &ash.desc_layout;
+            VkDescriptorSet ds;
+            if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+            const VkDeviceSize x_size = (VkDeviceSize)tile_n * in_dim * sizeof(float);
+            const VkDeviceSize o_size = (VkDeviceSize)tile_n * out_dim * sizeof(float);
+            const VkDeviceSize tile_x_off = xoff + (VkDeviceSize)tile * in_dim * sizeof(float);
+            const VkDeviceSize tile_o_off = ooff + (VkDeviceSize)tile * out_dim * sizeof(float);
+            if (storage_align && ((tile_x_off | tile_o_off) % storage_align) != 0) {
+                vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds);
+                return 0;
+            }
+            VkDescriptorBufferInfo bufs[4] = {
+                {xbuf, tile_x_off, x_size},
+                {aligned->gpu.buffer, 0, aligned->scale_bytes},
+                {aligned->gpu.buffer, aligned->payload_offset, aligned->payload_bytes},
+                {obuf, tile_o_off, o_size}
+            };
+            VkWriteDescriptorSet writes[4];
+            for (int i = 0; i < 4; ++i) {
+                writes[i] = {}; writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = ds; writes[i].dstBinding = i; writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[i].pBufferInfo = &bufs[i];
+            }
+            vkUpdateDescriptorSets(g_vk.device, 4, writes, 0, nullptr);
+            vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ash.pipeline);
+            vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ash.layout, 0, 1, &ds, 0, nullptr);
+            struct { uint32_t in_dim, out_dim, n_tok, blocks, y_scale; } pc = {
+                (uint32_t)in_dim, (uint32_t)out_dim, tile_n, (uint32_t)n_blocks, y_scale
+            };
+            vkCmdPushConstants(c.cmd, ash.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(c.cmd, y_scale, y_cnt, tile_n);
+            c.command_count++;
+            if (!submit_and_wait()) return 0;
+            if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) return 0;
+        }
+        return 1;
+    }
 
     /* Lazy weight upload with LRU eviction: find the range in the cache or
      * upload it from the model mmap on first use. */

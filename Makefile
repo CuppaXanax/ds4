@@ -353,8 +353,14 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-ds4_vulkan.o: vulkan/vulkan_backend.cpp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp vulkan/_impl_gen.cpp vulkan/gen_impl.py
+ds4_vulkan.o: vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.h vulkan/shaders/matmul_q8_0_aligned.comp ds4_gpu.h ds4_vulkan.h vulkan/include/volk.h vulkan/include/vulkan/vulkan.h vulkan/include/vk_mem_alloc.h vulkan/_stubs.gen.cpp vulkan/_impl_gen.cpp vulkan/gen_impl.py
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/vulkan_backend.cpp
+
+tests/test_q8_aligned_artifact: tests/test_q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.h
+	$(VULKAN_CXX) -O2 -std=c++17 -o $@ tests/test_q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.cpp
+
+q8-aligned-artifact-test: tests/test_q8_aligned_artifact
+	./tests/test_q8_aligned_artifact
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

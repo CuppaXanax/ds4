@@ -3033,6 +3033,14 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const uint64_t *span_offsets,
                                             const uint64_t *span_sizes,
                                             uint32_t span_count) {
+#ifdef DS4_VULKAN_BUILD
+    (void)backend;
+    (void)m;
+    (void)span_offsets;
+    (void)span_sizes;
+    (void)span_count;
+    return true;
+#else
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 #ifndef DS4_ROCM_BUILD
@@ -3057,6 +3065,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
             "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
     return true;
+#endif
 }
 #else
 static bool accelerator_cache_model_tensors(ds4_backend backend,

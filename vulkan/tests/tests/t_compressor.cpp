@@ -943,6 +943,11 @@ static int test_compressor_prefill_ratio2(void) {
 }
 REGISTER_TEST(compressor_prefill_ratio2, test_compressor_prefill_ratio2);
 
+static int test_compressor_prefill_ratio128(void) {
+    return prefill_one("prefill/ratio128", 8, 128, 0, 256, 0, false);
+}
+REGISTER_TEST(compressor_prefill_ratio128, test_compressor_prefill_ratio128);
+
 static int test_compressor_prefill_fp8(void) {
     /* head_dim 80 / n_rot 16 → n_nope 64 (one full fp8 block); ratio 2 with
      * 3 windows + 1 leftover so the rolling state is non-trivial. */

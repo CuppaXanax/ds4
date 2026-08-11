@@ -59,14 +59,28 @@ void main() {
         }
     } else {
         uint base = c * pc.ratio;
-        for (uint r = 0u; r < 4u; ++r) {
-            if (r >= pc.ratio) break;
+        float denom = 0.0;
+        float accum = 0.0;
+        for (uint r = 0u; r < pc.ratio; ++r) {
             uint t = base + r;
             uint phase = (pc.pos0 + t) % pc.ratio;
-            values[count] = kv[t * width + d];
-            scores[count] = score[t * width + d] + ape_value(phase * width + d);
-            max_score = max(max_score, scores[count++]);
+            float value = kv[t * width + d];
+            float next_score = score[t * width + d] + ape_value(phase * width + d);
+            if (denom == 0.0) {
+                max_score = next_score;
+                denom = 1.0;
+                accum = value;
+            } else {
+                float next_max = max(max_score, next_score);
+                float old_scale = exp(max_score - next_max);
+                float next_weight = exp(next_score - next_max);
+                denom = denom * old_scale + next_weight;
+                accum = accum * old_scale + value * next_weight;
+                max_score = next_max;
+            }
         }
+        out_buf[c * pc.head_dim + d] = denom > 0.0 ? accum / denom : 0.0;
+        return;
     }
     float denom = 0.0;
     float accum = 0.0;

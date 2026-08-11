@@ -25,12 +25,26 @@ void main() {
             max_score = max(max_score, scores[count++]);
         }
     } else {
-        for (uint r = 0u; r < 4u; ++r) {
-            if (r >= pc.ratio) break;
-            values[count] = state_kv[r * width + d];
-            scores[count] = state_score[r * width + d];
-            max_score = max(max_score, scores[count++]);
+        float denom = 0.0;
+        float accum = 0.0;
+        for (uint r = 0u; r < pc.ratio; ++r) {
+            float value = state_kv[r * width + d];
+            float next_score = state_score[r * width + d];
+            if (denom == 0.0) {
+                max_score = next_score;
+                denom = 1.0;
+                accum = value;
+            } else {
+                float next_max = max(max_score, next_score);
+                float old_scale = exp(max_score - next_max);
+                float next_weight = exp(next_score - next_max);
+                denom = denom * old_scale + next_weight;
+                accum = accum * old_scale + value * next_weight;
+                max_score = next_max;
+            }
         }
+        out_buf[d] = denom > 0.0 ? accum / denom : 0.0;
+        return;
     }
     float denom = 0.0;
     float accum = 0.0;

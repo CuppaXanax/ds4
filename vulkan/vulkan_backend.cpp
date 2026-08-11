@@ -5154,7 +5154,7 @@ int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
-        head_dim == 0 || ratio == 0 || ratio > 4u || n_tokens == 0 ||
+        head_dim == 0 || ratio == 0 || ratio > 128u || n_tokens == 0 ||
         (ape_type != 0u && ape_type != 1u) || n_tokens > 65535u) return 0;
     const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
     const uint32_t state_rows = (ratio == 4u ? 2u : 1u) * ratio;
@@ -5221,7 +5221,7 @@ static int compressor_set_rows_vk(
         VkBuffer ape_buf, VkDeviceSize ape_off, uint32_t ape_type,
         uint32_t width, uint32_t ratio, uint32_t pos0,
         uint32_t src0, uint32_t dst0, uint32_t rows) {
-    if (rows == 0 || width == 0 || width > 4096u || ratio == 0 || ratio > 4u ||
+    if (rows == 0 || width == 0 || width > 4096u || ratio == 0 || ratio > 128u ||
         rows > 65535u || !shader_f32_domain(rows, width, 1)) return 0;
     VkBuffer kv_buf, sc_buf, state_kv_buf, state_score_buf;
     VkDeviceSize kv_off, sc_off, state_kv_off, state_score_off;
@@ -5397,7 +5397,7 @@ int ds4_gpu_compressor_update_tensor(
         bool                    defer_finalize) {
     DS4_VK_TRACE_KERNEL("compressor_update");
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache || !model_map ||
-        head_dim == 0 || ratio == 0 || ratio > 4u || n_rot > head_dim ||
+        head_dim == 0 || ratio == 0 || ratio > 128u || n_rot > head_dim ||
         (n_rot & 1u) != 0 || (ape_type != 0u && ape_type != 1u) || norm_type != 0u)
         return 0;
     const uint32_t width = (ratio == 4u ? 2u : 1u) * head_dim;
@@ -5540,7 +5540,7 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   rms_eps) {
     DS4_VK_TRACE_KERNEL("compressor_prefill");
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
-        head_dim == 0 || ratio == 0 || ratio > 4u || n_tokens == 0 ||
+        head_dim == 0 || ratio == 0 || ratio > 128u || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
         (ape_type != 0u && ape_type != 1u) || norm_type != 0u || n_tokens > 65535u)
     {
@@ -5801,7 +5801,7 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos) {
     if (!out_kv || !out_score || !state_kv || !state_score || !model_map || !x ||
-        in_dim == 0 || width == 0 || ratio == 0 || ratio > 4u ||
+        in_dim == 0 || width == 0 || ratio == 0 || ratio > 128u ||
         in_dim > UINT32_MAX || width > UINT32_MAX ||
         (ape_type != 0u && ape_type != 1u)) {
         return -1;

@@ -158,7 +158,7 @@ float q2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
             for (uint i = 0u; i < 8u; ++i) q8_words[i] = b0[q8group + i];
             for (uint k = 0u; k < 16u; ++k) {
                 uint q0_word = q_words[q2base + (k >> 2u)];
-                uint q1_word = q_words[q2base + 8u + (k >> 2u)];
+                uint q1_word = q_words[q2base + 4u + (k >> 2u)];
                 uint q0 = (q0_word >> ((k & 3u) * 8u + shift)) & 3u;
                 uint q1 = (q1_word >> ((k & 3u) * 8u + shift)) & 3u;
                 uint q8_word0 = q8_words[k >> 2u];

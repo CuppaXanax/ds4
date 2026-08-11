@@ -97,7 +97,7 @@ static int test_matmul_q8_0_prequant() {
         !ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok) ||
         !ds4_gpu_end_commands()) return cleanup();
 
-    std::vector<uint8_t> packed(q->bytes);
+    std::vector<uint8_t> packed(ds4_gpu_tensor_bytes(q));
     if (!ds4_gpu_tensor_read(q, 0, packed.data(), packed.size())) return cleanup();
     const uint8_t *zero_block = packed.data() + (1u * blocks) * 36u;
     for (uint32_t i = 0; i < 36u; i++)

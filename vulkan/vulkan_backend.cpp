@@ -1681,7 +1681,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         {obuf, ooff, (VkDeviceSize)(n_tok * out_dim * sizeof(float))}};
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks, y_scale};
-    if (sh.push_constant_size != sizeof(pc) ||
+    if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader("matmul_q8_0_prequant", &pc, sizeof(pc),
                                 buffers, 3, y_scale, (uint32_t)y_count64,

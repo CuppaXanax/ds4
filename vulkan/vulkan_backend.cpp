@@ -1232,22 +1232,50 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     auto it = g_vk.aligned_cache.find(offset);
     if (it != g_vk.aligned_cache.end()) {
         if (it->second.model_map != model_map || it->second.model_size != model_size ||
-            it->second.in_dim != in_dim || it->second.out_dim != out_dim) return false;
+            it->second.in_dim != in_dim || it->second.out_dim != out_dim) {
+            if (getenv("DS4_VULKAN_DEBUG"))
+                fprintf(stderr,
+                        "ds4: [dbg] aligned q8 identity mismatch off=%llu "
+                        "cached=%llux%llu requested=%llux%llu\n",
+                        (unsigned long long)offset,
+                        (unsigned long long)it->second.in_dim,
+                        (unsigned long long)it->second.out_dim,
+                        (unsigned long long)in_dim,
+                        (unsigned long long)out_dim);
+            return false;
+        }
         it->second.gpu.last_used = ++g_vk.lru_counter;
         it->second.gpu.last_gen = g_vk.cmd_gen;
         entry = &it->second; return true;
     }
     ds4_vulkan_q8_aligned_artifact artifact{};
     if (!ds4_vulkan_q8_aligned_build(&artifact, model_map, model_size, offset, in_dim, out_dim,
-                                     g_vk.caps.min_storage_buffer_offset_alignment)) return false;
+                                     g_vk.caps.min_storage_buffer_offset_alignment)) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr, "ds4: [dbg] aligned q8 build failed off=%llu dims=%llux%llu\n",
+                    (unsigned long long)offset, (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+        return false;
+    }
     const uint64_t raw_bytes = out_dim * artifact.blocks_per_row * 34u;
     if (!remove_raw_weight_overlap(offset, raw_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, offset)) {
+        if (getenv("DS4_VULKAN_DEBUG"))
+            fprintf(stderr,
+                    "ds4: [dbg] aligned q8 reserve failed off=%llu artifact=%llu "
+                    "used=%llu budget=%llu\n",
+                    (unsigned long long)offset,
+                    (unsigned long long)artifact.bytes,
+                    (unsigned long long)g_vk.weight_used,
+                    (unsigned long long)g_vk.weight_budget);
         ds4_vulkan_q8_aligned_free(&artifact);
         return false;
     }
     VkBuffer buf = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE;
     bool ok = upload_aligned_artifact(artifact, buf, alloc);
+    if (!ok && getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr, "ds4: [dbg] aligned q8 upload failed off=%llu bytes=%llu\n",
+                (unsigned long long)offset, (unsigned long long)artifact.bytes);
     if (ok) {
         g_vk.aligned_cache[offset] = {model_map, model_size, offset, in_dim, out_dim,
             artifact.blocks_per_row, artifact.scale_bytes, artifact.payload_offset,

@@ -880,14 +880,20 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
     return 1;  /* DS4 convention: 1 = success */
 }
 
-/* Model ranges are only registered here (metadata).  The actual GPU upload
- * happens lazily in the kernels via ensure_weight(), so models larger than
- * the device heap stream layer-by-layer (llama.cpp-style) instead of failing
- * during startup. */
+static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
+
 int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes, const char *label) {
-    (void)m; (void)s; (void)label;
-    if (bytes == 0) return 0;
+    (void)label;
+    if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off) return 0;
+    set_model_map_identity(m, s);
     g_vk.range_registry[off] = bytes;
+    if (!ensure_weight(off, bytes)) return 0;
+    for (auto &[base, entry] : g_vk.weight_cache) {
+        if (off >= base && off - base <= entry.size && bytes <= entry.size - (off - base)) {
+            entry.last_gen = UINT64_MAX;
+            break;
+        }
+    }
     return 1;
 }
 

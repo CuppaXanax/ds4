@@ -3035,10 +3035,15 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             uint32_t span_count) {
 #ifdef DS4_VULKAN_BUILD
     (void)backend;
-    (void)m;
-    (void)span_offsets;
-    (void)span_sizes;
-    (void)span_count;
+    if (!m || !m->map || m->size == 0) return false;
+    const double t0 = now_sec();
+    uint64_t prepared = 0;
+    if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: Vulkan startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
+            (double)prepared / 1073741824.0, now_sec() - t0);
     return true;
 #else
     if (backend != DS4_BACKEND_CUDA) return true;
@@ -58135,6 +58140,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* Also apply explicit optional Q8 preload settings to the runtime
          * support model when loaded. */
         if (support_model_runtime_ready) {
+#ifndef DS4_VULKAN_BUILD
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
@@ -58145,6 +58151,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+#endif
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));

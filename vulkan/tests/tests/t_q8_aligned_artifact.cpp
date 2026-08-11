@@ -41,12 +41,13 @@ static int test_q8_aligned_artifact() {
     const std::string saved_prequant = had_prequant ? old_prequant : "";
     const uint64_t in_dim = 37;
     const uint64_t out_dim = 5;
+    const uint64_t artifact_out_dim = 7;
     const uint64_t n_tok = 3;
     const uint64_t source_offset = 4096;
     const uint64_t blocks = (in_dim + 31u) / 32u;
-    const uint64_t raw_bytes = out_dim * blocks * 34u;
+    const uint64_t raw_bytes = artifact_out_dim * blocks * 34u;
     std::vector<uint8_t> model(source_offset + raw_bytes, 0xa5);
-    for (uint64_t row = 0; row < out_dim; row++) {
+    for (uint64_t row = 0; row < artifact_out_dim; row++) {
         for (uint64_t block = 0; block < blocks; block++) {
             uint8_t *dst = model.data() + source_offset + (row * blocks + block) * 34u;
             const uint16_t scale = q8_aligned_f32_to_f16(0.125f * (float)(row + block + 1u));
@@ -96,21 +97,21 @@ static int test_q8_aligned_artifact() {
     if (!ds4_gpu_set_model_map(model.data(), model.size())) return cleanup();
     set_test_env("DS4_VULKAN_Q8_ALIGNED", "1");
     if (!ds4_vulkan_q8_aligned_build(&artifact, model.data(), model.size(), source_offset,
-                                     in_dim, out_dim, 64u) ||
+                                     in_dim, artifact_out_dim, 64u) ||
         artifact.payload_offset % 256u != 0 ||
-        artifact.payload_bytes != out_dim * blocks * 32u)
+        artifact.payload_bytes != artifact_out_dim * blocks * 32u)
         return cleanup();
-    for (uint64_t record = 0; record < out_dim * blocks; record++) {
+    for (uint64_t record = 0; record < artifact_out_dim * blocks; record++) {
         const uint8_t *source = original.data() + source_offset + record * 34u;
         if (std::memcmp(artifact.data + record * 2u, source, 2u) != 0 ||
             std::memcmp(artifact.data + artifact.payload_offset + record * 32u,
                         source + 2u, 32u) != 0)
             return cleanup();
     }
-    for (uint64_t i = out_dim * blocks * 2u; i < artifact.payload_offset; i++)
+    for (uint64_t i = artifact_out_dim * blocks * 2u; i < artifact.payload_offset; i++)
         if (artifact.data[i] != 0) return cleanup();
     if (!ds4_gpu_cache_q8_f16_range(model.data(), model.size(), source_offset,
-                                    raw_bytes, in_dim, out_dim, "q8-aligned-test"))
+                                    raw_bytes, in_dim, artifact_out_dim, "q8-aligned-test"))
         return cleanup();
 
     std::memset(model.data() + source_offset, 0, (size_t)raw_bytes);

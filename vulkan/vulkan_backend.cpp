@@ -1232,7 +1232,7 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     auto it = g_vk.aligned_cache.find(offset);
     if (it != g_vk.aligned_cache.end()) {
         if (it->second.model_map != model_map || it->second.model_size != model_size ||
-            it->second.in_dim != in_dim || it->second.out_dim != out_dim) {
+            it->second.in_dim != in_dim || it->second.out_dim < out_dim) {
             if (getenv("DS4_VULKAN_DEBUG"))
                 fprintf(stderr,
                         "ds4: [dbg] aligned q8 identity mismatch off=%llu "
@@ -1946,14 +1946,19 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
         if (!ensure_aligned_weight(model_map, model_size, weight_offset,
                                    in_dim, out_dim, aligned)) return 0;
+        const uint64_t requested_records = out_dim * blocks;
+        const uint64_t requested_scale_bytes = (requested_records * 2u + 3u) & ~3ull;
+        const uint64_t requested_payload_bytes = requested_records * 32u;
+        if (requested_scale_bytes > aligned->scale_bytes ||
+            requested_payload_bytes > aligned->payload_bytes) return 0;
         if (g_vk.caps.max_storage_buffer_range != 0 &&
-            (aligned->scale_bytes > g_vk.caps.max_storage_buffer_range ||
-             aligned->payload_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
+            (requested_scale_bytes > g_vk.caps.max_storage_buffer_range ||
+             requested_payload_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
         buffers[descriptor_count++] = {aligned->gpu.buffer, 0,
-                                       (VkDeviceSize)aligned->scale_bytes};
+                                       (VkDeviceSize)requested_scale_bytes};
         buffers[descriptor_count++] = {aligned->gpu.buffer,
                                        (VkDeviceSize)aligned->payload_offset,
-                                       (VkDeviceSize)aligned->payload_bytes};
+                                       (VkDeviceSize)requested_payload_bytes};
     } else {
         VkBuffer weight_buffer = VK_NULL_HANDLE;
         VkDeviceSize weight_buffer_offset = 0;

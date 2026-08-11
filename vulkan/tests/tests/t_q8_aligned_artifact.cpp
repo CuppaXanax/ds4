@@ -68,7 +68,7 @@ static int test_q8_aligned_artifact() {
     int result = 1;
     ds4_vulkan_q8_aligned_artifact artifact{};
     auto cleanup = [&]() {
-        ds4_gpu_release_q8_f16_cache();
+        ds4_gpu_set_model_map(model.data(), model.size());
         ds4_vulkan_q8_aligned_free(&artifact);
         ds4_gpu_tensor_free(aligned_out);
         ds4_gpu_tensor_free(raw_out);

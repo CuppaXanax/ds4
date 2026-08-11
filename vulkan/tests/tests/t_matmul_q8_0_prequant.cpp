@@ -1,6 +1,9 @@
 /* Kernel test for reusable Q8_0 activation quantization and consumption. */
 #include "../tests.h"
 #include "../../ds4_gpu.h"
+#include <vulkan/vulkan.h>
+#include "../../include/vk_mem_alloc.h"
+#include "../../../ds4_vulkan.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -75,13 +78,16 @@ static int test_matmul_q8_0_prequant() {
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
     ds4_gpu_tensor *out0 = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
     ds4_gpu_tensor *out1 = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
-    if (!x || !q || !out0 || !out1) {
+    ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
+    if (!x || !q || !out0 || !out1 || !out_ref) {
+        ds4_gpu_tensor_free(out_ref);
         ds4_gpu_tensor_free(out1); ds4_gpu_tensor_free(out0);
         ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(x);
         return 1;
     }
     int rc = 1;
     auto cleanup = [&]() {
+        ds4_gpu_tensor_free(out_ref);
         ds4_gpu_tensor_free(out1); ds4_gpu_tensor_free(out0);
         ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(x);
         return rc;
@@ -108,6 +114,21 @@ static int test_matmul_q8_0_prequant() {
             weight1, in_dim, out_dim, q, n_tok) ||
         !ds4_gpu_end_commands()) return cleanup();
 
+    std::vector<float> established[2] = {
+        std::vector<float>(n_tok * out_dim),
+        std::vector<float>(n_tok * out_dim),
+    };
+    const uint64_t established_weights[2] = {weight0, weight1};
+    for (int which = 0; which < 2; which++) {
+        if (!ds4_gpu_begin_commands() ||
+            !ds4_gpu_matmul_q8_0_tensor(out_ref, model.data(), model.size(),
+                established_weights[which], in_dim, out_dim, x, n_tok) ||
+            !ds4_gpu_end_commands() ||
+            !ds4_gpu_tensor_read(out_ref, 0, established[which].data(),
+                                 established[which].size() * sizeof(float)))
+            return cleanup();
+    }
+
     for (int which = 0; which < 2; which++) {
         std::vector<float> got(n_tok * out_dim);
         ds4_gpu_tensor *out = which == 0 ? out0 : out1;
@@ -129,15 +150,18 @@ static int test_matmul_q8_0_prequant() {
             }
             for (uint64_t row = 0; row < out_dim; row++) {
                 const uint8_t *w = model.data() + weight + row * row_bytes;
-                double sum = 0.0;
+                float sum = 0.0f;
                 for (uint64_t b = 0; b < blocks; b++) {
                     uint16_t sb; std::memcpy(&sb, w + b * 34u, sizeof(sb));
                     int dot = 0;
                     for (uint32_t i = 0; i < 32u; i++)
                         dot += (int)((int8_t)w[b * 34u + 2u + i]) * xq[b * 32u + i];
-                    sum += (double)f16_to_f32(sb) * (double)xscale[b] * dot;
+                    sum += f16_to_f32(sb) * xscale[b] * (float)dot;
                 }
-                if (std::fabsf(got[t * out_dim + row] - (float)sum) > 1e-5f) return cleanup();
+                if (std::fabsf(got[t * out_dim + row] - sum) > 1e-5f) return cleanup();
+                if (std::fabsf(got[t * out_dim + row] -
+                               established[which][t * out_dim + row]) > 1e-5f)
+                    return cleanup();
             }
         }
     }

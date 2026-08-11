@@ -379,7 +379,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
-        {"matmul_q8_0_prequant", 16, 3},
+        {"matmul_q8_0_prequant", 20, 3},
         {"group_copy", 24, 6},
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
         {"rms_norm_weight_rows", 12, 6},
@@ -1602,7 +1602,16 @@ int ds4_gpu_quantize_q8_0_tensor(
     const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
     if ((align && ((xoff | ooff) % align) != 0) ||
         n_tok * in_dim * sizeof(float) > UINT32_MAX ||
-        n_tok * blocks * 36u > UINT32_MAX) return 0;
+        n_tok * blocks * 36u > UINT32_MAX ||
+        (g_vk.caps.max_storage_buffer_range != 0 &&
+         (n_tok * in_dim * sizeof(float) > g_vk.caps.max_storage_buffer_range ||
+          n_tok * blocks * 36u > g_vk.caps.max_storage_buffer_range))) return 0;
+    if (g_vk.caps.max_compute_work_group_size[0] < 256u ||
+        g_vk.caps.max_compute_work_group_size[1] < 1u ||
+        g_vk.caps.max_compute_work_group_size[2] < 1u ||
+        g_vk.caps.max_compute_work_group_invocations < 256u ||
+        blocks > g_vk.caps.max_compute_work_group_count[0] ||
+        n_tok > g_vk.caps.max_compute_work_group_count[2]) return 0;
     auto &ctx = get_cmd_ctx();
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
@@ -1639,6 +1648,24 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     if (!find_tensor_buffer(x_q8, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
     const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
     if (align && ((xoff | ooff) % align) != 0) return 0;
+    auto si = g_vk.shader_map.find("matmul_q8_0_prequant");
+    if (si == g_vk.shader_map.end()) return 0;
+    auto &sh = g_vk.shaders[si->second];
+    if (g_vk.caps.max_compute_work_group_size[0] < 256u ||
+        g_vk.caps.max_compute_work_group_size[1] < 1u ||
+        g_vk.caps.max_compute_work_group_size[2] < 1u ||
+        g_vk.caps.max_compute_work_group_invocations < 256u) return 0;
+    const uint32_t y_scale = std::min((uint32_t)out_dim,
+                                      g_vk.caps.max_compute_work_group_count[0]);
+    if (y_scale == 0) return 0;
+    const uint64_t y_count64 = (out_dim + y_scale - 1u) / y_scale;
+    if (y_count64 > g_vk.caps.max_compute_work_group_count[1] ||
+        n_tok > g_vk.caps.max_compute_work_group_count[2]) return 0;
+    const uint64_t output_bytes = n_tok * out_dim * sizeof(float);
+    if (g_vk.caps.max_storage_buffer_range != 0 &&
+        (q_bytes > g_vk.caps.max_storage_buffer_range ||
+         weight_bytes > g_vk.caps.max_storage_buffer_range ||
+         output_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
     auto &ctx = get_cmd_ctx();
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
@@ -1650,10 +1677,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         {xbuf, xoff, (VkDeviceSize)q_bytes},
         {wit->second.buffer, 0, (VkDeviceSize)weight_bytes},
         {obuf, ooff, (VkDeviceSize)(n_tok * out_dim * sizeof(float))}};
-    struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks};
+    struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks, y_scale};
+    if (sh.push_constant_size != sizeof(pc) ||
+        g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader("matmul_q8_0_prequant", &pc, sizeof(pc),
-                                buffers, 3, (uint32_t)out_dim, 1,
+                                buffers, 3, y_scale, (uint32_t)y_count64,
                                 (uint32_t)n_tok, resume_recording);
 }
 

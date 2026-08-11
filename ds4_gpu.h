@@ -652,26 +652,6 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Diagnostic Vulkan path: quantize F32 rows once into padded Q8_0 blocks.
- * Each block is 36 bytes: F32 scale followed by 32 packed int8 values. */
-int ds4_gpu_quantize_q8_0_tensor(
-        ds4_gpu_tensor       *out,
-        const ds4_gpu_tensor *x,
-        uint64_t                in_dim,
-        uint64_t                n_tok);
-
-/* Diagnostic Vulkan path: consume ds4_gpu_quantize_q8_0_tensor output against
- * a GGUF Q8_0 matrix without re-quantizing the activations. */
-int ds4_gpu_matmul_q8_0_prequant_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x_q8,
-        uint64_t                n_tok);
-
 /* Multi-row decode projections that preserve the one-row reduction order. */
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,

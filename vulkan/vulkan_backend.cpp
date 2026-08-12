@@ -5723,9 +5723,15 @@ static bool ds4gk_routed_common(
     }
     if (ok) {
         pc.mode = 1;
+        const char *iq2_words_env = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
+        /* Unaligned four-byte reconstruction may fetch the following uint.
+         * Keep the exact legacy path for a descriptor with a partial tail. */
+        const bool iq2_words = gate_type == 16 && (gate_bytes & 3u) == 0u &&
+            (!iq2_words_env || strcmp(iq2_words_env, "0") != 0);
+        pc.q2_words = iq2_words ? 1u : 0u;
         VkDescriptorBufferInfo gate_buffers[6] = {
             q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
-        ok = ds4gk_routed_dispatch("gate", pc,
+        ok = ds4gk_routed_dispatch(iq2_words ? "gate_iq2_words" : "gate", pc,
             gate_buffers,
             ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
             n_tokens, n_expert, sets);
@@ -5733,12 +5739,13 @@ static bool ds4gk_routed_common(
             pc.add_enabled = 1;
             VkDescriptorBufferInfo up_buffers[6] = {
                 q8_info, up_model, up_model, selected_info, up_info, up_info};
-            ok = ds4gk_routed_dispatch("up", pc,
+            ok = ds4gk_routed_dispatch(iq2_words ? "up_iq2_words" : "up", pc,
                 up_buffers,
                 ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
                 n_tokens, n_expert, sets);
             pc.add_enabled = 0;
         }
+        pc.q2_words = 0;
     }
     if (ok) {
         pc.mode = 2;

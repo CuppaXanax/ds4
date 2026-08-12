@@ -526,7 +526,8 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     }
     if (ctx.timeline_enabled)
         ctx.timeline_events.reserve((size_t)ctx.timeline_max_dispatches * 16u + 256u);
-    if ((getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") || ctx.timeline_enabled) &&
+    if ((getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") || ctx.timeline_enabled ||
+         getenv("DS4_VULKAN_TIMELINE_LAYER")) &&
         g_vk.timestamp_valid_bits != 0) {
         VkQueryPoolCreateInfo qpci{};
         qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;

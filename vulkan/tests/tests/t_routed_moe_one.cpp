@@ -532,6 +532,40 @@ static int run_moe_case(
         return 1;
     }
 
+    const std::vector<float> public_gate = got_gate;
+    const std::vector<float> public_up = got_up;
+    const std::vector<float> public_mid = got_mid;
+    const std::vector<float> public_exp = got_exp;
+    const std::vector<float> public_out = got_out;
+    ok = ds4_gpu_routed_moe_one_trusted_tensor(
+            out_t, gate_t, up_t, mid_t, exp_t,
+            model.data(), model.size(),
+            gate_offset, up_offset, down_offset,
+            gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim,
+            sel_t, w_t, n_total_expert, n_expert,
+            clamp, x_t, add_t, 0, false);
+    read_ok = ok != 0 &&
+        ds4_gpu_tensor_read(gate_t, 0, got_gate.data(), got_gate.size() * sizeof(float)) != 0 &&
+        ds4_gpu_tensor_read(up_t,   0, got_up.data(),   got_up.size() * sizeof(float)) != 0 &&
+        ds4_gpu_tensor_read(mid_t,  0, got_mid.data(),  got_mid.size() * sizeof(float)) != 0 &&
+        ds4_gpu_tensor_read(exp_t,  0, got_exp.data(),  got_exp.size() * sizeof(float)) != 0 &&
+        ds4_gpu_tensor_read(out_t,  0, got_out.data(),  got_out.size() * sizeof(float)) != 0;
+    if (!read_ok ||
+        std::memcmp(public_gate.data(), got_gate.data(), got_gate.size() * sizeof(float)) != 0 ||
+        std::memcmp(public_up.data(), got_up.data(), got_up.size() * sizeof(float)) != 0 ||
+        std::memcmp(public_mid.data(), got_mid.data(), got_mid.size() * sizeof(float)) != 0 ||
+        std::memcmp(public_exp.data(), got_exp.data(), got_exp.size() * sizeof(float)) != 0 ||
+        std::memcmp(public_out.data(), got_out.data(), got_out.size() * sizeof(float)) != 0) {
+        fprintf(stderr,
+                "routed_moe_one[%s]: trusted/public Vulkan paths differ\n",
+                label);
+        freet();
+        return 1;
+    }
+
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
                        const std::vector<float> &ref, size_t n) -> bool {
         bool good = true;
@@ -814,6 +848,24 @@ static int test_routed_moe_one(void) {
             fprintf(stderr, "routed_moe_one: out-of-range expert should return 0\n");
             rc = 1;
         }
+        /* The same validation contract must hold inside a layer-batched
+         * command scope; this exercises the forced retirement before the
+         * host reads the validation flag. */
+        if (rc == 0 &&
+            (!ds4_gpu_begin_commands() || !ds4_gpu_batch_layer_begin(0))) {
+            rc = 1;
+        }
+        if (rc == 0 &&
+            ds4_gpu_routed_moe_one_tensor(out_t, out_t, out_t, out_t, out_t,
+                                          model, sizeof(model), 0, 0, 0,
+                                          8, 8, 272, 34, 272, 34,
+                                          8, 8, 8, sel_t, w_t, 2, 2, 0.25f,
+                                          x_t, nullptr, 0, false) != 0) {
+            fprintf(stderr,
+                    "routed_moe_one: batched out-of-range expert should return 0\n");
+            rc = 1;
+        }
+        if (!ds4_gpu_batch_layer_end(0) || !ds4_gpu_end_commands()) rc = 1;
         ds4_gpu_tensor_free(out_t);
         ds4_gpu_tensor_free(sel_t);
         ds4_gpu_tensor_free(w_t);

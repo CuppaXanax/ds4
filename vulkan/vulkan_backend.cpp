@@ -5588,7 +5588,7 @@ static bool ds4gk_routed_common(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t n_tokens, bool *mid_is_f16) {
+        uint32_t n_tokens, bool selected_trusted, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
@@ -5670,12 +5670,14 @@ static bool ds4gk_routed_common(
         return false;
     ds4_gpu_tensor q8{}, invalid{};
     if (ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) != 0 ||
-        ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0) {
+        (!selected_trusted &&
+         ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0)) {
         ds4_gpu_tensor_free_in_place(&q8);
         return false;
     }
     const uint32_t zero = 0;
-    if (!ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
+    if (!selected_trusted &&
+        !ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
         ds4_gpu_tensor_free_in_place(&invalid);
         ds4_gpu_tensor_free_in_place(&q8);
         return false;
@@ -5688,17 +5690,25 @@ static bool ds4gk_routed_common(
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
           (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
-    VkDescriptorBufferInfo q8_info, invalid_info;
-    ok = ds4gk_routed_buffer(&q8, q8_info) &&
-         ds4gk_routed_buffer(&invalid, invalid_info);
-    if (ok) {
+    VkDescriptorBufferInfo q8_info, invalid_info{};
+    ok = ds4gk_routed_buffer(&q8, q8_info);
+    if (ok && !selected_trusted) {
+        ok = ds4gk_routed_buffer(&invalid, invalid_info);
+    }
+    if (ok && !selected_trusted) {
         pc.mode = 5;
         VkDescriptorBufferInfo validate_buffers[6] = {
             selected_info, selected_info, selected_info, selected_info,
             invalid_info, invalid_info};
         ok = ds4gk_routed_dispatch("validate_selected", pc,
-            validate_buffers, 1, n_tokens, 1, sets) &&
-             ds4gk_routed_flush(sets);
+            validate_buffers, 1, n_tokens, 1, sets);
+        if (ok && get_cmd_ctx().layer_batch_active) {
+            /* This is an intentionally untrusted public call.  Unlike the
+             * normal graph path, the host must observe the validation result
+             * before any expert address is consumed. */
+            ok = retire_layer_batch_span(get_cmd_ctx(), true) != 0;
+        }
+        if (ok) ok = ds4gk_routed_flush(sets);
         uint32_t invalid_value = 0;
         if (ok) ok = ds4_gpu_tensor_read(&invalid, 0, &invalid_value,
                                           sizeof(invalid_value)) != 0 &&
@@ -5794,7 +5804,7 @@ static bool ds4gk_routed_common(
             (out_dim + 255u) / 256u, n_tokens, 1, sets);
     }
     if (!ds4gk_routed_flush(sets)) ok = false;
-    ds4_gpu_tensor_free_in_place(&invalid);
+    if (!selected_trusted) ds4_gpu_tensor_free_in_place(&invalid);
     ds4_gpu_tensor_free_in_place(&q8);
     if (resume_recording && !get_cmd_ctx().recording && !begin_cmd()) ok = false;
     return ok;
@@ -5841,7 +5851,51 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
         gate_offset, up_offset, down_offset, gate_type, down_type,
         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-        n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16) ? 1 : 0;
+        n_total_expert, n_expert, clamp, x, add_in, 1, false,
+        &mid_is_f16) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_routed_moe_one_trusted_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              gate_type,
+        uint32_t              down_type,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        float                 clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        uint32_t              layer_index,
+        bool                  force_resident)
+{
+    DS4_VK_TRACE_KERNEL("routed_moe_one_trusted");
+    (void)layer_index;
+    (void)force_resident;
+    bool mid_is_f16 = false;
+    return ds4gk_routed_common(
+        out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, add_in, 1, true,
+        &mid_is_f16) ? 1 : 0;
 }
 
 /* Prefill routed MoE over n_tokens tokens.  Same math as the single-token
@@ -5890,7 +5944,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(
         gate_offset, up_offset, down_offset, gate_type, down_type,
         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-        n_total_expert, n_expert, clamp, x, nullptr, n_tokens, mid_is_f16) ? 1 : 0;
+        n_total_expert, n_expert, clamp, x, nullptr, n_tokens, false,
+        mid_is_f16) ? 1 : 0;
 }
 
 /* =========================================================================

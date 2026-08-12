@@ -24743,7 +24743,21 @@ static bool metal_graph_encode_decode_layer_phase(
         parallel_full_ffn = false;
 #endif
     }
-    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+#ifdef DS4_VULKAN_BUILD
+    /* Trust only the normal in-graph Vulkan router producer.  CPU routing,
+     * router-ablation diagnostics, and split-phase callers retain the public
+     * validation/readback contract even when they reuse the graph tensor. */
+    const bool trusted_vulkan_selected =
+        !external_routed &&
+        !metal_graph_decode_cpu_router_applicable(g, layer) &&
+        !metal_graph_tp_ablate("router");
+#define DS4_GPU_ROUTED_MOE_ONE_DECODE \
+    (trusted_vulkan_selected ? ds4_gpu_routed_moe_one_trusted_tensor : \
+                               ds4_gpu_routed_moe_one_tensor)
+#else
+#define DS4_GPU_ROUTED_MOE_ONE_DECODE ds4_gpu_routed_moe_one_tensor
+#endif
+    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = DS4_GPU_ROUTED_MOE_ONE_DECODE(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
                                                  metal_graph_routed_mid(g),
@@ -24763,8 +24777,9 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  DS4_N_EXPERT,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                  NULL,
-                                                 il,
-                                                 false) != 0;
+                                                  il,
+                                                  false) != 0;
+#undef DS4_GPU_ROUTED_MOE_ONE_DECODE
     if (!ok && parallel_full_ffn) {
 #if defined(__APPLE__)
         ds4_gpu_parallel_ffn_abort();

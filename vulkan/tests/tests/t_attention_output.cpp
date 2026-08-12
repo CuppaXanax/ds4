@@ -135,7 +135,7 @@ static void make_q8_0_row(uint8_t *dst, const float *vals, uint64_t n) {
 /* Deterministic pseudo-random float in [-1, 1). */
 static float lcg_float(uint64_t *s) {
     *s = *s * 6364136223846793005ull + 1442695040888963407ull;
-    return (float)((double)((*s >> 33) & 0x7fffffffu) / (double)0x40000000u) * 2.0f - 1.0f;
+    return (float)((double)((*s >> 33) & 0x7fffffffu) / (double)0x80000000u) * 2.0f - 1.0f;
 }
 
 /* ---- attention_output_low_q8: single-token stage A ---- */
@@ -222,12 +222,13 @@ REGISTER_TEST(attention_output_low_q8, test_attention_output_low_q8);
 
 /* ---- attention_output_q8_batch: two-stage batch projection ---- */
 static int test_attention_output_q8_batch(void) {
-    const uint32_t n_groups  = 2;
-    const uint64_t group_dim = 64;
-    const uint64_t rank      = 16;
-    const uint32_t n_tokens  = 3;
-    const uint64_t out_dim   = 24;
-    const uint64_t low_dim   = (uint64_t)n_groups * rank;  /* 32 */
+    const bool production_shape = getenv("DS4_TEST_PRODUCTION_SHAPE") != nullptr;
+    const uint32_t n_groups  = production_shape ? 8u : 2u;
+    const uint64_t group_dim = production_shape ? 4096u : 64u;
+    const uint64_t rank      = production_shape ? 1024u : 16u;
+    const uint32_t n_tokens  = production_shape ? 1u : 3u;
+    const uint64_t out_dim   = production_shape ? 4096u : 24u;
+    const uint64_t low_dim   = (uint64_t)n_groups * rank;
 
     const uint64_t blocks_a = (group_dim + 31u) / 32u;      /* 2 */
     const uint64_t row_a_bytes = blocks_a * 34u;
@@ -318,7 +319,14 @@ static int test_attention_output_q8_batch(void) {
     }
 
     int rc = 1;
-    if (ds4_gpu_attention_output_q8_batch_tensor(out, low, gt, lt,
+    int gpu_ok = 1;
+    if (production_shape)
+        gpu_ok = ds4_gpu_attention_output_q8_batch_tensor(out, low, gt, lt,
+                                                          model, model_size,
+                                                          out_a_offset, out_b_offset,
+                                                          group_dim, rank, n_groups, out_dim,
+                                                          heads, n_tokens);
+    if (gpu_ok && ds4_gpu_attention_output_q8_batch_tensor(out, low, gt, lt,
                                                  model, model_size,
                                                  out_a_offset, out_b_offset,
                                                  group_dim, rank, n_groups, out_dim,

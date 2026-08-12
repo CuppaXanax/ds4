@@ -753,6 +753,14 @@ static bool dist_decode_profile_enabled(void) {
     return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
 }
 
+/* Keep relay timing separate from decode profiling: the result path has one
+ * relay per remote span, and adding it to normal diagnostics makes the logs
+ * unnecessarily noisy.  All timestamps use CLOCK_MONOTONIC via dist_now_sec.
+ */
+static bool dist_relay_profile_enabled(void) {
+    return getenv("DS4_DIST_RELAY_PROFILE") != NULL;
+}
+
 static bool dist_parse_positive_u32(
         const char *s,
         const char *name,
@@ -6280,7 +6288,12 @@ static int dist_worker_upstream_send_work_result(
         uint32_t telemetry_count,
         const void *payload,
         uint32_t payload_bytes) {
+    const bool relay_profile = dist_relay_profile_enabled() && telemetry_count == 1u &&
+        telemetry && telemetry[0].n_tokens == 1u;
+    const double mutex_t0 = relay_profile ? dist_now_sec() : 0.0;
     pthread_mutex_lock(&upstream->write_mu);
+    const double mutex_t1 = relay_profile ? dist_now_sec() : 0.0;
+    const double write_t0 = relay_profile ? dist_now_sec() : 0.0;
     int rc = dist_send_work_result(upstream->fd,
                                    request_id,
                                    result_hash,
@@ -6291,7 +6304,17 @@ static int dist_worker_upstream_send_work_result(
                                    telemetry_count,
                                    payload,
                                    payload_bytes);
+    const double write_t1 = relay_profile ? dist_now_sec() : 0.0;
     pthread_mutex_unlock(&upstream->write_mu);
+    if (relay_profile) {
+        fprintf(stderr,
+                "ds4: dist relay profile: request=%llu layers=%u:%u route=%u "
+                "final_mutex_wait=%.3fms final_result_write=%.3fms payload=%.2fMiB rc=%d\n",
+                (unsigned long long)request_id,
+                telemetry[0].layer_start, telemetry[0].layer_end, telemetry[0].route_index,
+                (mutex_t1 - mutex_t0) * 1000.0, (write_t1 - write_t0) * 1000.0,
+                (double)payload_bytes / (1024.0 * 1024.0), rc);
+    }
     return rc;
 }
 
@@ -6452,7 +6475,10 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
     for (;;) {
         uint32_t type = 0, bytes = 0;
         char err[256];
+        const bool relay_profile = dist_relay_profile_enabled();
+        const double header_t0 = relay_profile ? dist_now_sec() : 0.0;
         int rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
+        const double header_t1 = relay_profile ? dist_now_sec() : 0.0;
         if (rc <= 0) {
             uint64_t pending_request = 0;
             if (dist_worker_forwarder_pop_request(forwarder, &pending_request, NULL, NULL)) {
@@ -6485,7 +6511,9 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
         }
 
         ds4_dist_result_fixed wire_result;
+        const double fixed_t0 = relay_profile ? dist_now_sec() : 0.0;
         rc = dist_read_full(fd, &wire_result, sizeof(wire_result));
+        const double fixed_t1 = relay_profile ? dist_now_sec() : 0.0;
         if (rc <= 0) {
             if (dist_worker_forwarder_pop_request(forwarder, &expected_request, NULL, NULL)) {
                 dist_worker_upstream_send_work_error(upstream,
@@ -6539,7 +6567,9 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
                        (unsigned long long)got_request);
             break;
         }
-        local_telemetry.downstream_wait_usec = dist_usec_since(downstream_t0, dist_now_sec());
+        const double result_received_t = relay_profile ? dist_now_sec() : 0.0;
+        local_telemetry.downstream_wait_usec = dist_usec_since(downstream_t0,
+                                                                relay_profile ? result_received_t : dist_now_sec());
         const uint64_t out_telemetry_bytes64 =
             (uint64_t)result.telemetry_bytes + sizeof(ds4_dist_telemetry_fixed);
         const uint32_t out_telemetry_count = result.telemetry_count + 1u;
@@ -6568,30 +6598,41 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
                    out_telemetry_count,
                    result.payload_bytes);
 
+        const double mutex_t0 = relay_profile ? dist_now_sec() : 0.0;
         pthread_mutex_lock(&upstream->write_mu);
+        const double mutex_t1 = relay_profile ? dist_now_sec() : 0.0;
         result.telemetry_count = out_telemetry_count;
         result.telemetry_bytes = out_telemetry_bytes;
         ds4_dist_result_fixed out_wire_result = result;
         dist_result_to_wire(&out_wire_result);
+        const double upstream_header_t0 = relay_profile ? dist_now_sec() : 0.0;
         int write_rc = dist_write_frame_header(upstream->fd,
                                                DS4_DIST_MSG_RESULT,
                                                (uint32_t)out_frame_bytes64);
         if (write_rc == 0) write_rc = dist_write_full(upstream->fd, &out_wire_result, sizeof(out_wire_result));
+        const double upstream_header_t1 = relay_profile ? dist_now_sec() : 0.0;
 
         uint32_t remaining = result.telemetry_bytes - (uint32_t)sizeof(ds4_dist_telemetry_fixed);
+        double telemetry_read_sec = 0.0;
+        double telemetry_write_sec = 0.0;
         while (write_rc == 0 && remaining > 0) {
             uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
+            const double telemetry_read_t0 = relay_profile ? dist_now_sec() : 0.0;
             rc = dist_read_full(fd, buf, n);
+            if (relay_profile) telemetry_read_sec += dist_now_sec() - telemetry_read_t0;
             if (rc <= 0) {
                 write_rc = -1;
                 break;
             }
+            const double telemetry_write_t0 = relay_profile ? dist_now_sec() : 0.0;
             if (dist_write_full(upstream->fd, buf, n) != 0) {
                 write_rc = -1;
                 break;
             }
+            if (relay_profile) telemetry_write_sec += dist_now_sec() - telemetry_write_t0;
             remaining -= n;
         }
+        const double local_telemetry_write_t0 = relay_profile ? dist_now_sec() : 0.0;
         if (write_rc == 0) {
             ds4_dist_telemetry_fixed local_wire = local_telemetry;
             dist_telemetry_to_wire(&local_wire);
@@ -6599,22 +6640,52 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
                 write_rc = -1;
             }
         }
+        const double local_telemetry_write_t1 = relay_profile ? dist_now_sec() : 0.0;
 
         remaining = result.payload_bytes;
+        double payload_read_sec = 0.0;
+        double payload_write_sec = 0.0;
         while (write_rc == 0 && remaining > 0) {
             uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
+            const double payload_read_t0 = relay_profile ? dist_now_sec() : 0.0;
             rc = dist_read_full(fd, buf, n);
+            if (relay_profile) payload_read_sec += dist_now_sec() - payload_read_t0;
             if (rc <= 0) {
                 write_rc = -1;
                 break;
             }
+            const double payload_write_t0 = relay_profile ? dist_now_sec() : 0.0;
             if (dist_write_full(upstream->fd, buf, n) != 0) {
                 write_rc = -1;
                 break;
             }
+            if (relay_profile) payload_write_sec += dist_now_sec() - payload_write_t0;
             remaining -= n;
         }
         pthread_mutex_unlock(&upstream->write_mu);
+
+        if (relay_profile && local_telemetry.n_tokens == 1u) {
+            fprintf(stderr,
+                    "ds4: dist relay profile: request=%llu layers=%u:%u route=%u "
+                    "result_wait=%.3fms header_read=%.3fms fixed_read=%.3fms "
+                    "mutex_wait=%.3fms upstream_header_write=%.3fms "
+                    "telemetry_read=%.3fms telemetry_write=%.3fms local_telemetry_write=%.3fms "
+                    "payload_read=%.3fms payload_write=%.3fms payload=%.2fMiB rc=%d\n",
+                    (unsigned long long)got_request,
+                    local_telemetry.layer_start, local_telemetry.layer_end,
+                    local_telemetry.route_index,
+                    (double)local_telemetry.downstream_wait_usec / 1000.0,
+                    (header_t1 - header_t0) * 1000.0,
+                    (fixed_t1 - fixed_t0) * 1000.0,
+                    (mutex_t1 - mutex_t0) * 1000.0,
+                    (upstream_header_t1 - upstream_header_t0) * 1000.0,
+                    telemetry_read_sec * 1000.0,
+                    telemetry_write_sec * 1000.0,
+                    (local_telemetry_write_t1 - local_telemetry_write_t0) * 1000.0,
+                    payload_read_sec * 1000.0,
+                    payload_write_sec * 1000.0,
+                    (double)result.payload_bytes / (1024.0 * 1024.0), write_rc);
+        }
 
         DIST_DEBUG("relay wrote result request=%llu write_rc=%d remaining=%u",
                    (unsigned long long)got_request,

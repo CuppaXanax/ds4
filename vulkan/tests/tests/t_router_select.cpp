@@ -55,7 +55,8 @@ static int run_router_case(const float *logits, uint32_t token,
                            const float *bias, float scale,
                            uint32_t n_expert, uint32_t n_expert_used,
                            uint32_t n_expert_groups, uint32_t n_group_used,
-                           bool has_bias, bool hash_mode, const char *label)
+                           bool has_bias, bool hash_mode,
+                           const int32_t *expected_selected, const char *label)
 {
     const uint64_t logits_bytes = (uint64_t)n_expert * sizeof(float);
     ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc((uint64_t)n_expert_used * sizeof(int32_t));
@@ -124,6 +125,8 @@ static int run_router_case(const float *logits, uint32_t token,
             ok = true;
             for (uint32_t k = 0; k < n_expert_used && ok; k++)
                 if (got_sel[k] != ref_sel[k]) ok = false;
+            for (uint32_t k = 0; k < n_expert_used && ok && expected_selected; k++)
+                if (got_sel[k] != expected_selected[k]) ok = false;
             for (uint32_t i = 0; i < n_expert && ok; i++)
                 if (!(std::fabsf(got_p[i] - ref_prob[i]) <= 1e-4f)) ok = false;
             for (uint32_t k = 0; k < n_expert_used && ok; k++)
@@ -169,6 +172,7 @@ static int test_router_select(void) {
     /* Case 1: no bias. */
     rc |= run_router_case(logits, token, nullptr, scale,
                           n_expert, n_expert_used, 0, 0, false, false,
+                          nullptr,
                           "no-bias");
 
     /* Case 2: has_bias with a synthetic model buffer registered via
@@ -176,6 +180,7 @@ static int test_router_select(void) {
     float bias[n_expert] = { -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f };
     rc |= run_router_case(logits, token, bias, scale,
                           n_expert, n_expert_used, 0, 0, true, false,
+                          nullptr,
                           "has-bias");
 
     /* Case 3: all -inf logits -> zero probabilities and zero weights. */
@@ -183,7 +188,19 @@ static int test_router_select(void) {
     for (uint32_t i = 0; i < n_expert; i++) ninf_logits[i] = -INFINITY;
     rc |= run_router_case(ninf_logits, token, nullptr, scale,
                           n_expert, n_expert_used, 0, 0, false, false,
+                          nullptr,
                           "all-ninf");
+
+    /* Seven equal biased scores must select the lowest six expert IDs. */
+    float tied_logits[n_expert] = {};
+    float tie_bias[n_expert] = {};
+    const uint32_t tied_experts[] = {120u, 5u, 80u, 43u, 17u, 3u, 200u};
+    for (uint32_t expert : tied_experts) tie_bias[expert] = 1.0f;
+    const int32_t expected_ties[n_expert_used] = {3, 5, 17, 43, 80, 120};
+    rc |= run_router_case(tied_logits, token, tie_bias, scale,
+                          n_expert, n_expert_used, 0, 0, true, false,
+                          expected_ties,
+                          "stable-bias-ties");
 
     /* Case 4: error path - null pointers must return 0. */
     if (ds4_gpu_router_select_tensor(nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0,
@@ -204,7 +221,7 @@ static int test_router_select_batch(void) {
         0.1f, 0.5f, -0.2f, 2.0f, 1.0f, -1.0f, 0.0f, 3.0f,
         1.2f, -0.4f, 2.5f, 0.3f, 1.8f, 0.1f, -2.0f, 0.7f,
     };
-    const int32_t tokens[n_tokens] = {3, 99};
+    const int32_t tokens[n_tokens] = {1, 99};
     const float bias[n_expert] = {
         -0.5f, 0.1f, 0.2f, -0.3f, 0.05f, -0.05f, 0.0f, 0.15f,
     };
@@ -220,7 +237,8 @@ static int test_router_select_batch(void) {
         hash[(uint64_t)row * n_expert_used] = (int32_t)((row + 1u) % n_expert);
         hash[(uint64_t)row * n_expert_used + 1u] = (int32_t)((row + 4u) % n_expert);
     }
-    hash[1] = -1;
+    /* Token 1 reads the invalid ID; token 99 falls back to hash row 0. */
+    hash[n_expert_used + 1u] = -1;
 
     ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(
         (uint64_t)n_tokens * n_expert_used * sizeof(int32_t));
@@ -267,6 +285,17 @@ static int test_router_select_batch(void) {
             std::memcmp(got_logits, logits, sizeof(logits)) != 0) {
             fprintf(stderr, "router_select_batch[%s]: read or immutability failure\n", label);
             return 1;
+        }
+        if (hash_mode) {
+            const int32_t expected_hash_selected[] = {
+                2, -1, 0, 0, 0, 0,
+                1, 4, 0, 0, 0, 0,
+            };
+            if (std::memcmp(got_selected.data(), expected_hash_selected,
+                            sizeof(expected_hash_selected)) != 0) {
+                fprintf(stderr, "router_select_batch[%s]: unexpected hash IDs\n", label);
+                return 1;
+            }
         }
         for (uint32_t t = 0; t < n_tokens; t++) {
             float ref_probs[n_expert];

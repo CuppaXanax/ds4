@@ -88,6 +88,7 @@ struct VulkanCommandCtx {
     uint32_t cmd_rot_idx = 0;
     uint32_t cmd_buf_count = 0;
     bool timeline_enabled = false;
+    bool routed_profile_enabled = false;
     bool timeline_collecting = false;
     bool timeline_dumped = false;
     bool timeline_queries_pending = false;
@@ -518,6 +519,7 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     VkSemaphoreCreateInfo sci{}; sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     if (vkCreateSemaphore(g_vk.device, &sci, nullptr, &ctx.semaphore) != VK_SUCCESS) abort();
     ctx.timeline_enabled = getenv("DS4_VULKAN_TIMELINE") != nullptr;
+    ctx.routed_profile_enabled = getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") != nullptr;
     if (const char *skip = getenv("DS4_VULKAN_TIMELINE_SKIP"))
         ctx.timeline_skip_dispatches = strtoull(skip, nullptr, 10);
     if (const char *count = getenv("DS4_VULKAN_TIMELINE_COUNT")) {
@@ -526,7 +528,7 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     }
     if (ctx.timeline_enabled)
         ctx.timeline_events.reserve((size_t)ctx.timeline_max_dispatches * 16u + 256u);
-    if ((getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") || ctx.timeline_enabled ||
+    if ((ctx.routed_profile_enabled || ctx.timeline_enabled ||
          getenv("DS4_VULKAN_TIMELINE_LAYER")) &&
         g_vk.timestamp_valid_bits != 0) {
         VkQueryPoolCreateInfo qpci{};
@@ -5412,7 +5414,8 @@ static bool ds4gk_routed_dispatch(const char *stage,
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     uint32_t first_query = UINT32_MAX;
-    if (ctx.timestamp_pool != VK_NULL_HANDLE && ctx.timestamp_cursor <= 254) {
+    if (ctx.routed_profile_enabled && ctx.timestamp_pool != VK_NULL_HANDLE &&
+        ctx.timestamp_cursor <= 254) {
         first_query = ctx.timestamp_cursor;
         ctx.timestamp_cursor += 2;
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,

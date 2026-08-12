@@ -1246,8 +1246,9 @@ extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
 }
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
+    (void)layer;
     const char *enabled = getenv("DS4_VULKAN_BATCH_LAYER");
-    if (layer != 4 || !enabled || !enabled[0] || strcmp(enabled, "0") == 0)
+    if (!enabled || !enabled[0] || strcmp(enabled, "0") == 0)
         return 1;
     auto &ctx = get_cmd_ctx();
     if (ctx.layer_batch_active) return 0;
@@ -1265,8 +1266,9 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
 }
 
 extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
+    (void)layer;
     auto &ctx = get_cmd_ctx();
-    if (layer != 4 || !ctx.layer_batch_active) return 1;
+    if (!ctx.layer_batch_active) return 1;
     return retire_layer_batch_span(ctx, false);
 }
 

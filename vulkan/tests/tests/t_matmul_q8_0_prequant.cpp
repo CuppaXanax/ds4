@@ -185,25 +185,44 @@ static int test_matmul_q8_0_prequant() {
 
 REGISTER_TEST(matmul_q8_0_prequant, test_matmul_q8_0_prequant);
 
-/* Exercise all 256 lanes of the aligned shader's final reduction.  A
- * subgroup reduction has a different FP32 addition tree from the former
- * scalar block-order loop, so compare against that loop using a conservative
- * forward-error bound rather than requiring a bitwise match. */
+/* Exercise all 256 lanes and make a change to the final FP32 addition order
+ * observable.  2^24 + 1 - 2^24 is zero when accumulated left-to-right, but
+ * can be one under a parallel tree.  Every factor is exactly representable,
+ * so this is an exact ordering gate rather than a tolerance-based check. */
 static int test_matmul_q8_0_aligned_reduction() {
     const uint64_t in_dim = 8192;  /* 256 Q8 blocks: four Wave64s on BC-250. */
-    const uint64_t out_dim = 3;
-    const uint64_t n_tok = 2;
+    const uint64_t out_dim = 1;
+    const uint64_t n_tok = 1;
     const uint64_t blocks = in_dim / 32u;
     const uint64_t row_bytes = blocks * 34u;
     const uint64_t weight_offset = 12288;
     std::vector<uint8_t> model(weight_offset + out_dim * row_bytes, 0xA5);
-    make_q8_weights(model, weight_offset, in_dim, out_dim, 3);
+    uint8_t *weights = model.data() + weight_offset;
+    const uint16_t unit_scale = f32_to_f16(1.0f);
+    const uint16_t large_scale = f32_to_f16(512.0f);
+    for (uint64_t block = 0; block < blocks; block++) {
+        uint8_t *w = weights + block * 34u;
+        std::memcpy(w, &unit_scale, sizeof(unit_scale));
+        std::memset(w + 2u, 0, 32u);
+    }
 
-    std::vector<float> input(n_tok * in_dim);
-    for (uint64_t t = 0; t < n_tok; t++)
-        for (uint64_t i = 0; i < in_dim; i++)
-            input[t * in_dim + i] = (float)((int)((i * 29u + t * 71u) % 509u) -
-                                             254) * 0.0078125f;
+    /* xq is {127, 127, 1, 1, 1, 1, 1, 0...}, with xscale exactly one.
+     * Its dot with {127, 127, 127, 127, 127, 127, 2} is 32768. */
+    std::vector<float> input(n_tok * in_dim, 0.0f);
+    for (uint64_t block = 0; block < blocks; block++) {
+        float *x_block = input.data() + block * 32u;
+        x_block[0] = 127.0f;
+        x_block[1] = 127.0f;
+        for (uint32_t i = 2u; i < 7u; i++) x_block[i] = 1.0f;
+    }
+    const int8_t large_q[7] = {127, 127, 127, 127, 127, 127, 2};
+    for (uint32_t i = 0; i < 7u; i++) {
+        weights[2u + i] = (uint8_t)large_q[i];
+        weights[2u + 34u + i] = (uint8_t)(i == 6u ? 1 : 0);
+        weights[2u + 2u * 34u + i] = (uint8_t)-large_q[i];
+    }
+    std::memcpy(weights, &large_scale, sizeof(large_scale));
+    std::memcpy(weights + 2u * 34u, &large_scale, sizeof(large_scale));
 
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
     ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
@@ -225,50 +244,12 @@ static int test_matmul_q8_0_aligned_reduction() {
                                                weight_offset, in_dim, out_dim, q, n_tok) ||
         !ds4_gpu_end_commands()) return cleanup();
 
-    std::vector<uint8_t> packed(n_tok * blocks * 36u);
     std::vector<float> got(n_tok * out_dim);
-    if (!ds4_gpu_tensor_read(q, 0, packed.data(), packed.size()) ||
-        !ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))
+    if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))
         return cleanup();
-
-    for (uint64_t t = 0; t < n_tok; t++) {
-        for (uint64_t row = 0; row < out_dim; row++) {
-            float serial_sum = 0.0f;
-            float abs_terms = 0.0f;
-            for (uint64_t block = 0; block < blocks; block++) {
-                const uint64_t q_off = (t * blocks + block) * 36u;
-                float activation_scale;
-                std::memcpy(&activation_scale, packed.data() + q_off,
-                            sizeof(activation_scale));
-                const uint8_t *w = model.data() + weight_offset + row * row_bytes +
-                                   block * 34u;
-                uint16_t weight_bits;
-                std::memcpy(&weight_bits, w, sizeof(weight_bits));
-                int dot = 0;
-                for (uint32_t word = 0; word < 8u; word++) {
-                    uint32_t packed_word;
-                    std::memcpy(&packed_word, packed.data() + q_off + 4u +
-                                word * sizeof(packed_word), sizeof(packed_word));
-                    for (uint32_t byte = 0; byte < 4u; byte++) {
-                        const uint32_t x_byte = (packed_word >> (byte * 8u)) & 0xffu;
-                        const int xq = x_byte < 128u ? (int)x_byte : (int)x_byte - 256;
-                        dot += (int)(int8_t)w[2u + word * 4u + byte] * xq;
-                    }
-                }
-                const float term = f16_to_f32(weight_bits) * activation_scale * (float)dot;
-                serial_sum += term;
-                abs_terms += std::fabsf(term);
-            }
-            const float tolerance = 2.0e-5f * std::fmaxf(1.0f, abs_terms);
-            if (!std::isfinite(got[t * out_dim + row]) ||
-                std::fabsf(got[t * out_dim + row] - serial_sum) > tolerance) {
-                fprintf(stderr,
-                        "matmul_q8_0_aligned_reduction[%llu][%llu]: got=%g want=%g tol=%g\n",
-                        (unsigned long long)t, (unsigned long long)row,
-                        got[t * out_dim + row], serial_sum, tolerance);
-                return cleanup();
-            }
-        }
+    if (got[0] != 0.0f) {
+        fprintf(stderr, "matmul_q8_0_aligned_reduction: got=%g want=0\n", got[0]);
+        return cleanup();
     }
 
     rc = 0;

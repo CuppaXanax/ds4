@@ -1,7 +1,4 @@
 #version 460 core
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
-
 /* Q8_0 matrix-vector using reusable 36-byte activation blocks and a lossless
  * weight artifact split into contiguous f16 scales and aligned int8 blocks. */
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -18,10 +15,12 @@ layout(push_constant) uniform PC {
     uint y_scale;
 } pc;
 
-/* The production 256-lane group is four Wave64s on BC-250.  Keep one slot
- * per possible subgroup instead of assuming that width, so the same shader
- * remains correct on a device that selects Wave32. */
-shared float subgroup_sums[256];
+/* The established path accumulates blocks in ascending order.  Keep that
+ * addition chain: model logits are sensitive to changing its FP32 tree.
+ * Each lane can still form the first factor of its own term while it has the
+ * scales live, which removes a shared load and multiply from lane zero. */
+shared float block_scale_products[256];
+shared int block_dots[256];
 
 float f16tof32(uint h) {
     uint s = h & 0x8000u;
@@ -66,22 +65,17 @@ void main() {
         weight_scale = f16tof32(scale_bits);
         activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
     }
-    float block_sum = weight_scale * activation_scale * float(block_dot);
-    float subgroup_sum = subgroupAdd(block_sum);
-    if (gl_SubgroupInvocationID == 0u)
-        subgroup_sums[gl_SubgroupID] = subgroup_sum;
+    /* Preserve (weight_scale * activation_scale) * block_dot association.
+     * The final multiply remains adjacent to the serial addition below, so a
+     * compiler that contracts that pair retains the established opportunity. */
+    block_scale_products[lid] = weight_scale * activation_scale;
+    block_dots[lid] = block_dot;
     barrier();
 
-    /* On BC-250 only the first four lanes of Wave64 read a subtotal.  Every
-     * subgroup executes this second subgroup op so its control flow is
-     * uniform; only subgroup zero publishes the workgroup total.  This
-     * deliberately changes the FP32 addition tree, so qualify against the
-     * deterministic artifact with a numerical tolerance rather than a
-     * bitwise-output requirement. */
-    float workgroup_part = 0.0;
-    if (gl_SubgroupID == 0u && gl_SubgroupInvocationID < gl_NumSubgroups)
-        workgroup_part = subgroup_sums[gl_SubgroupInvocationID];
-    float sum = subgroupAdd(workgroup_part);
-    if (gl_SubgroupID == 0u && gl_SubgroupInvocationID == 0u)
+    if (lid == 0u) {
+        float sum = 0.0;
+        for (uint block = 0u; block < pc.blocks_per_row; block++)
+            sum += block_scale_products[block] * float(block_dots[block]);
         out_buf[token * pc.out_dim + row] = sum;
+    }
 }

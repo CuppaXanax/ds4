@@ -749,6 +749,25 @@ static uint32_t dist_worker_forward_window(void) {
     return depth;
 }
 
+/* Results normally traverse several worker relays.  Copying a whole final
+ * payload at each relay makes the return path store-and-forward.  Keep the
+ * relay buffer deliberately modest so each hop can begin its upstream write
+ * while its downstream read is still making progress. */
+static uint32_t dist_relay_chunk_bytes(void) {
+    uint32_t kib = 64u;
+    const char *env = getenv("DS4_DIST_RELAY_CHUNK_KB");
+    if (env && env[0]) {
+        errno = 0;
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' &&
+            parsed >= 16u && parsed <= 1024u) {
+            kib = (uint32_t)parsed;
+        }
+    }
+    return kib * 1024u;
+}
+
 static bool dist_decode_profile_enabled(void) {
     return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
 }
@@ -6438,7 +6457,8 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
     ds4_dist_worker_forwarder *forwarder = arg;
     ds4_dist_worker_upstream *upstream = forwarder->upstream;
     int fd = forwarder->fd;
-    uint8_t *buf = malloc(1024 * 1024);
+    const uint32_t relay_chunk_bytes = dist_relay_chunk_bytes();
+    uint8_t *buf = malloc(relay_chunk_bytes);
     if (!buf) {
         shutdown(upstream->fd, SHUT_RDWR);
         return NULL;
@@ -6580,7 +6600,7 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
 
         uint32_t remaining = result.telemetry_bytes - (uint32_t)sizeof(ds4_dist_telemetry_fixed);
         while (write_rc == 0 && remaining > 0) {
-            uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
+            uint32_t n = remaining < relay_chunk_bytes ? remaining : relay_chunk_bytes;
             rc = dist_read_full(fd, buf, n);
             if (rc <= 0) {
                 write_rc = -1;
@@ -6602,7 +6622,7 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
 
         remaining = result.payload_bytes;
         while (write_rc == 0 && remaining > 0) {
-            uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
+            uint32_t n = remaining < relay_chunk_bytes ? remaining : relay_chunk_bytes;
             rc = dist_read_full(fd, buf, n);
             if (rc <= 0) {
                 write_rc = -1;

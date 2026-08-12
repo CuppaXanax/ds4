@@ -1175,7 +1175,7 @@ int ds4_gpu_end_commands(void) {
 }
 int ds4_gpu_synchronize(void) { VK_CHECK_RAW(timeline_device_wait_idle("synchronize")); return 1; }
 
-void ds4_gpu_timeline_layer_begin(uint32_t layer) {
+extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
     if (!target || !target[0] || strtoul(target, nullptr, 10) != layer) return;
     auto &ctx = get_cmd_ctx();
@@ -1194,7 +1194,7 @@ void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     ctx.layer_timeline_start_ns = timeline_now_ns();
 }
 
-void ds4_gpu_timeline_layer_end(uint32_t layer) {
+extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_timeline_active || ctx.layer_timeline_layer != layer) return;
     timeline_layer_summary(ctx);

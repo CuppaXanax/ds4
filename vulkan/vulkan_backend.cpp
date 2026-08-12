@@ -99,6 +99,9 @@ struct VulkanCommandCtx {
     bool attention_output_batch = false;
     std::vector<VkDescriptorSet> attention_output_descriptors;
     std::vector<ds4_gpu_tensor *> attention_output_tensors;
+    bool layer_timeline_active = false;
+    uint32_t layer_timeline_layer = UINT32_MAX;
+    uint64_t layer_timeline_start_ns = 0;
 };
 
 struct ShaderEntry {
@@ -579,6 +582,36 @@ static void timeline_dump(VulkanCommandCtx &ctx) {
     }
     ctx.timeline_dumped = true;
     ctx.timeline_collecting = false;
+}
+
+static void timeline_layer_summary(VulkanCommandCtx &ctx) {
+    if (!ctx.layer_timeline_active) return;
+    uint64_t gpu_ns = 0;
+    uint64_t submit_ns = 0;
+    uint64_t fence_ns = 0;
+    uint32_t submissions = 0;
+    uint32_t waits = 0;
+    for (const TimelineEvent &event : ctx.timeline_events) {
+        if (event.kind == TimelineEventKind::Dispatch) gpu_ns += event.gpu_ns;
+        else if (event.kind == TimelineEventKind::Submit) {
+            submissions++;
+            submit_ns += event.duration_ns;
+        } else if (event.kind == TimelineEventKind::Wait) {
+            waits++;
+            fence_ns += event.duration_ns;
+        }
+    }
+    const uint64_t wall_ns = timeline_now_ns() - ctx.layer_timeline_start_ns;
+    fprintf(stderr,
+            "ds4: VULKAN layer_timeline layer=%u wall_ms=%.6f gpu_ms=%.6f "
+            "submissions=%u fence_waits=%u submit_cpu_ms=%.6f fence_cpu_ms=%.6f\n",
+            ctx.layer_timeline_layer, (double)wall_ns / 1.0e6,
+            (double)gpu_ns / 1.0e6, submissions, waits,
+            (double)submit_ns / 1.0e6, (double)fence_ns / 1.0e6);
+    ctx.layer_timeline_active = false;
+    ctx.timeline_collecting = false;
+    ctx.timeline_enabled = false;
+    ctx.timeline_dumped = true;
 }
 
 static TimelineEvent *timeline_add(VulkanCommandCtx &ctx, TimelineEventKind kind,
@@ -1141,6 +1174,31 @@ int ds4_gpu_end_commands(void) {
     return ok;
 }
 int ds4_gpu_synchronize(void) { VK_CHECK_RAW(timeline_device_wait_idle("synchronize")); return 1; }
+
+void ds4_gpu_timeline_layer_begin(uint32_t layer) {
+    const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
+    if (!target || !target[0] || strtoul(target, nullptr, 10) != layer) return;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_timeline_active) return;
+    ctx.timeline_events.clear();
+    ctx.timeline_events.reserve(2048);
+    ctx.timeline_enabled = true;
+    ctx.timeline_collecting = true;
+    ctx.timeline_dumped = false;
+    ctx.timeline_seen_dispatches = 0;
+    ctx.timeline_skip_dispatches = 0;
+    ctx.timeline_max_dispatches = 1024;
+    ctx.timeline_captured_dispatches = 0;
+    ctx.layer_timeline_active = true;
+    ctx.layer_timeline_layer = layer;
+    ctx.layer_timeline_start_ns = timeline_now_ns();
+}
+
+void ds4_gpu_timeline_layer_end(uint32_t layer) {
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.layer_timeline_active || ctx.layer_timeline_layer != layer) return;
+    timeline_layer_summary(ctx);
+}
 
 int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
     auto &c = get_cmd_ctx(); *ev = ++c.event_counter; return 1;

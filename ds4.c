@@ -25123,9 +25123,16 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
-    return metal_graph_encode_decode_layer_phase(
+#ifdef DS4_VULKAN_BUILD
+    ds4_gpu_timeline_layer_begin(il);
+#endif
+    const bool ok = metal_graph_encode_decode_layer_phase(
             g, model, layer, il, pos, raw_cache, raw_cap, raw_row, n_raw,
             token, METAL_DECODE_LAYER_FULL);
+#ifdef DS4_VULKAN_BUILD
+    ds4_gpu_timeline_layer_end(il);
+#endif
+    return ok;
 }
 
 static bool metal_graph_output_logits_head_matmul(

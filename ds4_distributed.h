@@ -122,8 +122,4 @@ int ds4_dist_session_load_payload(
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 
-#ifdef DS4_TEST_HOOKS
-int ds4_test_distributed_local_output_route(void);
-#endif
-
 #endif

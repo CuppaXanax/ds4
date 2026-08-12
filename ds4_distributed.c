@@ -354,13 +354,9 @@ typedef struct {
 } ds4_dist_route_entry;
 
 typedef struct {
-    /* Entries and blob describe the advertised worker capabilities and remain
-     * canonical for route failure matching. Decode may send the blob-only
-     * variant to make the final worker return hidden state instead of logits. */
     ds4_dist_route_entry *entry;
     uint32_t count;
     void *blob;
-    void *local_output_blob;
     uint32_t blob_bytes;
 } ds4_dist_route_plan;
 
@@ -2108,7 +2104,6 @@ static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     }
     free(plan->entry);
     free(plan->blob);
-    free(plan->local_output_blob);
     memset(plan, 0, sizeof(*plan));
 }
 
@@ -2222,39 +2217,6 @@ static bool dist_route_plan_append_return_upstream(
     return true;
 }
 
-static bool dist_route_plan_build_local_output_blob(
-        ds4_dist_route_plan *plan,
-        char *err,
-        size_t errlen) {
-    if (!plan || plan->count == 0 ||
-        (plan->entry[plan->count - 1u].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) {
-        return true;
-    }
-
-    ds4_dist_route_plan alternate = {0};
-    for (uint32_t i = 0; i < plan->count; i++) {
-        ds4_dist_route_entry entry = plan->entry[i];
-        if (i + 1u == plan->count) {
-            entry.flags &= ~DS4_DIST_ROUTE_F_OUTPUT_LOGITS;
-        }
-        if (!dist_route_plan_append_blob(&alternate, &entry, err, errlen)) {
-            free(alternate.blob);
-            return false;
-        }
-    }
-    if (!dist_route_plan_append_return_upstream(&alternate, err, errlen)) {
-        free(alternate.blob);
-        return false;
-    }
-    if (alternate.blob_bytes != plan->blob_bytes) {
-        free(alternate.blob);
-        if (errlen) snprintf(err, errlen, "local-output route size mismatch");
-        return false;
-    }
-    plan->local_output_blob = alternate.blob;
-    return true;
-}
-
 static bool dist_coordinator_build_route_plan(
         ds4_dist_coordinator_state *state,
         ds4_dist_route_plan *plan,
@@ -2363,11 +2325,6 @@ static bool dist_coordinator_build_route_plan(
     free(workers);
     free(path);
     if (plan->count != 0 && !dist_route_plan_append_return_upstream(plan, err, errlen)) {
-        dist_route_plan_free(plan);
-        return false;
-    }
-    if (plan->count != 0 && state->local_can_output_head &&
-        !dist_route_plan_build_local_output_blob(plan, err, errlen)) {
         dist_route_plan_free(plan);
         return false;
     }
@@ -2552,29 +2509,6 @@ static int dist_recv_result_alloc(
     return 0;
 }
 
-static bool dist_route_use_local_output_head(
-        const ds4_dist_coordinator_state *state,
-        const ds4_dist_route_plan *plan,
-        uint32_t n_tokens,
-        bool ack_only,
-        bool allow_local_output_head) {
-    return allow_local_output_head && state && plan &&
-           state->local_can_output_head &&
-           state->activation_bits == DS4_DIST_ACTIVATION_BITS_DEFAULT &&
-           n_tokens == 1u && !ack_only &&
-           plan->count != 0 && plan->local_output_blob &&
-           (plan->entry[plan->count - 1u].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
-}
-
-static bool dist_route_first_requests_logits(
-        const ds4_dist_route_plan *plan,
-        bool use_local_output_head) {
-    if (!plan || plan->count == 0) return false;
-    const bool canonical =
-        (plan->entry[0].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
-    return canonical && !(use_local_output_head && plan->count == 1u);
-}
-
 static int dist_coordinator_send_remote_work_on_fd(
         ds4_dist_coordinator_state *state,
         const ds4_dist_route_plan *plan,
@@ -2588,7 +2522,6 @@ static int dist_coordinator_send_remote_work_on_fd(
         uint64_t result_hash,
         bool reset_session,
         bool ack_only,
-        bool allow_local_output_head,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         char *err,
@@ -2598,12 +2531,6 @@ static int dist_coordinator_send_remote_work_on_fd(
         return 1;
     }
     const ds4_dist_route_entry *first = &plan->entry[0];
-    const bool use_local_output_head = dist_route_use_local_output_head(state,
-                                                                        plan,
-                                                                        n_tokens,
-                                                                        ack_only,
-                                                                        allow_local_output_head);
-    const void *route_blob = use_local_output_head ? plan->local_output_blob : plan->blob;
 
     ds4_dist_work_fixed work;
     memset(&work, 0, sizeof(work));
@@ -2619,7 +2546,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.flags = DS4_DIST_WORK_F_INPUT_HC;
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
-    if (dist_route_first_requests_logits(plan, use_local_output_head)) {
+    if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     }
     uint32_t wire_hidden_hc_bytes = 0;
@@ -2636,7 +2563,7 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.route_index = 0;
     work.route_bytes = plan->blob_bytes;
 
-    if (dist_send_work_frame(fd, &work, tokens, hidden_hc, route_blob) != 0) {
+    if (dist_send_work_frame(fd, &work, tokens, hidden_hc, plan->blob) != 0) {
         if (errlen) snprintf(err, errlen, "failed to send distributed work");
         return 1;
     }
@@ -2656,7 +2583,6 @@ static int dist_coordinator_eval_remote_on_fd(
         uint64_t prefix_hash,
         uint64_t expected_result_hash,
         bool reset_session,
-        bool allow_local_output_head,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         float *logits,
@@ -2677,7 +2603,6 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
-                                                     allow_local_output_head,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2771,7 +2696,6 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
-        bool allow_local_output_head,
         float *logits,
         char *err,
         size_t errlen) {
@@ -2853,7 +2777,6 @@ static int dist_coordinator_eval_span(
                                                 prefix_hash,
                                                 result_hash,
                                                 reset_session,
-                                                allow_local_output_head,
                                                 hidden,
                                                 hidden_bytes,
                                                 logits,
@@ -3151,7 +3074,7 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, true, logits, err, sizeof(err)) != 0) {
+                                       false, logits, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -3327,7 +3250,6 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
-                                                         false,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -3912,7 +3834,7 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, false, logits, err, errlen);
+                                                 pos == 0, logits, err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -4151,7 +4073,7 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, true, logits, err, sizeof(err));
+                                                   false, logits, err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5686,7 +5608,6 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
-                                                     false,
                                                      logits,
                                                      err,
                                                      errlen);
@@ -5768,7 +5689,6 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
-                                        true,
                                         logits,
                                         err,
                                         errlen);
@@ -6326,129 +6246,6 @@ static bool dist_route_validate_blob(
     }
     return true;
 }
-
-#ifdef DS4_TEST_HOOKS
-int ds4_test_distributed_local_output_route(void) {
-    ds4_dist_route_plan plan = {0};
-    ds4_dist_route_entry normal_first = {0};
-    ds4_dist_route_entry normal_final = {0};
-    ds4_dist_route_entry alternate_first = {0};
-    ds4_dist_route_entry alternate_final = {0};
-    ds4_dist_worker_entry worker = {0};
-    ds4_dist_coordinator_state state = {0};
-    char err[256] = {0};
-    int failed = 0;
-
-    plan.count = 2;
-    plan.entry = calloc(plan.count, sizeof(plan.entry[0]));
-    if (!plan.entry) return 1;
-    snprintf(plan.entry[0].host, sizeof(plan.entry[0].host), "worker-a");
-    plan.entry[0].port = 1234;
-    plan.entry[0].layer_start = 1;
-    plan.entry[0].layer_end = 2;
-    plan.entry[0].fd = -1;
-    snprintf(plan.entry[1].host, sizeof(plan.entry[1].host), "worker-b");
-    plan.entry[1].port = 1235;
-    plan.entry[1].layer_start = 3;
-    plan.entry[1].layer_end = 3;
-    plan.entry[1].flags = DS4_DIST_ROUTE_F_OUTPUT_LOGITS;
-    plan.entry[1].fd = -1;
-
-    for (uint32_t i = 0; i < plan.count; i++) {
-        if (!dist_route_plan_append_blob(&plan, &plan.entry[i], err, sizeof(err))) {
-            failed = 1;
-            goto done;
-        }
-    }
-    if (!dist_route_plan_append_return_upstream(&plan, err, sizeof(err)) ||
-        !dist_route_plan_build_local_output_blob(&plan, err, sizeof(err))) {
-        failed = 1;
-        goto done;
-    }
-    if (!plan.local_output_blob ||
-        !dist_route_validate_blob(plan.blob, plan.blob_bytes, plan.count, 4, err, sizeof(err)) ||
-        !dist_route_validate_blob(plan.local_output_blob, plan.blob_bytes, plan.count, 4, err, sizeof(err)) ||
-        !dist_route_get_entry(plan.blob, plan.blob_bytes, plan.count, 0,
-                              &normal_first, err, sizeof(err)) ||
-        !dist_route_get_entry(plan.blob, plan.blob_bytes, plan.count, 1,
-                              &normal_final, err, sizeof(err)) ||
-        !dist_route_get_entry(plan.local_output_blob, plan.blob_bytes, plan.count, 0,
-                              &alternate_first, err, sizeof(err)) ||
-        !dist_route_get_entry(plan.local_output_blob, plan.blob_bytes, plan.count, 1,
-                              &alternate_final, err, sizeof(err))) {
-        failed = 1;
-        goto done;
-    }
-
-    if (normal_first.flags != alternate_first.flags ||
-        normal_first.port != alternate_first.port ||
-        normal_first.layer_start != alternate_first.layer_start ||
-        normal_first.layer_end != alternate_first.layer_end ||
-        strcmp(normal_first.host, alternate_first.host) != 0 ||
-        normal_final.port != alternate_final.port ||
-        normal_final.layer_start != alternate_final.layer_start ||
-        normal_final.layer_end != alternate_final.layer_end ||
-        strcmp(normal_final.host, alternate_final.host) != 0 ||
-        (normal_final.flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0 ||
-        (alternate_final.flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0 ||
-        (plan.entry[1].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) {
-        failed = 1;
-        goto done;
-    }
-
-    snprintf(worker.peer_host, sizeof(worker.peer_host), "%s", plan.entry[1].host);
-    worker.listen_port = plan.entry[1].port;
-    worker.layer_start = plan.entry[1].layer_start;
-    worker.layer_end = plan.entry[1].layer_end;
-    worker.has_output = 1;
-    if (!dist_route_entry_matches_worker(&plan.entry[1], &worker)) {
-        failed = 1;
-        goto done;
-    }
-
-    state.local_can_output_head = true;
-    state.activation_bits = DS4_DIST_ACTIVATION_BITS_DEFAULT;
-    if (!dist_route_use_local_output_head(&state, &plan, 1, false, true) ||
-        dist_route_use_local_output_head(&state, &plan, 2, false, true) ||
-        dist_route_use_local_output_head(&state, &plan, 1, true, true) ||
-        dist_route_use_local_output_head(&state, &plan, 1, false, false)) {
-        failed = 1;
-        goto done;
-    }
-    state.activation_bits = 16;
-    if (dist_route_use_local_output_head(&state, &plan, 1, false, true)) {
-        failed = 1;
-        goto done;
-    }
-    state.activation_bits = DS4_DIST_ACTIVATION_BITS_DEFAULT;
-    state.local_can_output_head = false;
-    if (dist_route_use_local_output_head(&state, &plan, 1, false, true)) {
-        failed = 1;
-        goto done;
-    }
-    state.local_can_output_head = true;
-    plan.entry[1].flags = 0;
-    if (dist_route_use_local_output_head(&state, &plan, 1, false, true)) {
-        failed = 1;
-        goto done;
-    }
-    plan.entry[1].flags = DS4_DIST_ROUTE_F_OUTPUT_LOGITS;
-
-    ds4_dist_route_plan one_worker = {
-        .entry = &plan.entry[1],
-        .count = 1,
-        .local_output_blob = plan.local_output_blob,
-    };
-    if (!dist_route_first_requests_logits(&one_worker, false) ||
-        dist_route_first_requests_logits(&one_worker, true)) {
-        failed = 1;
-    }
-
-done:
-    dist_route_plan_free(&plan);
-    return failed;
-}
-#endif
 
 static int dist_send_work_frame(
         int fd,

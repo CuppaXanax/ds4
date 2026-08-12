@@ -5724,8 +5724,10 @@ static bool ds4gk_routed_common(
     if (ok) {
         pc.mode = 1;
         const char *iq2_words_env = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
-        const bool iq2_words = gate_type == 16 && iq2_words_env &&
-            iq2_words_env[0] != '\0' && strcmp(iq2_words_env, "0") != 0;
+        /* Unaligned four-byte reconstruction may fetch the following uint.
+         * Keep the exact legacy path for a descriptor with a partial tail. */
+        const bool iq2_words = gate_type == 16 && (gate_bytes & 3u) == 0u &&
+            (!iq2_words_env || strcmp(iq2_words_env, "0") != 0);
         pc.q2_words = iq2_words ? 1u : 0u;
         VkDescriptorBufferInfo gate_buffers[6] = {
             q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};

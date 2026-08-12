@@ -9,15 +9,6 @@
 #include <string>
 #include <vector>
 
-static void set_test_env(const char *name, const char *value) {
-#if defined(_WIN32)
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) setenv(name, value, 1);
-    else unsetenv(name);
-#endif
-}
-
 static uint16_t q8_aligned_f32_to_f16(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -33,12 +24,6 @@ static uint16_t q8_aligned_f32_to_f16(float value) {
 }
 
 static int test_q8_aligned_artifact() {
-    const char *old_aligned = std::getenv("DS4_VULKAN_Q8_ALIGNED");
-    const char *old_prequant = std::getenv("DS4_VULKAN_Q8_PREQUANT");
-    const bool had_aligned = old_aligned != nullptr;
-    const bool had_prequant = old_prequant != nullptr;
-    const std::string saved_aligned = had_aligned ? old_aligned : "";
-    const std::string saved_prequant = had_prequant ? old_prequant : "";
     const uint64_t in_dim = 37;
     const uint64_t out_dim = 5;
     const uint64_t artifact_out_dim = 7;
@@ -64,7 +49,7 @@ static int test_q8_aligned_artifact() {
                 (float)((int)((i * 13u + token * 19u) % 29u) - 14) * 0.03125f;
 
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
-    ds4_gpu_tensor *raw_out = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
+    ds4_gpu_tensor *raw_out = ds4_gpu_tensor_alloc(n_tok * artifact_out_dim * sizeof(float));
     ds4_gpu_tensor *aligned_out = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
     int result = 1;
     ds4_vulkan_q8_aligned_artifact artifact{};
@@ -74,28 +59,23 @@ static int test_q8_aligned_artifact() {
         ds4_gpu_tensor_free(aligned_out);
         ds4_gpu_tensor_free(raw_out);
         ds4_gpu_tensor_free(x);
-        set_test_env("DS4_VULKAN_Q8_ALIGNED", had_aligned ? saved_aligned.c_str() : nullptr);
-        set_test_env("DS4_VULKAN_Q8_PREQUANT", had_prequant ? saved_prequant.c_str() : nullptr);
         return result;
     };
     if (!x || !raw_out || !aligned_out ||
         !ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)))
         return cleanup();
 
-    set_test_env("DS4_VULKAN_Q8_ALIGNED", nullptr);
-    set_test_env("DS4_VULKAN_Q8_PREQUANT", "1");
     if (!ds4_gpu_set_model_map(model.data(), model.size()) ||
         !ds4_gpu_begin_commands() ||
         !ds4_gpu_matmul_q8_0_tensor(raw_out, model.data(), model.size(), source_offset,
-                                    in_dim, out_dim, x, n_tok) ||
+                                    in_dim, artifact_out_dim, x, n_tok) ||
         !ds4_gpu_end_commands())
         return cleanup();
-    std::vector<float> raw(n_tok * out_dim);
+    std::vector<float> raw(n_tok * artifact_out_dim);
     if (!ds4_gpu_tensor_read(raw_out, 0, raw.data(), raw.size() * sizeof(float)))
         return cleanup();
 
     if (!ds4_gpu_set_model_map(model.data(), model.size())) return cleanup();
-    set_test_env("DS4_VULKAN_Q8_ALIGNED", "1");
     if (!ds4_vulkan_q8_aligned_build(&artifact, model.data(), model.size(), source_offset,
                                      in_dim, artifact_out_dim, 64u) ||
         artifact.payload_offset % 256u != 0 ||
@@ -124,10 +104,15 @@ static int test_q8_aligned_artifact() {
     if (!ds4_gpu_tensor_read(aligned_out, 0, aligned.data(), aligned.size() * sizeof(float)))
         return cleanup();
     bool tokens_differ = false;
-    for (uint64_t i = 0; i < aligned.size(); i++) {
-        if (std::fabs(aligned[i] - raw[i]) > 1e-5f) return cleanup();
-        if (i >= out_dim && std::fabs(raw[i] - raw[i % out_dim]) > 1e-5f)
-            tokens_differ = true;
+    for (uint64_t token = 0; token < n_tok; token++) {
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const uint64_t aligned_index = token * out_dim + row;
+            const uint64_t raw_index = token * artifact_out_dim + row;
+            if (std::fabs(aligned[aligned_index] - raw[raw_index]) > 1e-5f)
+                return cleanup();
+            if (token > 0 && std::fabs(raw[raw_index] - raw[row]) > 1e-5f)
+                tokens_differ = true;
+        }
     }
     if (!tokens_differ) return cleanup();
     result = 0;

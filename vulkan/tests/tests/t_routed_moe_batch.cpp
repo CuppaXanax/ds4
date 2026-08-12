@@ -34,14 +34,6 @@
 #include <cstdlib>
 #include <vector>
 
-static void set_q2_words(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0");
-#else
-    setenv("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0", 1);
-#endif
-}
-
 /* ---------------- f16 helpers (from ds4.c / t_matmul_f16.cpp) ------------- */
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -351,8 +343,7 @@ static int run_moe_batch_case(
         const std::vector<uint8_t> &model,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
-        uint64_t down_expert_bytes, uint64_t down_row_bytes,
-        bool q2_words = false, std::vector<float> *observed_out = nullptr)
+        uint64_t down_expert_bytes, uint64_t down_row_bytes)
 {
     ds4_gpu_tensor *out_t  = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
     ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_expert * mid_dim * sizeof(float));
@@ -385,7 +376,6 @@ static int run_moe_batch_case(
         return 1;
     }
 
-    set_q2_words(q2_words);
     bool mid_f16 = true;
     int ok = ds4_gpu_routed_moe_batch_tensor(
             out_t, gate_t, up_t, mid_t, exp_t,
@@ -434,7 +424,6 @@ static int run_moe_batch_case(
         freet();
         return 1;
     }
-    if (observed_out) *observed_out = got_out;
 
     const float tol = 1e-3f;
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
@@ -602,32 +591,12 @@ static int test_routed_moe_batch(void) {
                 x[(uint64_t)t * in_dim + i] = (float)((int)((i * 13 + 5 + t * 7) % 17) - 8) * 0.125f;
         std::vector<int32_t> sel = { 1, 0,   0, 1 };
         std::vector<float> wgt = { 0.6f, 0.4f,   0.5f, 0.5f };
-        std::vector<float> raw_out, word_out;
-        rc |= run_moe_batch_case("iq2xxs-gate-q2k-down-raw", 16, 10, in_dim, mid_dim, out_dim,
+        rc |= run_moe_batch_case("iq2xxs-gate-q2k-down", 16, 10, in_dim, mid_dim, out_dim,
                                  n_total, n_expert, clamp, n_tokens,
                                  x, sel, wgt, model,
                                  gate_offset, up_offset, down_offset,
                                  gate_expert_bytes, gate_row_bytes,
-                                 down_expert_bytes, down_row_bytes, false, &raw_out);
-        rc |= run_moe_batch_case("iq2xxs-gate-q2k-down-words", 16, 10, in_dim, mid_dim, out_dim,
-                                 n_total, n_expert, clamp, n_tokens,
-                                 x, sel, wgt, model,
-                                 gate_offset, up_offset, down_offset,
-                                 gate_expert_bytes, gate_row_bytes,
-                                 down_expert_bytes, down_row_bytes, true, &word_out);
-        if (raw_out.size() != word_out.size()) {
-            fprintf(stderr, "routed_moe_batch[q2-words]: parity output size mismatch\n");
-            rc = 1;
-        } else {
-            for (size_t i = 0; i < raw_out.size(); i++) {
-                if (!(std::fabsf(raw_out[i] - word_out[i]) <= 1e-3f)) {
-                    fprintf(stderr, "routed_moe_batch[q2-words]: parity mismatch at %zu: raw=%g words=%g\n",
-                            i, (double)raw_out[i], (double)word_out[i]);
-                    rc = 1;
-                    break;
-                }
-            }
-        }
+                                 down_expert_bytes, down_row_bytes);
     }
 
     /* ============ Error paths ============================================= */

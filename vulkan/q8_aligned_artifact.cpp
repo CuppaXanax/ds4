@@ -9,11 +9,6 @@ static uint64_t align_up(uint64_t value, uint64_t alignment) {
     return remainder == 0 ? value : value + alignment - remainder;
 }
 
-int ds4_vulkan_q8_aligned_enabled(void) {
-    const char *value = std::getenv("DS4_VULKAN_Q8_ALIGNED");
-    return value && std::strcmp(value, "1") == 0;
-}
-
 int ds4_vulkan_q8_aligned_build(
     ds4_vulkan_q8_aligned_artifact *artifact, const void *model_map,
     uint64_t model_size, uint64_t source_offset, uint64_t in_dim,

@@ -971,7 +971,6 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off) return 0;
     set_model_map_identity(m, s);
     g_vk.range_registry[off] = bytes;
-    if (!ds4_vulkan_q8_aligned_enabled() && !ensure_weight(off, bytes)) return 0;
     for (auto &[base, entry] : g_vk.weight_cache) {
         if (off >= base && off - base <= entry.size && bytes <= entry.size - (off - base)) {
             entry.last_gen = UINT64_MAX;
@@ -996,14 +995,6 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
     if (!g_vk.model_map || needed_bytes == 0) return 0;
 
     uint64_t size = needed_bytes;
-    if (!ds4_vulkan_q8_aligned_enabled()) {
-        for (auto &[rb, rs] : g_vk.range_registry) {
-            if (offset >= rb && offset < rb + rs) {
-                size = rs > needed_bytes ? rs : needed_bytes;
-                break;
-            }
-        }
-    }
     /* Never read past the end of the file-backed mmap (SIGBUS otherwise). */
     if (offset >= g_vk.model_size) return 0;
     if (size > g_vk.model_size - offset) {
@@ -1290,7 +1281,6 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
 int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes,
                                  uint64_t idim, uint64_t odim, const char *label) {
     (void)label;
-    if (!ds4_vulkan_q8_aligned_enabled()) return 1;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off || idim == 0 || odim == 0)
         return 0;
     const uint64_t blocks = (idim + 31u) / 32u;
@@ -1298,7 +1288,7 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
         odim * blocks > UINT64_MAX / 34u || bytes != odim * blocks * 34u) return 0;
     set_model_map_identity(m, s);
     decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
-    return ensure_aligned_weight(m, s, off, idim, odim, entry) ? 1 : 0;
+    return ensure_aligned_weight(m, s, off, idim, odim, entry) || ensure_weight(off, bytes);
 }
 
 void ds4_gpu_release_q8_f16_cache(void) {
@@ -1709,8 +1699,6 @@ int ds4_gpu_matmul_q8_0_tensor(
         n_tok > UINT64_MAX / out_dim ||
         out_dim * n_tok > out->bytes / sizeof(float)) return 0;
 
-    const char *prequant = getenv("DS4_VULKAN_Q8_PREQUANT");
-    const bool aligned_enabled = ds4_vulkan_q8_aligned_enabled();
     const bool prequant_eligible =
         n_tok <= 65535u && n_blocks <= 256u &&
         n_tok <= UINT64_MAX / n_blocks &&
@@ -1718,9 +1706,7 @@ int ds4_gpu_matmul_q8_0_tensor(
         n_tok * n_blocks * 36u <= UINT32_MAX &&
         g_vk.caps.max_compute_work_group_size[0] >= 256u &&
         g_vk.caps.max_compute_work_group_invocations >= 256u;
-    if (aligned_enabled && !prequant_eligible) return 0;
-    if ((aligned_enabled || (prequant && strcmp(prequant, "1") == 0)) &&
-        prequant_eligible) {
+    if (prequant_eligible) {
         ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * n_blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -1913,12 +1899,6 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     if (!find_tensor_buffer(x_q8, xbuf, xoff) || !find_tensor_buffer(out, obuf, ooff)) return 0;
     const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
     if (align && ((xoff | ooff) % align) != 0) return 0;
-    const bool aligned_enabled = ds4_vulkan_q8_aligned_enabled();
-    const char *shader_name = aligned_enabled ? "matmul_q8_0_aligned" :
-                                                "matmul_q8_0_prequant";
-    auto si = g_vk.shader_map.find(shader_name);
-    if (si == g_vk.shader_map.end()) return 0;
-    auto &sh = g_vk.shaders[si->second];
     if (g_vk.caps.max_compute_work_group_size[0] < 256u ||
         g_vk.caps.max_compute_work_group_size[1] < 1u ||
         g_vk.caps.max_compute_work_group_size[2] < 1u ||
@@ -1939,21 +1919,33 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
+    const uint64_t requested_records = out_dim * blocks;
+    const uint64_t requested_scale_bytes = (requested_records * 2u + 3u) & ~3ull;
+    const uint64_t requested_payload_bytes = requested_records * 32u;
+    decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+    bool use_aligned = ensure_aligned_weight(model_map, model_size, weight_offset,
+                                              in_dim, out_dim, aligned);
+    if (use_aligned &&
+        (requested_scale_bytes > aligned->scale_bytes ||
+         requested_payload_bytes > aligned->payload_bytes ||
+         (g_vk.caps.max_storage_buffer_range != 0 &&
+          (requested_scale_bytes > g_vk.caps.max_storage_buffer_range ||
+           requested_payload_bytes > g_vk.caps.max_storage_buffer_range))))
+        use_aligned = false;
+    const char *shader_name = use_aligned ? "matmul_q8_0_aligned" :
+                                            "matmul_q8_0_prequant";
+    auto si = g_vk.shader_map.find(shader_name);
+    if (si == g_vk.shader_map.end() && use_aligned) {
+        use_aligned = false;
+        shader_name = "matmul_q8_0_prequant";
+        si = g_vk.shader_map.find(shader_name);
+    }
+    if (si == g_vk.shader_map.end()) return 0;
+    auto &sh = g_vk.shaders[si->second];
     VkDescriptorBufferInfo buffers[4] = {};
     uint32_t descriptor_count = 0;
     buffers[descriptor_count++] = {xbuf, xoff, (VkDeviceSize)q_bytes};
-    if (aligned_enabled) {
-        decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
-        if (!ensure_aligned_weight(model_map, model_size, weight_offset,
-                                   in_dim, out_dim, aligned)) return 0;
-        const uint64_t requested_records = out_dim * blocks;
-        const uint64_t requested_scale_bytes = (requested_records * 2u + 3u) & ~3ull;
-        const uint64_t requested_payload_bytes = requested_records * 32u;
-        if (requested_scale_bytes > aligned->scale_bytes ||
-            requested_payload_bytes > aligned->payload_bytes) return 0;
-        if (g_vk.caps.max_storage_buffer_range != 0 &&
-            (requested_scale_bytes > g_vk.caps.max_storage_buffer_range ||
-             requested_payload_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
+    if (use_aligned) {
         buffers[descriptor_count++] = {aligned->gpu.buffer, 0,
                                        (VkDeviceSize)requested_scale_bytes};
         buffers[descriptor_count++] = {aligned->gpu.buffer,
@@ -5209,8 +5201,7 @@ static bool ds4gk_routed_common(
     }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
-        pc.q2_words = down_type == 10 && getenv("DS4_VULKAN_Q2_WORDS") &&
-                      strcmp(getenv("DS4_VULKAN_Q2_WORDS"), "1") == 0;
+        pc.q2_words = down_type == 10;
         VkDescriptorBufferInfo down_buffers[6] = {
             q8_info, down_model, down_model, selected_info, exp_info, exp_info};
         const char *down_stage = pc.q2_words ? "down_words" : "down_raw";

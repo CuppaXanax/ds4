@@ -20,7 +20,6 @@ struct ds4_vulkan_q8_aligned_artifact {
     uint64_t section_alignment;
 };
 
-int ds4_vulkan_q8_aligned_enabled(void);
 int ds4_vulkan_q8_aligned_build(
     struct ds4_vulkan_q8_aligned_artifact *artifact, const void *model_map,
     uint64_t model_size, uint64_t source_offset, uint64_t in_dim,

@@ -31,14 +31,6 @@
 #include <cstdlib>
 #include <vector>
 
-static void set_q2_words(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0");
-#else
-    setenv("DS4_VULKAN_Q2_WORDS", enabled ? "1" : "0", 1);
-#endif
-}
-
 /* ---------------- f16 helpers (from ds4.c / t_matmul_f16.cpp) ------------- */
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
@@ -461,8 +453,7 @@ static int run_moe_case(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
         uint64_t down_expert_bytes, uint64_t down_row_bytes,
-        const std::vector<float> &add_in, bool q2_words = false,
-        std::vector<float> *observed_out = nullptr)
+        const std::vector<float> &add_in)
 {
     ds4_gpu_tensor *out_t  = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc((uint64_t)n_expert * mid_dim * sizeof(float));
@@ -500,7 +491,6 @@ static int run_moe_case(
         return 1;
     }
 
-    set_q2_words(q2_words);
     int ok = ds4_gpu_routed_moe_one_tensor(
             out_t, gate_t, up_t, mid_t, exp_t,
             model.data(), model.size(),
@@ -541,7 +531,6 @@ static int run_moe_case(
         freet();
         return 1;
     }
-    if (observed_out) *observed_out = got_out;
 
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
                        const std::vector<float> &ref, size_t n) -> bool {
@@ -779,31 +768,11 @@ static int test_routed_moe_one(void) {
         for (uint32_t i = 0; i < in_dim; i++) x[i] = (float)((int)((i * 7 + 3) % 19) - 9) * 0.125f;
         std::vector<int32_t> sel = { 0, 1, 2, 3, 4, 5 };
         std::vector<float> wgt = { 0.20f, 0.18f, 0.17f, 0.16f, 0.15f, 0.14f };
-        std::vector<float> raw_out, word_out;
-        rc |= run_moe_case("iq2xxs-gate-q2k-down-raw", 16, 10, in_dim, mid_dim, out_dim,
+        rc |= run_moe_case("iq2xxs-gate-q2k-down", 16, 10, in_dim, mid_dim, out_dim,
                            n_total, n_expert, clamp, x, sel, wgt, model,
                            gate_offset, up_offset, down_offset,
                            gate_expert_bytes, gate_row_bytes,
-                           down_expert_bytes, down_row_bytes, {}, false, &raw_out);
-        rc |= run_moe_case("iq2xxs-gate-q2k-down-words", 16, 10, in_dim, mid_dim, out_dim,
-                           n_total, n_expert, clamp, x, sel, wgt, model,
-                           gate_offset, up_offset, down_offset,
-                           gate_expert_bytes, gate_row_bytes,
-                           down_expert_bytes, down_row_bytes, {}, true, &word_out);
-        if (raw_out.size() != word_out.size()) {
-            fprintf(stderr, "routed_moe_one[q2-words]: parity output size mismatch\n");
-            rc = 1;
-        } else {
-            for (size_t i = 0; i < raw_out.size(); i++) {
-                const float tol = 1e-4f + 2e-7f * std::fabsf(raw_out[i]);
-                if (!(std::fabsf(raw_out[i] - word_out[i]) <= tol)) {
-                    fprintf(stderr, "routed_moe_one[q2-words]: parity mismatch at %zu: raw=%g words=%g\n",
-                            i, (double)raw_out[i], (double)word_out[i]);
-                    rc = 1;
-                    break;
-                }
-            }
-        }
+                           down_expert_bytes, down_row_bytes, {});
     }
 
     /* ============ Error paths ============================================= */

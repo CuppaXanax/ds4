@@ -207,6 +207,14 @@ static struct {
     uint32_t            streamed_experts = 0;
     float               timestamp_period_ns = 0.0f;
     uint32_t            timestamp_valid_bits = 0;
+    bool                subgroup_size_control = false;
+    bool                compute_full_subgroups = false;
+    bool                subgroup_size_control_extension = false;
+    uint32_t            min_subgroup_size = 0;
+    uint32_t            max_subgroup_size = 0;
+    uint32_t            max_compute_workgroup_subgroups = 0;
+    VkShaderStageFlags  required_subgroup_size_stages = 0;
+    bool                routed_wave64_capable = false;
     bool                initialized    = false;
 } g_vk;
 
@@ -268,13 +276,34 @@ static int select_physical_device(void) {
         VK_VERSION_PATCH(props.driverVersion));
     ds4_vulkan_driver_version = strdup(ver);
 
-    /* Check subgroup support */
+    /* Check subgroup support.  The Wave64 routed path is optional: keep the
+     * portable shader usable even when size control is absent or incomplete. */
+    const bool subgroup_size_control_core =
+        VK_API_VERSION_MAJOR(props.apiVersion) > 1 ||
+        (VK_API_VERSION_MAJOR(props.apiVersion) == 1 &&
+         VK_API_VERSION_MINOR(props.apiVersion) >= 3);
+    const bool subgroup_size_control_ext =
+        has_extension(best, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    const bool can_query_subgroup_size_control =
+        subgroup_size_control_core || subgroup_size_control_ext;
+    VkPhysicalDeviceSubgroupSizeControlProperties sg_size{};
+    sg_size.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties sg{};
     sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    if (can_query_subgroup_size_control) sg.pNext = &sg_size;
     VkPhysicalDeviceProperties2 p2{};
     p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     p2.pNext = &sg;
     vkGetPhysicalDeviceProperties2(best, &p2);
+
+    VkPhysicalDeviceSubgroupSizeControlFeatures sg_size_features{};
+    sg_size_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+    if (can_query_subgroup_size_control) {
+        VkPhysicalDeviceFeatures2 f2{};
+        f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        f2.pNext = &sg_size_features;
+        vkGetPhysicalDeviceFeatures2(best, &f2);
+    }
 
     g_vk.caps.subgroup_size = sg.subgroupSize;
     g_vk.caps.min_storage_buffer_offset_alignment =
@@ -292,6 +321,23 @@ static int select_physical_device(void) {
     g_vk.caps.has_subgroup_arithmetic = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
     g_vk.caps.has_subgroup_ballot     = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
     g_vk.caps.has_subgroup_shuffle    = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
+    g_vk.subgroup_size_control = sg_size_features.subgroupSizeControl == VK_TRUE;
+    g_vk.compute_full_subgroups = sg_size_features.computeFullSubgroups == VK_TRUE;
+    g_vk.subgroup_size_control_extension =
+        !subgroup_size_control_core && subgroup_size_control_ext;
+    if (can_query_subgroup_size_control) {
+        g_vk.min_subgroup_size = sg_size.minSubgroupSize;
+        g_vk.max_subgroup_size = sg_size.maxSubgroupSize;
+        g_vk.max_compute_workgroup_subgroups = sg_size.maxComputeWorkgroupSubgroups;
+        g_vk.required_subgroup_size_stages = sg_size.requiredSubgroupSizeStages;
+    }
+    g_vk.routed_wave64_capable =
+        g_vk.subgroup_size_control && g_vk.compute_full_subgroups &&
+        (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+        g_vk.caps.has_subgroup_basic && g_vk.caps.has_subgroup_shuffle &&
+        g_vk.min_subgroup_size <= 64u && g_vk.max_subgroup_size >= 64u &&
+        g_vk.max_compute_workgroup_subgroups >= 4u &&
+        (g_vk.required_subgroup_size_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
 
     VkPhysicalDeviceMemoryProperties mem;
     vkGetPhysicalDeviceMemoryProperties(best, &mem);
@@ -302,6 +348,9 @@ static int select_physical_device(void) {
     fprintf(stderr, "ds4: VULKAN device: %s driver=%s subgroup=%u max_shmem=%u mem=%lu MB\n",
             props.deviceName, ver, g_vk.caps.subgroup_size, g_vk.caps.max_shared_memory_size,
             (unsigned long)(g_vk.caps.device_memory_total / (1024*1024)));
+    if (g_vk.routed_wave64_capable)
+        fprintf(stderr, "ds4: VULKAN routed Wave64 capability: subgroup size control %u..%u, full subgroups\n",
+                g_vk.min_subgroup_size, g_vk.max_subgroup_size);
     return 0;
 }
 
@@ -351,11 +400,30 @@ static int create_logical_device(void) {
     a64.shaderBufferInt64Atomics = VK_TRUE; a64.shaderSharedInt64Atomics = VK_TRUE;
     f13.pNext = &a64;
 
-    const char *dext[] = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
+    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_ctl{};
+    if (g_vk.subgroup_size_control && g_vk.compute_full_subgroups) {
+        if (g_vk.subgroup_size_control_extension) {
+            subgroup_ctl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+            subgroup_ctl.subgroupSizeControl = VK_TRUE;
+            subgroup_ctl.computeFullSubgroups = VK_TRUE;
+            a64.pNext = &subgroup_ctl;
+        } else {
+            /* These features are promoted into Vulkan 1.3.  Requesting both
+             * VkPhysicalDeviceVulkan13Features and the promoted extension
+             * struct in one device chain is invalid. */
+            f13.subgroupSizeControl = VK_TRUE;
+            f13.computeFullSubgroups = VK_TRUE;
+        }
+    }
+
+    std::vector<const char *> dext = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
+    if (g_vk.subgroup_size_control_extension)
+        dext.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = dext;
+    dci.enabledExtensionCount = (uint32_t)dext.size();
+    dci.ppEnabledExtensionNames = dext.data();
     dci.pEnabledFeatures = &feat; dci.pNext = &f11;
     VK_CHECK_RAW(vkCreateDevice(g_vk.phys_device, &dci, nullptr, &g_vk.device));
     vkGetDeviceQueue(g_vk.device, qf, 0, &g_vk.queue);
@@ -436,6 +504,77 @@ static int create_compute_pipeline(ShaderEntry &entry) {
     return 0;
 }
 
+/* The portable pipeline above deliberately stays unchanged.  This optional
+ * companion requests exactly four full Wave64 subgroups for the 256-thread
+ * routed workgroup; every failure is local and leaves the portable shader
+ * available. */
+static bool create_wave64_compute_pipeline(ShaderEntry &entry) {
+    VkDescriptorSetLayoutBinding bindings[8] = {};
+    for (uint32_t i = 0; i < entry.binding_count; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslci{};
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = entry.binding_count;
+    dslci.pBindings = bindings;
+    VkResult result = vkCreateDescriptorSetLayout(
+        g_vk.device, &dslci, nullptr, &entry.desc_layout);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "ds4: VULKAN Wave64 descriptor layout failed (%d); using portable routed MoE\n",
+                result);
+        return false;
+    }
+
+    VkPushConstantRange pr{};
+    pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pr.size = entry.push_size > 0 ? entry.push_size : 128;
+    if (pr.size > g_vk.caps.max_push_constants_size)
+        pr.size = g_vk.caps.max_push_constants_size;
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &entry.desc_layout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pr;
+    result = vkCreatePipelineLayout(g_vk.device, &plci, nullptr, &entry.layout);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "ds4: VULKAN Wave64 pipeline layout failed (%d); using portable routed MoE\n",
+                result);
+        vkDestroyDescriptorSetLayout(g_vk.device, entry.desc_layout, nullptr);
+        entry.desc_layout = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
+    required_size.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    required_size.requiredSubgroupSize = 64;
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.pNext = &required_size;
+    cpci.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = entry.module;
+    cpci.stage.pName = "main";
+    cpci.layout = entry.layout;
+    result = vkCreateComputePipelines(
+        g_vk.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &entry.pipeline);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "ds4: VULKAN Wave64 compute pipeline failed (%d); using portable routed MoE\n",
+                result);
+        vkDestroyPipelineLayout(g_vk.device, entry.layout, nullptr);
+        vkDestroyDescriptorSetLayout(g_vk.device, entry.desc_layout, nullptr);
+        entry.layout = VK_NULL_HANDLE;
+        entry.desc_layout = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
 static int load_all_shaders(void) {
     struct { const char *name; uint32_t push_size; uint32_t binding_count; } list[] = {
         {"fill_f32", 12, 6}, {"add_f32", 4, 6},
@@ -492,6 +631,30 @@ static int load_all_shaders(void) {
         }
         g_vk.shader_map[e.name] = g_vk.shaders.size();
         g_vk.shaders.push_back(e);
+    }
+    if (g_vk.routed_wave64_capable) {
+        const char *name = "routed_moe_wave64";
+        const std::string path = std::string("vulkan/shaders/spv/") + name + ".spv";
+        std::vector<uint32_t> spv;
+        if (load_spirv(path, spv) != 0) {
+            fprintf(stderr, "ds4: VULKAN Wave64 shader not found; using portable routed MoE\n");
+        } else {
+            ShaderEntry e;
+            e.name = name;
+            e.push_size = 68;
+            e.binding_count = 6;
+            e.module = create_shader_module(spv.data(), spv.size() * 4);
+            if (e.module && create_wave64_compute_pipeline(e)) {
+                g_vk.shader_map[e.name] = g_vk.shaders.size();
+                g_vk.shaders.push_back(e);
+                fprintf(stderr, "ds4: VULKAN routed MoE Wave64 pipeline ready\n");
+            } else {
+                if (e.module)
+                    vkDestroyShaderModule(g_vk.device, e.module, nullptr);
+                else
+                    fprintf(stderr, "ds4: VULKAN Wave64 shader module unavailable; using portable routed MoE\n");
+            }
+        }
     }
     fprintf(stderr, "ds4: VULKAN loaded %zu shaders\n", g_vk.shaders.size());
     return 0;
@@ -5516,6 +5679,24 @@ static bool ds4gk_routed_dispatch(const char *stage,
                                   std::vector<VkDescriptorSet> &sets) {
     auto si = g_vk.shader_map.find("routed_moe");
     if (si == g_vk.shader_map.end()) return false;
+    /* Only the projection reductions change.  Mode 0 quantization and modes
+     * 2/4 keep using the byte-identical portable shader, and rows wider than
+     * one Wave64 retain its shared-memory tree.  The disable switch exists
+     * solely for same-binary exact A/B validation; Wave64 is the release
+     * default whenever its pipeline was created successfully. */
+    const bool wave64_shape =
+        (pc.mode == 1u || pc.mode == 3u) && pc.q8_blocks <= 64u;
+    const bool wave64_enabled =
+        wave64_shape && getenv("DS4_VULKAN_DISABLE_ROUTED_WAVE64") == nullptr;
+    if (wave64_enabled) {
+        auto wave64 = g_vk.shader_map.find("routed_moe_wave64");
+        if (wave64 != g_vk.shader_map.end()) {
+            si = wave64;
+        } else if (getenv("DS4_VULKAN_REQUIRE_ROUTED_WAVE64") != nullptr) {
+            fprintf(stderr, "ds4: VULKAN required routed Wave64 pipeline is unavailable\n");
+            return false;
+        }
+    }
     auto &ctx = get_cmd_ctx();
     if (!ctx.recording && !begin_cmd()) return false;
     auto &shader = g_vk.shaders[si->second];

@@ -103,6 +103,10 @@ struct VulkanCommandCtx {
     bool layer_timeline_active = false;
     uint32_t layer_timeline_layer = UINT32_MAX;
     uint64_t layer_timeline_start_ns = 0;
+    bool layer_batch_active = false;
+    std::vector<VkDescriptorSet> layer_batch_descriptors;
+    std::vector<ds4_gpu_tensor *> layer_batch_tensors;
+    std::vector<void *> layer_batch_in_place_ptrs;
 };
 
 struct ShaderEntry {
@@ -878,9 +882,39 @@ static int wait_cmd(void) {
     return 1;  /* DS4: non-zero = success */
 }
 
-static int submit_and_wait(void) {
+static int submit_and_wait_force(void) {
     int r = end_and_submit(); if (!r) return 0;
     return wait_cmd();
+}
+
+static int submit_and_wait(void) {
+    if (get_cmd_ctx().layer_batch_active) return 1;
+    return submit_and_wait_force();
+}
+
+static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
+    const bool was_active = ctx.layer_batch_active;
+    ctx.layer_batch_active = false;
+    int ok = submit_and_wait_force();
+    for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
+        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
+            ok = 0;
+    }
+    for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors)
+        ds4_gpu_tensor_free(tensor);
+    for (void *ptr : ctx.layer_batch_in_place_ptrs) {
+        auto it = g_vk.tensor_headers.find(ptr);
+        if (it == g_vk.tensor_headers.end()) continue;
+        vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
+        free(it->second);
+        g_vk.tensor_headers.erase(it);
+    }
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    if (ok && resume && !ctx.recording) ok = begin_cmd();
+    ctx.layer_batch_active = was_active && resume && ok;
+    return ok;
 }
 
 /* Split long command buffers into multiple submissions (llama.cpp-style):
@@ -1097,6 +1131,11 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 
 void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
     if (!t) return;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active && t->owner && t->ptr) {
+        ctx.layer_batch_tensors.push_back(t);
+        return;
+    }
     if (t->owner && t->ptr) {
         auto it = g_vk.tensor_headers.find(t->ptr);
         if (it != g_vk.tensor_headers.end()) {
@@ -1165,6 +1204,9 @@ int ds4_gpu_commands_active(void) { return get_cmd_ctx().recording ? 1 : 0; }
 int ds4_gpu_flush_commands(void) {
     /* The engine keeps recording after a flush (e.g. SSD streaming async
      * loads), so start a fresh command buffer like Metal's next encoder. */
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active)
+        return retire_layer_batch_span(ctx, true);
     int ok = end_and_submit();
     if (ok) ok = begin_cmd();
     return ok;
@@ -1203,6 +1245,31 @@ extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
     timeline_layer_summary(ctx);
 }
 
+extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
+    const char *enabled = getenv("DS4_VULKAN_BATCH_LAYER");
+    if (layer != 4 || !enabled || !enabled[0] || strcmp(enabled, "0") == 0)
+        return 1;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active) return 0;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())
+        return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    ctx.layer_batch_descriptors.reserve(128);
+    ctx.layer_batch_tensors.reserve(32);
+    ctx.layer_batch_in_place_ptrs.reserve(16);
+    ctx.layer_batch_active = true;
+    return 1;
+}
+
+extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
+    auto &ctx = get_cmd_ctx();
+    if (layer != 4 || !ctx.layer_batch_active) return 1;
+    return retire_layer_batch_span(ctx, false);
+}
+
 int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
     auto &c = get_cmd_ctx(); *ev = ++c.event_counter; return 1;
 }
@@ -1211,6 +1278,9 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t ev, const char *label) {
     (void)ev; (void)label;
     /* End + wait + re-begin: the engine reads the selected ids on the CPU and
      * then keeps encoding GPU kernels (routed MoE) without a begin_commands. */
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active)
+        return retire_layer_batch_span(ctx, true);
     int ok = end_and_submit();
     if (ok) ok = wait_cmd();
     if (ok) ok = begin_cmd();
@@ -1829,6 +1899,11 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
 }
 
 static int release_simple_descriptors(VkDescriptorSet set) {
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active) {
+        ctx.layer_batch_descriptors.push_back(set);
+        return 1;
+    }
     const bool ok = vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
     if (ok)
         timeline_resource(get_cmd_ctx(), TimelineEventKind::DescriptorFree,
@@ -2235,7 +2310,7 @@ int ds4_gpu_matmul_q8_0_tensor(
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
                              0, nullptr, 0, nullptr);
         if (!submit_and_wait()) return 0;
-        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) return 0;
+        if (!release_simple_descriptors(ds)) return 0;
         timeline_resource(c, TimelineEventKind::DescriptorFree,
                           "matmul_q8_0", 0);
     }
@@ -2560,7 +2635,7 @@ int ds4_gpu_matmul_f16_tensor(
 
     maybe_submit();
     int ok = submit_and_wait();
-    if (ok && vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds) != VK_SUCCESS) ok = 0;
+    if (ok && !release_simple_descriptors(ds)) ok = 0;
     else if (ok) timeline_resource(c, TimelineEventKind::DescriptorFree,
                                    "matmul_f16", 0);
     return ok;
@@ -7065,6 +7140,12 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
 extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
     if (t->owner && t->ptr) {
+        auto &ctx = get_cmd_ctx();
+        if (ctx.layer_batch_active) {
+            ctx.layer_batch_in_place_ptrs.push_back(t->ptr);
+            memset(t, 0, sizeof(*t));
+            return;
+        }
         auto it = g_vk.tensor_headers.find(t->ptr);
         if (it != g_vk.tensor_headers.end()) {
             if (getenv("DS4_VULKAN_TIMELINE"))

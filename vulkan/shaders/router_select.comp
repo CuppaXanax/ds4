@@ -22,6 +22,7 @@ const uint N_EXPERT = 256u;
 const uint N_USED = 6u;
 const float MIN_SUM = 6.103515625e-5;
 shared float lane_probs[N_EXPERT];
+shared float lane_scores[N_EXPERT];
 
 float router_probability(float logit) {
     float softplus = logit > 20.0 ? logit :
@@ -43,6 +44,9 @@ void main() {
     float probability = router_probability(logits[probability_offset]);
     probs[probability_offset] = probability;
     lane_probs[lane] = probability;
+    float score = probability;
+    if (pc.hash_mode == 0u && pc.has_bias != 0u) score += bias[lane];
+    lane_scores[lane] = score;
     barrier();
 
     /* Shared storage makes the handoff explicit; lane-0 order is semantic. */
@@ -55,28 +59,33 @@ void main() {
         for (uint rank = 0u; rank < N_USED; ++rank)
             selected[row * N_USED + rank] = uint(hash_ids[hash_row * N_USED + rank]);
     } else {
-        for (uint rank = 0u; rank < N_USED; ++rank)
-            selected[row * N_USED + rank] = 0xffffffffu;
+        uint best_ids[N_USED];
+        float best_scores[N_USED];
+        for (uint rank = 0u; rank < N_USED; ++rank) {
+            best_ids[rank] = 0xffffffffu;
+            best_scores[rank] = -1.0 / 0.0;
+        }
         for (uint expert = 0u; expert < N_EXPERT; ++expert) {
-            float score = lane_probs[expert];
-            if (pc.has_bias != 0u) score += bias[expert];
+            float candidate_score = lane_scores[expert];
             uint at = N_USED;
             for (uint rank = 0u; rank < N_USED; ++rank) {
-                uint current_expert = selected[row * N_USED + rank];
-                float current = current_expert < N_EXPERT
-                    ? lane_probs[current_expert] +
-                      (pc.has_bias != 0u ? bias[current_expert] : 0.0) : -1.0 / 0.0;
-                if (better(score, expert, current, current_expert)) {
+                if (better(candidate_score, expert,
+                           best_scores[rank], best_ids[rank])) {
                     at = rank;
                     break;
                 }
             }
             if (at < N_USED) {
-                for (uint rank = N_USED - 1u; rank > at; --rank)
-                    selected[row * N_USED + rank] = selected[row * N_USED + rank - 1u];
-                selected[row * N_USED + at] = expert;
+                for (uint rank = N_USED - 1u; rank > at; --rank) {
+                    best_ids[rank] = best_ids[rank - 1u];
+                    best_scores[rank] = best_scores[rank - 1u];
+                }
+                best_ids[at] = expert;
+                best_scores[at] = candidate_score;
             }
         }
+        for (uint rank = 0u; rank < N_USED; ++rank)
+            selected[row * N_USED + rank] = best_ids[rank];
     }
 
     float sum = 0.0;

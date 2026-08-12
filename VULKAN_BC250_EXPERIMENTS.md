@@ -2,6 +2,9 @@
 
 This ledger closes the `luna/*` optimization branches created during the 2026-08-11/12 BC-250 Vulkan work. The production integration branch is `pr-557-merge`.
 
+The follow-up kernel/backend audit and sequential optimization plan are in
+[`VULKAN_BC250_KERNEL_AUDIT.md`](VULKAN_BC250_KERNEL_AUDIT.md).
+
 The deleted branch refs are recoverable from the local bundle:
 
 - Path: `D:\cuppaxanax\github\bc-250-dbg\ds4-luna-branches-20260812.bundle`
@@ -14,7 +17,7 @@ The following work is contained in `pr-557-merge` and remains in production hist
 
 | Branch | Tip | Disposition |
 |---|---|---|
-| `all-layer-command-batching` | `51477a4` | Integrated. Opt-in batching for every normal Vulkan decode layer; 287.224 ms/token and 3.482 TPS on 12 BC-250 nodes. |
+| `all-layer-command-batching` | `51477a4` | Integrated. Batching for every normal Vulkan decode layer; 287.224 ms/token and 3.482 TPS on 12 BC-250 nodes. Promoted to the default after qualification. |
 | `attention-output-batching` | `4bb509b` | Integrated. Default single-token attention-output batching with deferred resource retirement. |
 | `default-vulkan-paths` | `34b5297` | Integrated. Promoted qualified Q8 prequant/aligned artifacts and Q2 direct-word decode. |
 | `full-layer-timeline` | `6394d70` | Integrated as the basis of non-perturbing production layer timing. |
@@ -60,7 +63,7 @@ At cleanup, `pr-557-merge` contains:
 - automatic Q8 activation prequantization and aligned Q8 artifacts
 - direct-word Q2_K routed down decode
 - default attention-output command batching
-- opt-in all-layer command batching via `DS4_VULKAN_BATCH_LAYER=1`
+- default all-layer command batching
 - non-perturbing Vulkan timeline and stage leaderboard instrumentation
 
 Validated results:

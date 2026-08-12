@@ -1286,9 +1286,6 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
     (void)layer;
-    const char *enabled = getenv("DS4_VULKAN_BATCH_LAYER");
-    if (!enabled || !enabled[0] || strcmp(enabled, "0") == 0)
-        return 1;
     auto &ctx = get_cmd_ctx();
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())

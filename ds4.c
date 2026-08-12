@@ -21962,10 +21962,16 @@ static bool metal_graph_encode_decode_layer_phase(
         layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
         layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
         layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT;
+#ifdef DS4_VULKAN_BUILD
+#define DS4_VULKAN_TIMELINE_DECODE_STAGE(name) ds4_gpu_timeline_stage_end((name))
+#else
+#define DS4_VULKAN_TIMELINE_DECODE_STAGE(name) ((void)0)
+#endif
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
+        DS4_VULKAN_TIMELINE_DECODE_STAGE((name)); \
     } while (0)
     const bool tp_ablate_hcpre = metal_graph_tp_ablate("hcpre");
     /* Decode-island CUDA graph capture (design ported from the Entrpi/ds4
@@ -25106,6 +25112,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
 #undef DS4_METAL_PROFILE_DECODE_STAGE
+#undef DS4_VULKAN_TIMELINE_DECODE_STAGE
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
     }

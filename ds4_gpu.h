@@ -112,6 +112,7 @@ int ds4_gpu_synchronize(void);
 #ifdef DS4_VULKAN_BUILD
 void ds4_gpu_timeline_layer_begin(uint32_t layer);
 void ds4_gpu_timeline_layer_end(uint32_t layer);
+void ds4_gpu_timeline_stage_end(const char *stage);
 int ds4_gpu_batch_layer_begin(uint32_t layer);
 int ds4_gpu_batch_layer_end(uint32_t layer);
 #endif

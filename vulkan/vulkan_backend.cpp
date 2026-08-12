@@ -58,6 +58,7 @@ enum class TimelineEventKind : uint8_t {
 struct TimelineEvent {
     TimelineEventKind kind = TimelineEventKind::Dispatch;
     const char *name = nullptr;
+    const char *stage = nullptr;
     uint64_t host_ns = 0;
     uint64_t duration_ns = 0;
     uint64_t gpu_ns = 0;
@@ -103,6 +104,7 @@ struct VulkanCommandCtx {
     bool layer_timeline_active = false;
     uint32_t layer_timeline_layer = UINT32_MAX;
     uint64_t layer_timeline_start_ns = 0;
+    size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
@@ -598,8 +600,12 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
     uint64_t fence_ns = 0;
     uint32_t submissions = 0;
     uint32_t waits = 0;
+    std::unordered_map<std::string, uint64_t> stage_gpu_ns;
     for (const TimelineEvent &event : ctx.timeline_events) {
-        if (event.kind == TimelineEventKind::Dispatch) gpu_ns += event.gpu_ns;
+        if (event.kind == TimelineEventKind::Dispatch) {
+            gpu_ns += event.gpu_ns;
+            stage_gpu_ns[event.stage ? event.stage : "unassigned"] += event.gpu_ns;
+        }
         else if (event.kind == TimelineEventKind::Submit) {
             submissions++;
             submit_ns += event.duration_ns;
@@ -615,6 +621,29 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
             ctx.layer_timeline_layer, (double)wall_ns / 1.0e6,
             (double)gpu_ns / 1.0e6, submissions, waits,
             (double)submit_ns / 1.0e6, (double)fence_ns / 1.0e6);
+    uint64_t attention_ns = 0;
+    uint64_t moe_ns = 0;
+    uint64_t other_ns = 0;
+    for (const auto &[stage, elapsed_ns] : stage_gpu_ns) {
+        const bool attention = stage.rfind("attn_", 0) == 0 ||
+            stage == "q_path" || stage == "kv_path" ||
+            stage.rfind("compressor", 0) == 0 ||
+            stage.rfind("indexer_", 0) == 0;
+        const bool moe = stage == "router" ||
+            stage.rfind("routed_moe", 0) == 0 ||
+            stage == "shared_gate_up" || stage == "shared_down";
+        if (attention) attention_ns += elapsed_ns;
+        else if (moe) moe_ns += elapsed_ns;
+        else other_ns += elapsed_ns;
+        fprintf(stderr, "ds4: VULKAN layer_stage layer=%u stage=%s gpu_ms=%.6f\n",
+                ctx.layer_timeline_layer, stage.c_str(), (double)elapsed_ns / 1.0e6);
+    }
+    fprintf(stderr,
+            "ds4: VULKAN layer_groups layer=%u attention_ms=%.6f moe_ms=%.6f "
+            "other_ms=%.6f total_gpu_ms=%.6f\n",
+            ctx.layer_timeline_layer, (double)attention_ns / 1.0e6,
+            (double)moe_ns / 1.0e6, (double)other_ns / 1.0e6,
+            (double)gpu_ns / 1.0e6);
     ctx.layer_timeline_active = false;
     ctx.timeline_collecting = false;
     ctx.timeline_enabled = false;
@@ -1237,12 +1266,22 @@ extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     ctx.layer_timeline_active = true;
     ctx.layer_timeline_layer = layer;
     ctx.layer_timeline_start_ns = timeline_now_ns();
+    ctx.layer_timeline_stage_cursor = 0;
 }
 
 extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_timeline_active || ctx.layer_timeline_layer != layer) return;
     timeline_layer_summary(ctx);
+}
+
+extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.layer_timeline_active) return;
+    for (size_t i = ctx.layer_timeline_stage_cursor;
+         i < ctx.timeline_events.size(); i++)
+        ctx.timeline_events[i].stage = stage;
+    ctx.layer_timeline_stage_cursor = ctx.timeline_events.size();
 }
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {

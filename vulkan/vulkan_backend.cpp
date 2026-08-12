@@ -209,7 +209,6 @@ static struct {
     uint32_t            timestamp_valid_bits = 0;
     bool                subgroup_size_control = false;
     bool                compute_full_subgroups = false;
-    bool                subgroup_size_control_extension = false;
     uint32_t            min_subgroup_size = 0;
     uint32_t            max_subgroup_size = 0;
     uint32_t            max_compute_workgroup_subgroups = 0;
@@ -222,16 +221,6 @@ const char *ds4_vulkan_gpu_name = "unknown";
 const char *ds4_vulkan_driver_version = "unknown";
 
 /* ---- Instance / Device Setup ---- */
-
-static bool has_extension(VkPhysicalDevice dev, const char *name) {
-    uint32_t count;
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> props(count);
-    vkEnumerateDeviceExtensionProperties(dev, nullptr, &count, props.data());
-    for (auto &p : props)
-        if (strcmp(p.extensionName, name) == 0) return true;
-    return false;
-}
 
 static int select_physical_device(void) {
     uint32_t count = 0;
@@ -282,26 +271,22 @@ static int select_physical_device(void) {
         VK_API_VERSION_MAJOR(props.apiVersion) > 1 ||
         (VK_API_VERSION_MAJOR(props.apiVersion) == 1 &&
          VK_API_VERSION_MINOR(props.apiVersion) >= 3);
-    const bool subgroup_size_control_ext =
-        has_extension(best, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
-    const bool can_query_subgroup_size_control =
-        subgroup_size_control_core || subgroup_size_control_ext;
     VkPhysicalDeviceSubgroupSizeControlProperties sg_size{};
     sg_size.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
     VkPhysicalDeviceSubgroupProperties sg{};
     sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    if (can_query_subgroup_size_control) sg.pNext = &sg_size;
+    if (subgroup_size_control_core) sg.pNext = &sg_size;
     VkPhysicalDeviceProperties2 p2{};
     p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     p2.pNext = &sg;
     vkGetPhysicalDeviceProperties2(best, &p2);
 
-    VkPhysicalDeviceSubgroupSizeControlFeatures sg_size_features{};
-    sg_size_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
-    if (can_query_subgroup_size_control) {
+    VkPhysicalDeviceVulkan13Features f13_support{};
+    f13_support.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    if (subgroup_size_control_core) {
         VkPhysicalDeviceFeatures2 f2{};
         f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        f2.pNext = &sg_size_features;
+        f2.pNext = &f13_support;
         vkGetPhysicalDeviceFeatures2(best, &f2);
     }
 
@@ -321,11 +306,11 @@ static int select_physical_device(void) {
     g_vk.caps.has_subgroup_arithmetic = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
     g_vk.caps.has_subgroup_ballot     = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT);
     g_vk.caps.has_subgroup_shuffle    = !!(sg.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT);
-    g_vk.subgroup_size_control = sg_size_features.subgroupSizeControl == VK_TRUE;
-    g_vk.compute_full_subgroups = sg_size_features.computeFullSubgroups == VK_TRUE;
-    g_vk.subgroup_size_control_extension =
-        !subgroup_size_control_core && subgroup_size_control_ext;
-    if (can_query_subgroup_size_control) {
+    g_vk.subgroup_size_control =
+        subgroup_size_control_core && f13_support.subgroupSizeControl == VK_TRUE;
+    g_vk.compute_full_subgroups =
+        subgroup_size_control_core && f13_support.computeFullSubgroups == VK_TRUE;
+    if (subgroup_size_control_core) {
         g_vk.min_subgroup_size = sg_size.minSubgroupSize;
         g_vk.max_subgroup_size = sg_size.maxSubgroupSize;
         g_vk.max_compute_workgroup_subgroups = sg_size.maxComputeWorkgroupSubgroups;
@@ -400,30 +385,16 @@ static int create_logical_device(void) {
     a64.shaderBufferInt64Atomics = VK_TRUE; a64.shaderSharedInt64Atomics = VK_TRUE;
     f13.pNext = &a64;
 
-    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_ctl{};
     if (g_vk.subgroup_size_control && g_vk.compute_full_subgroups) {
-        if (g_vk.subgroup_size_control_extension) {
-            subgroup_ctl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
-            subgroup_ctl.subgroupSizeControl = VK_TRUE;
-            subgroup_ctl.computeFullSubgroups = VK_TRUE;
-            a64.pNext = &subgroup_ctl;
-        } else {
-            /* These features are promoted into Vulkan 1.3.  Requesting both
-             * VkPhysicalDeviceVulkan13Features and the promoted extension
-             * struct in one device chain is invalid. */
-            f13.subgroupSizeControl = VK_TRUE;
-            f13.computeFullSubgroups = VK_TRUE;
-        }
+        f13.subgroupSizeControl = VK_TRUE;
+        f13.computeFullSubgroups = VK_TRUE;
     }
 
-    std::vector<const char *> dext = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
-    if (g_vk.subgroup_size_control_extension)
-        dext.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    const char *dext[] = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = (uint32_t)dext.size();
-    dci.ppEnabledExtensionNames = dext.data();
+    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = dext;
     dci.pEnabledFeatures = &feat; dci.pNext = &f11;
     VK_CHECK_RAW(vkCreateDevice(g_vk.phys_device, &dci, nullptr, &g_vk.device));
     vkGetDeviceQueue(g_vk.device, qf, 0, &g_vk.queue);

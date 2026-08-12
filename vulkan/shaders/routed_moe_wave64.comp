@@ -1,5 +1,6 @@
 #version 460 core
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -225,10 +226,14 @@ float reduce_sum(float value) {
 }
 
 /* Host dispatch restricts this variant to power-of-two rows no wider than
- * Wave64.  XOR selects the same upper-tree partner as the portable shared
- * reduction at every stride; only the lower lane performs each addition. */
+ * Wave64.  Subgroup coordinates define both work assignment and shuffle
+ * partners; Vulkan does not relate subgroup order to local-invocation order. */
+uint wave64_logical_id() {
+    return gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+}
+
 float reduce_row_sum(float value, uint lanes_per_row) {
-    uint lane = gl_LocalInvocationIndex & (lanes_per_row - 1u);
+    uint lane = wave64_logical_id() & (lanes_per_row - 1u);
     for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
         float paired = subgroupShuffleXor(value, stride);
         if (lane < stride) value += paired;
@@ -292,9 +297,10 @@ void main() {
                              pc.q8_blocks <= 32u ? 32u :
                              pc.q8_blocks <= 64u ? 64u :
                              pc.q8_blocks <= 128u ? 128u : 256u;
-        uint lane = lid & (lanes_per_row - 1u);
+        uint logical_id = wave64_logical_id();
+        uint lane = logical_id & (lanes_per_row - 1u);
         uint rows_per_group = 256u / lanes_per_row;
-        uint row = gl_WorkGroupID.x * rows_per_group + lid / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + logical_id / lanes_per_row;
         uint rank = gl_WorkGroupID.z;
         if (token >= pc.n_tokens || rank >= pc.n_selected) return;
         bool row_valid = row < pc.mid_dim;
@@ -344,9 +350,10 @@ void main() {
                              pc.q8_blocks <= 32u ? 32u :
                              pc.q8_blocks <= 64u ? 64u :
                              pc.q8_blocks <= 128u ? 128u : 256u;
-        uint lane = lid & (lanes_per_row - 1u);
+        uint logical_id = wave64_logical_id();
+        uint lane = logical_id & (lanes_per_row - 1u);
         uint rows_per_group = 256u / lanes_per_row;
-        uint row = gl_WorkGroupID.x * rows_per_group + lid / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + logical_id / lanes_per_row;
         uint rank = gl_WorkGroupID.z;
         if (token >= pc.n_tokens || rank >= pc.n_selected) return;
         bool row_valid = row < pc.out_dim;

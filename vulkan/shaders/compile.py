@@ -34,6 +34,68 @@ iq2_include.write_text(
     encoding="utf-8",
 )
 
+# The portable routed shader is the permanent fallback and intentionally stays
+# byte-for-byte unchanged.  Derive the Wave64 source from it so the large common
+# body cannot drift; only the subgroup extensions, reducer, and the two
+# projection coordinate mappings are allowed to differ.
+routed_src = SRC_DIR / "routed_moe.comp"
+routed_wave64_src = SRC_DIR / "routed_moe_wave64.comp"
+routed_text = routed_src.read_text(encoding="utf-8")
+
+extension_anchor = "#extension GL_GOOGLE_include_directive : require\n"
+wave64_extensions = (
+    extension_anchor
+    + "#extension GL_KHR_shader_subgroup_basic : require\n"
+    + "#extension GL_KHR_shader_subgroup_shuffle : require\n"
+)
+portable_reducer = """float reduce_row_sum(float value, uint lanes_per_row) {
+    uint lid = gl_LocalInvocationIndex;
+    uint lane = lid & (lanes_per_row - 1u);
+    q8_values[lid] = value;
+    barrier();
+    for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) q8_values[lid] += q8_values[lid + stride];
+        barrier();
+    }
+    return q8_values[lid - lane];
+}"""
+wave64_reducer = """/* Host dispatch restricts this variant to power-of-two rows no wider than
+ * Wave64.  Subgroup coordinates define both work assignment and shuffle
+ * partners; Vulkan does not relate subgroup order to local-invocation order. */
+uint wave64_logical_id() {
+    return gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+}
+
+float reduce_row_sum(float value, uint lanes_per_row) {
+    uint lane = wave64_logical_id() & (lanes_per_row - 1u);
+    for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
+        float paired = subgroupShuffleXor(value, stride);
+        if (lane < stride) value += paired;
+    }
+    return value;
+}"""
+portable_mapping = """        uint lane = lid & (lanes_per_row - 1u);
+        uint rows_per_group = 256u / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + lid / lanes_per_row;"""
+wave64_mapping = """        uint logical_id = wave64_logical_id();
+        uint lane = logical_id & (lanes_per_row - 1u);
+        uint rows_per_group = 256u / lanes_per_row;
+        uint row = gl_WorkGroupID.x * rows_per_group + logical_id / lanes_per_row;"""
+
+if routed_text.count(extension_anchor) != 1 or routed_text.count(portable_reducer) != 1 \
+        or routed_text.count(portable_mapping) != 2:
+    print("Portable routed shader no longer matches the Wave64 derivation anchors",
+          file=sys.stderr)
+    sys.exit(1)
+routed_wave64_text = routed_text.replace(extension_anchor, wave64_extensions, 1)
+routed_wave64_text = routed_wave64_text.replace(portable_reducer, wave64_reducer, 1)
+routed_wave64_text = routed_wave64_text.replace(portable_mapping, wave64_mapping, 2)
+routed_wave64_src.write_text(
+    routed_wave64_text,
+    encoding="utf-8",
+    newline="\n",
+)
+
 shaders = sorted(SRC_DIR.glob("*.comp"))
 if not shaders:
     print("No .comp shaders found, skipping.")

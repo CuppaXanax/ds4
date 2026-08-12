@@ -44,6 +44,22 @@ int weight_i8(uint byte_idx, uint total_bytes) {
     return v < 128u ? int(v) : int(v) - 256;
 }
 
+/* Load four little-endian weight bytes without asking the compiler to recover
+ * the common uint loads from four independent byte_at-style expressions.  IQ2
+ * rows are 66-byte records, so alternate blocks begin two bytes into a word. */
+uint weight_u32(uint byte_idx) {
+    uint word_idx = byte_idx >> 2u;
+    uint shift = (byte_idx & 3u) * 8u;
+    uint lo = b1[word_idx];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (b1[word_idx + 1u] << (32u - shift));
+}
+
+int packed_i8(uint word, uint byte_idx) {
+    uint v = (word >> ((byte_idx & 3u) * 8u)) & 255u;
+    return v < 128u ? int(v) : int(v) - 256;
+}
+
 int input_i8(uint byte_idx) {
     uint v = (b0[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
     return v < 128u ? int(v) : int(v) - 256;
@@ -212,6 +228,47 @@ float iq2_block_dot(uint row_byte, uint input_token, uint input_blocks,
     return 0.125 * d * float(sum);
 }
 
+/* Exact IQ2_XXS dot using explicit word loads.  This retains the scalar path's
+ * ib/pair/j accumulation order and float epilogue; it only removes redundant
+ * SSBO loads and byte-address reconstruction. */
+float iq2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
+                          uint block) {
+    uint wb = row_byte + block * 66u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    uint dword = weight_u32(wb) & 0xffffu;
+    float d = uintBitsToFloat(b0[xb]) * f16(dword);
+    int sum = 0;
+    for (uint ib = 0u; ib < 8u; ++ib) {
+        uint qbase = wb + 2u + ib * 8u;
+        uint q = weight_u32(qbase);
+        uint a = weight_u32(qbase + 4u);
+        uint ls = 2u * (a >> 28u) + 1u;
+        for (uint pair = 0u; pair < 2u; ++pair) {
+            uint s0 = (a >> (14u * pair)) & 127u;
+            uint s1 = (a >> (14u * pair + 7u)) & 127u;
+            uint g0 = (q >> (16u * pair)) & 255u;
+            uint g1 = (q >> (16u * pair + 8u)) & 255u;
+            uint q8_word = xb + 1u + ib * 8u + pair * 4u;
+            uint q80_lo = b0[q8_word];
+            uint q80_hi = b0[q8_word + 1u];
+            uint q81_lo = b0[q8_word + 2u];
+            uint q81_hi = b0[q8_word + 3u];
+            for (uint j = 0u; j < 8u; ++j) {
+                int v0 = int(iq2_grid[g0 * 8u + j]);
+                int v1 = int(iq2_grid[g1 * 8u + j]);
+                if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
+                if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
+                uint q80_word = j < 4u ? q80_lo : q80_hi;
+                uint q81_word = j < 4u ? q81_lo : q81_hi;
+                int q80 = packed_i8(q80_word, j);
+                int q81 = packed_i8(q81_word, j);
+                sum += int(ls) * (v0 * q80 + v1 * q81);
+            }
+        }
+    }
+    return 0.125 * d * float(sum);
+}
+
 float reduce_sum(float value) {
     uint lid = gl_LocalInvocationIndex;
     q8_values[lid] = value;
@@ -310,7 +367,9 @@ void main() {
                 partial += pc.gate_type == 8u
                     ? q8_0_block_dot(rb, token, pc.q8_blocks, block)
                     : (pc.gate_type == 16u
-                        ? iq2_block_dot(rb, token, pc.q8_blocks, block)
+                        ? (pc.q2_words != 0u
+                            ? iq2_block_dot_words(rb, token, pc.q8_blocks, block)
+                            : iq2_block_dot(rb, token, pc.q8_blocks, block))
                         : q2_block_dot(rb, token, pc.q8_blocks, block));
             }
         }

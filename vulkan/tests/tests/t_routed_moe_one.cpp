@@ -29,7 +29,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
+
+static void set_routed_iq2_words_env(const char *value) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_ROUTED_IQ2_WORDS", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_ROUTED_IQ2_WORDS", value, 1);
+    else unsetenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
+#endif
+}
 
 /* ---------------- f16 helpers (from ds4.c / t_matmul_f16.cpp) ------------- */
 static uint16_t f32_to_f16(float f) {
@@ -455,6 +465,11 @@ static int run_moe_case(
         uint64_t down_expert_bytes, uint64_t down_row_bytes,
         const std::vector<float> &add_in)
 {
+    const bool exact_iq2_ab = gate_type == 16;
+    const char *saved_iq2_words_env = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
+    const bool had_iq2_words_env = saved_iq2_words_env != nullptr;
+    const std::string saved_iq2_words = saved_iq2_words_env
+        ? saved_iq2_words_env : "";
     ds4_gpu_tensor *out_t  = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc((uint64_t)n_expert * mid_dim * sizeof(float));
     ds4_gpu_tensor *up_t   = ds4_gpu_tensor_alloc((uint64_t)n_expert * mid_dim * sizeof(float));
@@ -466,6 +481,10 @@ static int run_moe_case(
     ds4_gpu_tensor *add_t  = add_in.empty() ? nullptr :
                              ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
     auto freet = [&]() {
+        if (exact_iq2_ab) {
+            set_routed_iq2_words_env(had_iq2_words_env
+                ? saved_iq2_words.c_str() : nullptr);
+        }
         if (out_t)  ds4_gpu_tensor_free(out_t);
         if (gate_t) ds4_gpu_tensor_free(gate_t);
         if (up_t)   ds4_gpu_tensor_free(up_t);
@@ -491,7 +510,8 @@ static int run_moe_case(
         return 1;
     }
 
-    int ok = ds4_gpu_routed_moe_one_tensor(
+    auto run_kernel = [&]() -> int {
+        return ds4_gpu_routed_moe_one_tensor(
             out_t, gate_t, up_t, mid_t, exp_t,
             model.data(), model.size(),
             gate_offset, up_offset, down_offset,
@@ -501,6 +521,18 @@ static int run_moe_case(
             in_dim, mid_dim, out_dim,
             sel_t, w_t, n_total_expert, n_expert,
             clamp, x_t, add_t, 0, false);
+    };
+    if (exact_iq2_ab) {
+        /* First call warms the model mappings and shader path.  The following
+         * baseline/candidate pair is therefore a cache-hot same-binary A/B. */
+        set_routed_iq2_words_env(nullptr);
+        if (!run_kernel()) {
+            fprintf(stderr, "routed_moe_one[%s]: baseline warm-up returned 0\n", label);
+            freet();
+            return 1;
+        }
+    }
+    int ok = run_kernel();
     if (!ok) {
         fprintf(stderr, "routed_moe_one[%s]: kernel returned 0\n", label);
         freet();
@@ -520,16 +552,66 @@ static int run_moe_case(
     std::vector<float> got_mid((uint64_t)n_expert * mid_dim);
     std::vector<float> got_exp((uint64_t)n_expert * out_dim);
     std::vector<float> got_out(out_dim);
-    bool read_ok =
-        ds4_gpu_tensor_read(gate_t, 0, got_gate.data(), got_gate.size() * sizeof(float)) != 0 &&
-        ds4_gpu_tensor_read(up_t,   0, got_up.data(),   got_up.size() * sizeof(float)) != 0 &&
-        ds4_gpu_tensor_read(mid_t,  0, got_mid.data(),  got_mid.size() * sizeof(float)) != 0 &&
-        ds4_gpu_tensor_read(exp_t,  0, got_exp.data(),  got_exp.size() * sizeof(float)) != 0 &&
-        ds4_gpu_tensor_read(out_t,  0, got_out.data(),  got_out.size() * sizeof(float)) != 0;
+    auto read_outputs = [&](std::vector<float> &read_gate,
+                            std::vector<float> &read_up,
+                            std::vector<float> &read_mid,
+                            std::vector<float> &read_exp,
+                            std::vector<float> &read_out) -> bool {
+        return ds4_gpu_tensor_read(gate_t, 0, read_gate.data(), read_gate.size() * sizeof(float)) != 0 &&
+               ds4_gpu_tensor_read(up_t,   0, read_up.data(),   read_up.size() * sizeof(float)) != 0 &&
+               ds4_gpu_tensor_read(mid_t,  0, read_mid.data(),  read_mid.size() * sizeof(float)) != 0 &&
+               ds4_gpu_tensor_read(exp_t,  0, read_exp.data(),  read_exp.size() * sizeof(float)) != 0 &&
+               ds4_gpu_tensor_read(out_t,  0, read_out.data(),  read_out.size() * sizeof(float)) != 0;
+    };
+    bool read_ok = read_outputs(got_gate, got_up, got_mid, got_exp, got_out);
     if (!read_ok) {
         fprintf(stderr, "routed_moe_one[%s]: tensor read failed\n", label);
         freet();
         return 1;
+    }
+
+    bool exact_ab_ok = true;
+    if (exact_iq2_ab) {
+        std::vector<float> ab_gate(got_gate.size());
+        std::vector<float> ab_up(got_up.size());
+        std::vector<float> ab_mid(got_mid.size());
+        std::vector<float> ab_exp(got_exp.size());
+        std::vector<float> ab_out(got_out.size());
+        set_routed_iq2_words_env("1");
+        if (!run_kernel() ||
+            !read_outputs(ab_gate, ab_up, ab_mid, ab_exp, ab_out)) {
+            fprintf(stderr, "routed_moe_one[%s]: IQ2 word-load A/B run failed\n", label);
+            freet();
+            return 1;
+        }
+        auto exact_vec = [&](const char *what, const std::vector<float> &baseline,
+                             const std::vector<float> &candidate) -> bool {
+            if (std::memcmp(baseline.data(), candidate.data(),
+                            baseline.size() * sizeof(float)) == 0) return true;
+            for (size_t i = 0; i < baseline.size(); ++i) {
+                uint32_t baseline_bits = 0, candidate_bits = 0;
+                std::memcpy(&baseline_bits, &baseline[i], sizeof(baseline_bits));
+                std::memcpy(&candidate_bits, &candidate[i], sizeof(candidate_bits));
+                if (baseline_bits != candidate_bits) {
+                    fprintf(stderr,
+                        "routed_moe_one[%s]: IQ2 word-load %s bit mismatch "
+                        "[%zu] baseline=%08x candidate=%08x\n",
+                        label, what, i, baseline_bits, candidate_bits);
+                    break;
+                }
+            }
+            return false;
+        };
+        exact_ab_ok &= exact_vec("gate", got_gate, ab_gate);
+        exact_ab_ok &= exact_vec("up", got_up, ab_up);
+        exact_ab_ok &= exact_vec("mid", got_mid, ab_mid);
+        exact_ab_ok &= exact_vec("experts", got_exp, ab_exp);
+        exact_ab_ok &= exact_vec("out", got_out, ab_out);
+        got_gate.swap(ab_gate);
+        got_up.swap(ab_up);
+        got_mid.swap(ab_mid);
+        got_exp.swap(ab_exp);
+        got_out.swap(ab_out);
     }
 
     auto cmp_vec = [&](const char *what, const std::vector<float> &got,
@@ -545,7 +627,7 @@ static int run_moe_case(
         }
         return good;
     };
-    bool ok_all = true;
+    bool ok_all = exact_ab_ok;
     ok_all &= cmp_vec("gate", got_gate, ref_gate, got_gate.size());
     ok_all &= cmp_vec("up",   got_up,   ref_up,   got_up.size());
     ok_all &= cmp_vec("mid",  got_mid,  ref_mid,  got_mid.size());
@@ -705,10 +787,13 @@ static int test_routed_moe_one(void) {
     /* ============ Case C: IQ2_XXS gate/up + Q2_K down ======================
      * The production gate/up layout (66 B/block). */
     {
-        const uint32_t in_dim = 256, mid_dim = 2048, out_dim = 1024;
+        const bool production_shape = getenv("DS4_TEST_PRODUCTION_SHAPE") != nullptr;
+        const uint32_t in_dim = production_shape ? 7168 : 256;
+        const uint32_t mid_dim = 2048, out_dim = 1024;
         const uint32_t n_total = 8, n_expert = 6;
         const float clamp = 0.25f;
-        const uint64_t gate_row_bytes = 66;          /* IQ2_XXS block */
+        const uint32_t gate_blocks = in_dim / 256;
+        const uint64_t gate_row_bytes = (uint64_t)gate_blocks * 66;
         const uint64_t down_row_bytes = 8 * 84;      /* 8 Q2_K blocks */
         const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
         const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
@@ -721,26 +806,32 @@ static int test_routed_moe_one(void) {
         std::vector<uint8_t> model(model_size, 0xAA);
         for (uint32_t e = 0; e < n_total; e++) {
             for (uint32_t r = 0; r < mid_dim; r++) {
-                iq2_block blk;
-                blk.d = f32_to_f16(4.0f);            /* scale = 0.5 * (2*ls+1) */
-                for (uint32_t g = 0; g < 32; g += 4) {
-                    const uint32_t l = g / 4;        /* 8-element group */
-                    const uint32_t ls = (r + e) % 3;
-                    uint32_t aux0 = 0, aux1 = ls << 28;
-                    for (uint32_t t = 0; t < 4; t++) {
-                        const uint32_t grid_idx = ((r * 7 + l * 11 + e * 3 + t * 17) % 256);
-                        ((uint8_t *)&aux0)[t] = (uint8_t)grid_idx;
-                        aux1 |= (((r * 5 + l * 13 + e * 7 + t) & 127) << (7 * t));
+                for (uint32_t b = 0; b < gate_blocks; ++b) {
+                    iq2_block blk;
+                    blk.d = f32_to_f16(4.0f);        /* scale = 0.5 * (2*ls+1) */
+                    for (uint32_t g = 0; g < 32; g += 4) {
+                        const uint32_t l = g / 4;    /* 8-element group */
+                        const uint32_t ls = (r + e + b) % 3;
+                        uint32_t aux0 = 0, aux1 = ls << 28;
+                        for (uint32_t t = 0; t < 4; t++) {
+                            const uint32_t grid_idx =
+                                (r * 7 + l * 11 + e * 3 + b * 19 + t * 17) % 256;
+                            ((uint8_t *)&aux0)[t] = (uint8_t)grid_idx;
+                            aux1 |= (((r * 5 + l * 13 + e * 7 + b * 3 + t) & 127) << (7 * t));
+                        }
+                        blk.qs[g + 0] = (uint16_t)(aux0 & 0xffffu);
+                        blk.qs[g + 1] = (uint16_t)(aux0 >> 16);
+                        blk.qs[g + 2] = (uint16_t)(aux1 & 0xffffu);
+                        blk.qs[g + 3] = (uint16_t)(aux1 >> 16);
                     }
-                    blk.qs[g + 0] = (uint16_t)(aux0 & 0xffffu);
-                    blk.qs[g + 1] = (uint16_t)(aux0 >> 16);
-                    blk.qs[g + 2] = (uint16_t)(aux1 & 0xffffu);
-                    blk.qs[g + 3] = (uint16_t)(aux1 >> 16);
+                    const uint64_t row_base = (uint64_t)e * gate_expert_bytes +
+                                              (uint64_t)r * gate_row_bytes +
+                                              (uint64_t)b * sizeof(blk);
+                    std::memcpy(model.data() + gate_offset + row_base,
+                                &blk, sizeof(blk));
+                    std::memcpy(model.data() + up_offset + row_base,
+                                &blk, sizeof(blk));
                 }
-                std::memcpy(model.data() + gate_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * gate_row_bytes,
-                            &blk, sizeof(blk));
-                std::memcpy(model.data() + up_offset + (uint64_t)e * gate_expert_bytes + (uint64_t)r * gate_row_bytes,
-                            &blk, sizeof(blk));
             }
             for (uint32_t r2 = 0; r2 < out_dim; r2++) {
                 for (uint32_t b = 0; b < 8; b++) {
@@ -768,7 +859,10 @@ static int test_routed_moe_one(void) {
         for (uint32_t i = 0; i < in_dim; i++) x[i] = (float)((int)((i * 7 + 3) % 19) - 9) * 0.125f;
         std::vector<int32_t> sel = { 0, 1, 2, 3, 4, 5 };
         std::vector<float> wgt = { 0.20f, 0.18f, 0.17f, 0.16f, 0.15f, 0.14f };
-        rc |= run_moe_case("iq2xxs-gate-q2k-down", 16, 10, in_dim, mid_dim, out_dim,
+        rc |= run_moe_case(production_shape
+                               ? "iq2xxs-gate-q2k-down-production"
+                               : "iq2xxs-gate-q2k-down",
+                           16, 10, in_dim, mid_dim, out_dim,
                            n_total, n_expert, clamp, x, sel, wgt, model,
                            gate_offset, up_offset, down_offset,
                            gate_expert_bytes, gate_row_bytes,

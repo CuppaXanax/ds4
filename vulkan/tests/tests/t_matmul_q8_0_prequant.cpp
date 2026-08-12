@@ -184,3 +184,76 @@ static int test_matmul_q8_0_prequant() {
 }
 
 REGISTER_TEST(matmul_q8_0_prequant, test_matmul_q8_0_prequant);
+
+/* Exercise all 256 lanes and make a change to the final FP32 addition order
+ * observable.  2^24 + 1 - 2^24 is zero when accumulated left-to-right, but
+ * can be one under a parallel tree.  Every factor is exactly representable,
+ * so this is an exact ordering gate rather than a tolerance-based check. */
+static int test_matmul_q8_0_aligned_reduction() {
+    const uint64_t in_dim = 8192;  /* 256 Q8 blocks: four Wave64s on BC-250. */
+    const uint64_t out_dim = 1;
+    const uint64_t n_tok = 1;
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_offset = 12288;
+    std::vector<uint8_t> model(weight_offset + out_dim * row_bytes, 0xA5);
+    uint8_t *weights = model.data() + weight_offset;
+    const uint16_t unit_scale = f32_to_f16(1.0f);
+    const uint16_t large_scale = f32_to_f16(512.0f);
+    for (uint64_t block = 0; block < blocks; block++) {
+        uint8_t *w = weights + block * 34u;
+        std::memcpy(w, &unit_scale, sizeof(unit_scale));
+        std::memset(w + 2u, 0, 32u);
+    }
+
+    /* xq is {127, 127, 1, 1, 1, 1, 1, 0...}, with xscale exactly one.
+     * Its dot with {127, 127, 127, 127, 127, 127, 2} is 32768. */
+    std::vector<float> input(n_tok * in_dim, 0.0f);
+    for (uint64_t block = 0; block < blocks; block++) {
+        float *x_block = input.data() + block * 32u;
+        x_block[0] = 127.0f;
+        x_block[1] = 127.0f;
+        for (uint32_t i = 2u; i < 7u; i++) x_block[i] = 1.0f;
+    }
+    const int8_t large_q[7] = {127, 127, 127, 127, 127, 127, 2};
+    for (uint32_t i = 0; i < 7u; i++) {
+        weights[2u + i] = (uint8_t)large_q[i];
+        weights[2u + 34u + i] = (uint8_t)(i == 6u ? 1 : 0);
+        weights[2u + 2u * 34u + i] = (uint8_t)-large_q[i];
+    }
+    std::memcpy(weights, &large_scale, sizeof(large_scale));
+    std::memcpy(weights + 2u * 34u, &large_scale, sizeof(large_scale));
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
+    if (!x || !q || !out) {
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(x);
+        return 1;
+    }
+    int rc = 1;
+    auto cleanup = [&]() {
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(x);
+        return rc;
+    };
+
+    if (!ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)) ||
+        !ds4_gpu_begin_commands() ||
+        !ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok) ||
+        !ds4_gpu_matmul_q8_0_prequant_tensor(out, model.data(), model.size(),
+                                               weight_offset, in_dim, out_dim, q, n_tok) ||
+        !ds4_gpu_end_commands()) return cleanup();
+
+    std::vector<float> got(n_tok * out_dim);
+    if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))
+        return cleanup();
+    if (got[0] != 0.0f) {
+        fprintf(stderr, "matmul_q8_0_aligned_reduction: got=%g want=0\n", got[0]);
+        return cleanup();
+    }
+
+    rc = 0;
+    return cleanup();
+}
+
+REGISTER_TEST(matmul_q8_0_aligned_reduction, test_matmul_q8_0_aligned_reduction);

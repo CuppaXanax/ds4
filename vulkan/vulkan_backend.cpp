@@ -3771,7 +3771,7 @@ static int dispatch_attention_mixed_online(
     if (!heads || !q || !raw_kv || !model_map || n_q == 0 || n_tokens == 0 ||
         n_head == 0 || head_dim == 0 || n_q > n_tokens ||
         q_row0 > n_tokens - n_q || n_raw > raw_cap ||
-        (n_raw != 0 && raw_start >= raw_cap) || n_raw > 256u || n_comp > 4096u ||
+        (n_raw != 0 && raw_start >= raw_cap) || n_comp > 4096u ||
         top_k > 512u || (mode == 1u && top_k == 0u) ||
         (n_comp != 0 && !comp_kv) || (mode == 1u && !topk) ||
         (use_mask != 0u && !comp_mask) ||

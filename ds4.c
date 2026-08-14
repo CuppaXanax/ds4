@@ -19696,7 +19696,6 @@ static bool metal_graph_capture_prefix_index_state(
 }
 
 static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *g) {
-    (void)g;
     static int parsed = -1;
     static uint32_t cached = 0;
     if (parsed < 0) {
@@ -19729,7 +19728,16 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
      * indexed attention.  This threshold changes only the implementation used
      * to consume the compressed rows; it must not lower the 512-row indexer
      * selection defined by DS4_N_INDEXER_TOP_K. */
+#ifdef DS4_VULKAN_BUILD
+    /* Vulkan's dense decode kernel has a fixed 1024-row score array shared by
+     * raw and compressed rows. Hand off before the 128-row raw window leaves
+     * too little room for the compressed prefix. */
+    const uint32_t raw_window = g && g->raw_window ? g->raw_window : DS4_N_SWA;
+    return raw_window < 1024u ? 1024u - raw_window : 0u;
+#else
+    (void)g;
     return 1024u;
+#endif
 }
 
 /* =========================================================================
@@ -21913,6 +21921,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
     bool ok = true;
+    const char *decode_failed_stage = NULL;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
     const bool fuse_shared_gate_up =
@@ -21968,6 +21977,7 @@ static bool metal_graph_encode_decode_layer_phase(
 #define DS4_VULKAN_TIMELINE_DECODE_STAGE(name) ((void)0)
 #endif
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
+        if (!ok && !decode_failed_stage) decode_failed_stage = (name); \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
@@ -25116,6 +25126,16 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
     }
+#ifdef DS4_VULKAN_BUILD
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: VULKAN decode layer %u pos %u phase %u failed at %s\n",
+                il,
+                pos,
+                (unsigned)phase,
+                decode_failed_stage ? decode_failed_stage : "layer entry");
+    }
+#endif
     return ok;
 }
 

@@ -357,6 +357,95 @@ static int test_attention_decode(void) {
 }
 REGISTER_TEST(attention_decode, test_attention_decode);
 
+static int test_attention_decode_indexed_boundary(void) {
+    const uint32_t n_head = 2, head_dim = 4;
+    const uint32_t n_raw = 128, raw_cap = 128, raw_start = 0;
+    const uint32_t n_comp = 897, top_k = 512;
+    const uint32_t pos0 = 3588, window = 128, ratio = 4;
+    const uint64_t head_elems = (uint64_t)n_head * head_dim;
+    const uint64_t raw_elems = (uint64_t)raw_cap * head_dim;
+    const uint64_t comp_elems = (uint64_t)n_comp * head_dim;
+
+    std::vector<float> q(head_elems);
+    std::vector<float> raw(raw_elems);
+    std::vector<float> comp(comp_elems);
+    std::vector<uint32_t> selected(top_k);
+    float sinks[n_head] = {0.05f, -0.1f};
+    for (uint64_t i = 0; i < head_elems; i++)
+        q[i] = 0.07f * (float)((i * 5u) % 13u) - 0.3f;
+    for (uint64_t i = 0; i < raw_elems; i++)
+        raw[i] = 0.03f * (float)((i * 7u) % 19u) - 0.25f;
+    for (uint64_t i = 0; i < comp_elems; i++)
+        comp[i] = 0.02f * (float)((i * 11u) % 23u) - 0.2f;
+    for (uint32_t i = 0; i < top_k; i++) selected[i] = i;
+
+    ds4_gpu_tensor *heads_t = ds4_gpu_tensor_alloc(head_elems * sizeof(float));
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(head_elems * sizeof(float));
+    ds4_gpu_tensor *raw_t = ds4_gpu_tensor_alloc(raw_elems * sizeof(float));
+    ds4_gpu_tensor *comp_t = ds4_gpu_tensor_alloc(comp_elems * sizeof(float));
+    ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    const uint64_t sinks_offset = 16;
+    const uint64_t model_size = sinks_offset + sizeof(sinks);
+    unsigned char *model = (unsigned char *)std::malloc(model_size);
+    bool ok = heads_t && q_t && raw_t && comp_t && selected_t && model;
+    if (ok) {
+        std::memset(model, 0xAA, (size_t)sinks_offset);
+        std::memcpy(model + sinks_offset, sinks, sizeof(sinks));
+        ok = ds4_gpu_set_model_map(model, model_size) != 0 &&
+             ds4_gpu_tensor_write(q_t, 0, q.data(), head_elems * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_write(raw_t, 0, raw.data(), raw_elems * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_write(comp_t, 0, comp.data(), comp_elems * sizeof(float)) != 0 &&
+             ds4_gpu_tensor_write(selected_t, 0, selected.data(),
+                                  (uint64_t)top_k * sizeof(uint32_t)) != 0;
+    }
+    if (ok && ds4_gpu_attention_decode_heads_tensor(
+                      heads_t, model, model_size, sinks_offset, q_t, raw_t,
+                      n_raw, raw_cap, raw_start, comp_t, 0, n_comp, nullptr, 0,
+                      n_head, head_dim) != 0) {
+        fprintf(stderr, "attention_decode_indexed_boundary: dense path accepted 1025 rows\n");
+        ok = false;
+    }
+    if (ok) {
+        ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                 heads_t, model, model_size, sinks_offset, q_t, raw_t, comp_t, 0,
+                 selected_t, 1, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                 window, ratio, n_head, head_dim) != 0;
+    }
+    std::vector<float> got(head_elems);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(heads_t, 0, got.data(), head_elems * sizeof(float)) != 0;
+    }
+    if (ok) {
+        std::vector<float> selected_comp((uint64_t)top_k * head_dim);
+        for (uint32_t row = 0; row < top_k; row++) {
+            std::copy_n(comp.data() + (uint64_t)selected[row] * head_dim,
+                        head_dim,
+                        selected_comp.data() + (uint64_t)row * head_dim);
+        }
+        std::vector<float> ref(head_elems);
+        ref_attention_decode(ref.data(), n_head, head_dim, sinks, q.data(),
+                             raw.data(), n_raw, raw_cap, raw_start,
+                             selected_comp.data(), top_k, nullptr, 0);
+        for (uint32_t i = 0; i < head_elems && ok; i++) {
+            if (std::fabs(got[i] - ref[i]) > 2e-3f) {
+                fprintf(stderr,
+                        "attention_decode_indexed_boundary: head[%u] got %.6f want %.6f\n",
+                        i, got[i], ref[i]);
+                ok = false;
+            }
+        }
+    }
+
+    std::free(model);
+    if (selected_t) ds4_gpu_tensor_free(selected_t);
+    if (comp_t) ds4_gpu_tensor_free(comp_t);
+    if (raw_t) ds4_gpu_tensor_free(raw_t);
+    if (q_t) ds4_gpu_tensor_free(q_t);
+    if (heads_t) ds4_gpu_tensor_free(heads_t);
+    return ok ? 0 : 1;
+}
+REGISTER_TEST(attention_decode_indexed_boundary, test_attention_decode_indexed_boundary);
+
 static int test_attention_decode_raw_batch(void) {
     const uint32_t n_tokens = 3, pos0 = 7, n_raw = 5, raw_cap = 8;
     const uint32_t raw_start = 6, window = 3, n_head = 2, head_dim = 4;

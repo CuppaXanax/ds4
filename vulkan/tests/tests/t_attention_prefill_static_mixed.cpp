@@ -295,7 +295,7 @@ static int test_attention_prefill_static_mixed(void) {
     /* A chunk-sized case keeps the static path honest beyond the tiny
      * correctness vectors while remaining cheap for the kernel harness. */
     {
-        const uint32_t long_tokens = 32, long_comp = 20;
+        const uint32_t long_tokens = 257, long_comp = 20;
         std::vector<float> long_q((uint64_t)long_tokens * n_head * head_dim);
         std::vector<float> long_raw((uint64_t)long_tokens * head_dim);
         std::vector<float> long_comp_data((uint64_t)long_comp * head_dim);
@@ -311,7 +311,7 @@ static int test_attention_prefill_static_mixed(void) {
         rc |= run_prefill_case(long_tokens, long_comp, n_head, head_dim, 16, 4,
                                sinks, long_q.data(), long_raw.data(),
                                long_comp_data.data(), long_comp_half.data(), 1,
-                               "static-32-token-mixed");
+                               "static-257-token-mixed");
     }
 
     /* Case 5: error path - null pointers must return 0. */

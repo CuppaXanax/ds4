@@ -3766,7 +3766,7 @@ static int dispatch_attention_mixed_online(
         position_end > UINT32_MAX || pos0 > UINT32_MAX - n_tokens ||
         (uint64_t)n_raw > (uint64_t)pos0 + n_tokens ||
         (n_raw != 0u && raw_start > UINT32_MAX - n_raw) ||
-        !checked_u64_product(n_q, n_head, head_count) || head_count > 65535u ||
+        !checked_u64_product(n_q, n_head, head_count) || head_count > UINT32_MAX ||
         !shader_f32_domain(n_q, n_head, head_dim) ||
         !shader_f32_domain(n_tokens, n_head, head_dim) ||
         !shader_f32_domain(raw_cap, 1, head_dim) ||
@@ -3818,22 +3818,52 @@ static int dispatch_attention_mixed_online(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
-    VkDescriptorBufferInfo bufs[8] = {
-        {obuf, ooff, (VkDeviceSize)heads->bytes},
-        {qbuf, qoff, (VkDeviceSize)q->bytes},
-        {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
-        {cbuf, coff, n_comp ? (VkDeviceSize)comp_kv->bytes : 4},
-        {tbuf, toff, mode == 1u ? (VkDeviceSize)topk->bytes : 4},
-        {mbuf, moff, use_mask ? (VkDeviceSize)comp_mask->bytes : 4},
-        {sbuf, soff, ssize}, {rbuf, roff, 4}
-    };
-    struct { uint32_t n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
-             top_k, window, ratio, n_head, head_dim, comp_f16, use_mask, mode; } pc = {
-        n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
-        top_k, window, ratio, n_head, head_dim, comp_kv_f16, use_mask, mode};
     DS4_VK_TRACE_KERNEL("attention_mixed_online");
-    return record_simple_shader("attention_mixed_online", &pc, sizeof(pc), bufs, 8,
-                                (uint32_t)head_count, 1, 1, resume_recording);
+    constexpr uint32_t max_query_tokens_per_dispatch = 256u;
+    const uint64_t row_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t topk_row_bytes = (uint64_t)top_k * sizeof(uint32_t);
+    for (uint32_t local_row0 = 0; local_row0 < n_q; ) {
+        const uint32_t tile_rows = std::min(max_query_tokens_per_dispatch,
+                                            n_q - local_row0);
+        if (!ctx.recording && !begin_cmd()) return 0;
+        if ((uint64_t)local_row0 > UINT64_MAX / row_bytes ||
+            (mode == 1u && (uint64_t)local_row0 > UINT64_MAX / topk_row_bytes))
+            return fail_simple_dispatch(ctx);
+        const uint64_t row_delta = (uint64_t)local_row0 * row_bytes;
+        const uint64_t topk_delta = mode == 1u
+            ? (uint64_t)local_row0 * topk_row_bytes : 0u;
+        if (row_delta > UINT64_MAX - ooff || row_delta > UINT64_MAX - qoff ||
+            topk_delta > UINT64_MAX - toff)
+            return fail_simple_dispatch(ctx);
+        const VkDeviceSize tile_ooff = ooff + row_delta;
+        const VkDeviceSize tile_qoff = qoff + row_delta;
+        const VkDeviceSize tile_toff = toff + topk_delta;
+        if (align && ((tile_ooff | tile_qoff | tile_toff) % align) != 0)
+            return fail_simple_dispatch(ctx);
+        VkDescriptorBufferInfo bufs[8] = {
+            {obuf, tile_ooff, (VkDeviceSize)tile_rows * row_bytes},
+            {qbuf, tile_qoff, (VkDeviceSize)tile_rows * row_bytes},
+            {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
+            {cbuf, coff, n_comp ? (VkDeviceSize)comp_kv->bytes : 4},
+            {tbuf, tile_toff, mode == 1u
+                ? (VkDeviceSize)tile_rows * topk_row_bytes : 4},
+            {mbuf, moff, use_mask ? (VkDeviceSize)comp_mask->bytes : 4},
+            {sbuf, soff, ssize}, {rbuf, roff, 4}
+        };
+        struct { uint32_t n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
+                 top_k, window, ratio, n_head, head_dim, comp_f16, use_mask, mode; } pc = {
+            n_tokens, pos0, q_row0 + local_row0, tile_rows, n_raw, raw_cap,
+            raw_start, n_comp, top_k, window, ratio, n_head, head_dim,
+            comp_kv_f16, use_mask, mode};
+        const uint64_t tile_head_count = (uint64_t)tile_rows * n_head;
+        const bool more_tiles = local_row0 + tile_rows < n_q;
+        if (tile_head_count > g_vk.caps.max_compute_work_group_count[0] ||
+            !record_simple_shader("attention_mixed_online", &pc, sizeof(pc),
+                                  bufs, 8, (uint32_t)tile_head_count, 1, 1,
+                                  more_tiles || resume_recording)) return 0;
+        local_row0 += tile_rows;
+    }
+    return 1;
 }
 
 int ds4_gpu_attention_decode_mixed_batch_heads_tensor(

@@ -44,7 +44,7 @@ void main() {
     const uint token = work / pc.n_head;
     const uint head = work - token * pc.n_head;
     if (token >= pc.n_q || head >= pc.n_head) return;
-    const uint qpos = pc.pos0 + (pc.mode == 0u ? pc.q_row0 : 0u) + token;
+    const uint qpos = pc.pos0 + pc.q_row0 + token;
     const uint dim = pc.head_dim;
     const uint qbase = token * pc.n_head * dim + head * dim;
     const float scale = inversesqrt(float(dim));

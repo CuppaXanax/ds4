@@ -2768,7 +2768,12 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x,
     if (!find_tensor_buffer(x, buffer, offset)) return 0;
     auto &ctx = get_cmd_ctx();
     const bool resume_recording = ctx.recording;
-    const uint32_t tile_tokens = std::max(1u, 65535u / n_head);
+    /* Match the standalone RoPE work budget: 16K head rows each rotate 32
+     * pairs for the production shape. Larger logical prefills remain one
+     * engine chunk but are emitted as independently synchronized GPU tiles. */
+    constexpr uint32_t max_head_rows_per_dispatch = 16384u;
+    const uint32_t tile_tokens = std::max(
+        1u, std::min(65535u, max_head_rows_per_dispatch) / n_head);
     const VkDeviceSize alignment =
         (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
     if (n_tok > tile_tokens && alignment != 0 && row_bytes % alignment != 0)
@@ -2895,8 +2900,15 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
     auto &shader = g_vk.shaders[si->second];
     const uint64_t pairs_per_token = (uint64_t)n_head * (n_rot / 2u);
     if (pairs_per_token == 0 || pairs_per_token > UINT64_MAX / 256u) return 0;
+    /* RoPE evaluates several transcendentals per pair. Bound each dispatch to
+     * the work exercised by a 256-token indexer batch, while leaving the
+     * engine's logical prefill chunk and KV boundaries unchanged. */
+    constexpr uint64_t max_groups_per_dispatch = 2048u;
+    constexpr uint64_t invocations_per_group = 256u;
+    const uint64_t pairs_per_dispatch =
+        max_groups_per_dispatch * invocations_per_group;
     const uint32_t tile_tokens = (uint32_t)std::min<uint64_t>(n_tok,
-        (65535ull * 256ull) / pairs_per_token);
+        pairs_per_dispatch / pairs_per_token);
     if (tile_tokens == 0) return 0;
     const VkDeviceSize alignment =
         (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
@@ -4920,10 +4932,26 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
-    VkDescriptorBufferInfo bufs[1] = {{xbuf, xoff, (VkDeviceSize)x->bytes}};
-    struct { uint32_t n_rows; } pc = {n_rows};
-    return record_simple_shader("indexer_qat", &pc, sizeof(pc), bufs, 1,
-                                n_rows, 1, 1, resume_recording);
+    constexpr uint32_t max_rows_per_dispatch = 16384u;
+    const VkDeviceSize row_bytes = (VkDeviceSize)head_dim * sizeof(float);
+    int ok = 1;
+    for (uint32_t row_base = 0; row_base < n_rows; ) {
+        const uint32_t tile_rows = std::min(max_rows_per_dispatch,
+                                            n_rows - row_base);
+        if (!ctx.recording && !begin_cmd()) return 0;
+        const VkDeviceSize tile_offset = xoff + (VkDeviceSize)row_base * row_bytes;
+        if ((align && tile_offset % align != 0) ||
+            tile_rows > UINT64_MAX / row_bytes)
+            return fail_simple_dispatch(ctx);
+        VkDescriptorBufferInfo bufs[1] = {
+            {xbuf, tile_offset, (VkDeviceSize)tile_rows * row_bytes}};
+        struct { uint32_t n_rows; } pc = {tile_rows};
+        ok = record_simple_shader("indexer_qat", &pc, sizeof(pc), bufs, 1,
+                                  tile_rows, 1, 1, resume_recording);
+        if (!ok) return 0;
+        row_base += tile_rows;
+    }
+    return ok;
 }
 
 } /* extern "C" close CPU fallbacks */

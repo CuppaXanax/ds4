@@ -147,6 +147,12 @@ static int test_dsv4_indexer_qat_one_row(void) {
 }
 REGISTER_TEST(dsv4_indexer_qat_one_row, test_dsv4_indexer_qat_one_row);
 
+/* Cross the backend's per-dispatch row limit by one row. */
+static int test_dsv4_indexer_qat_tiled(void) {
+    return run_qat_case("dsv4_indexer_qat/tiled", 16385, 128, 29);
+}
+REGISTER_TEST(dsv4_indexer_qat_tiled, test_dsv4_indexer_qat_tiled);
+
 /* Validation: wrong head_dim / zero rows / undersized buffer must fail. */
 static int test_dsv4_indexer_qat_bounds(void) {
     const uint32_t head_dim = 128;

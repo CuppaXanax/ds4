@@ -303,6 +303,10 @@ static int test_rope_tail(void) {
     /* (g) Non-standard base / scale / attn_factor. */
     if (rope_tail_one("rope_tail/custom", 1, 1, 16, 16, 77, 0, false,
                       500000.0f, 0.5f, 0.0f, 2.0f, 32.0f, 1.0f) != 0) return 1;
+    /* (h) Production indexer shape crossing the internal 256-token tile. */
+    if (rope_tail_one("rope_tail/indexer-tiled", 257, 64, 128, 64, 4096,
+                      16384, false, 10000.0f, 0.25f, 1.0f, 1.0f,
+                      32.0f, 1.0f) != 0) return 1;
     return 0;
 }
 REGISTER_TEST(rope_tail, test_rope_tail);
@@ -382,6 +386,42 @@ static int test_head_rms_norm_rope_tail(void) {
     return rc || yarn_rc;
 }
 REGISTER_TEST(head_rms_norm_rope_tail, test_head_rms_norm_rope_tail);
+
+static int test_head_rms_norm_rope_tail_tiled(void) {
+    const uint32_t n_tok = 257, n_head = 64, head_dim = 64, n_rot = 32;
+    const uint32_t pos0 = 4096;
+    const float eps = 1e-5f;
+    const uint64_t elems = (uint64_t)n_tok * n_head * head_dim;
+    const uint64_t bytes = elems * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(bytes);
+    float *input = (float *)malloc(bytes);
+    float *want = (float *)malloc(bytes);
+    float *got = (float *)malloc(bytes);
+    if (!x || !input || !want || !got) {
+        ds4_gpu_tensor_free(x);
+        free(got); free(want); free(input);
+        return 1;
+    }
+    synth_row_major(input, elems);
+    std::memcpy(want, input, bytes);
+    ref_head_rms_norm(want, n_tok, n_head, head_dim, eps);
+    ref_rope_tail(want, n_tok, n_head, head_dim, n_rot, pos0, 16384,
+                  10000.0f, 0.25f, 1.0f, 1.0f, 32.0f, 1.0f, false);
+    int rc = 1;
+    if (ds4_gpu_tensor_write(x, 0, input, bytes) != 0 &&
+        ds4_gpu_head_rms_norm_rope_tail_tensor(
+            x, n_tok, n_head, head_dim, n_rot, pos0, 16384, false,
+            10000.0f, 0.25f, 1.0f, 1.0f, 32.0f, 1.0f, eps) != 0 &&
+        ds4_gpu_tensor_read(x, 0, got, bytes) != 0) {
+        rc = check_f32("head_rms_norm_rope_tail/tiled", got, want,
+                       (uint32_t)elems);
+    }
+    free(got); free(want); free(input);
+    ds4_gpu_tensor_free(x);
+    return rc;
+}
+REGISTER_TEST(head_rms_norm_rope_tail_tiled,
+              test_head_rms_norm_rope_tail_tiled);
 
 static int test_attn_q_b_fused_unavailable(void) {
     return ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(

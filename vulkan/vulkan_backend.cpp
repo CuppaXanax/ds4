@@ -2893,17 +2893,8 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
     auto &shader = g_vk.shaders[si->second];
     const uint64_t pairs_per_token = (uint64_t)n_head * (n_rot / 2u);
     if (pairs_per_token == 0 || pairs_per_token > UINT64_MAX / 256u) return 0;
-    /* The shader performs pow/log/cos/sin per rotary pair.  Limiting tiles
-     * only by Vulkan's 65535-workgroup dispatch ceiling lets long prefills
-     * create multi-million-invocation command streams that can trip RADV's
-     * GPU timeout.  Bound execution work per submission instead; arbitrary
-     * prompt lengths are handled by emitting more identical tiles. */
-    constexpr uint64_t max_groups_per_submit = 2048u;
-    constexpr uint64_t invocations_per_group = 256u;
-    const uint64_t pairs_per_submit =
-        max_groups_per_submit * invocations_per_group;
     const uint32_t tile_tokens = (uint32_t)std::min<uint64_t>(n_tok,
-        pairs_per_submit / pairs_per_token);
+        (65535ull * 256ull) / pairs_per_token);
     if (tile_tokens == 0) return 0;
     const VkDeviceSize alignment =
         (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;

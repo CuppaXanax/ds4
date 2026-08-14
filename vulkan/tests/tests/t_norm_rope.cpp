@@ -250,7 +250,8 @@ static int rope_tail_one(const char *what, uint32_t n_tok, uint32_t n_head,
     if (!x) return 1;
     float *xv = (float *)malloc(elems * sizeof(float));
     if (!xv) { ds4_gpu_tensor_free(x); return 1; }
-    synth_row_major(xv, elems);
+    for (uint64_t i = 0; i < elems; i++)
+        xv[i] = 0.03125f * (float)((int32_t)((i * 17u) % 127u) - 63);
     if (ds4_gpu_tensor_write(x, 0, xv, elems * sizeof(float)) == 0) {
         free(xv); ds4_gpu_tensor_free(x); return 1;
     }

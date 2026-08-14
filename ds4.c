@@ -12164,11 +12164,17 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 }
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
+#define DS4_VULKAN_DEFAULT_PREFILL_CHUNK 256u
 
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
     if (requested_chunk != 0) return requested_chunk;
+#if defined(DS4_VULKAN_BUILD)
+    (void)cuda_tensor_parallel;
+    return DS4_VULKAN_DEFAULT_PREFILL_CHUNK;
+#else
     return cuda_tensor_parallel ? DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK : 0;
+#endif
 }
 
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,

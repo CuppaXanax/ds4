@@ -39,12 +39,21 @@ if not shaders:
     print("No .comp shaders found, skipping.")
     sys.exit(0)
 
+# Keep a manual-unpack copy in the same binary solely for correctness and
+# performance A/B measurements.  matmul_f16.spv is the opt-in native
+# unpackHalf2x16 candidate until BC-250 qualification promotes it.
+jobs = [(src, OUT_DIR / f"{src.stem}.spv", []) for src in shaders]
+matmul_f16 = SRC_DIR / "matmul_f16.comp"
+if matmul_f16 in shaders:
+    jobs.append((matmul_f16, OUT_DIR / "matmul_f16_legacy.spv",
+                 ["-DDS4_F16_MANUAL_UNPACK=1"]))
+
 compiled = 0
 failed = 0
-for src in shaders:
-    spv = OUT_DIR / f"{src.stem}.spv"
+for src, spv, defines in jobs:
     result = subprocess.run(
-        [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}", str(src), "-o", str(spv)],
+        [GLSLANG, "-V", "--target-env", "vulkan1.2", *defines,
+         f"-I{SRC_DIR}", str(src), "-o", str(spv)],
         capture_output=True, text=True
     )
     if result.returncode == 0:
@@ -53,7 +62,7 @@ for src in shaders:
         failed += 1
         diagnostics = "\n".join(part for part in
                                 (result.stdout.strip(), result.stderr.strip()) if part)
-        print(f"FAIL {src.name}: {diagnostics}", file=sys.stderr)
+        print(f"FAIL {src.name} -> {spv.name}: {diagnostics}", file=sys.stderr)
 
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

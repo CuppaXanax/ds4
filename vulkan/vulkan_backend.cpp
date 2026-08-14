@@ -447,7 +447,8 @@ static int load_all_shaders(void) {
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
         {"group_copy", 24, 6},
-        {"matmul_f16", 12, 6},   /* 3 x uint32 */
+        {"matmul_f16", 12, 6},   /* 3 x uint32; native unpackHalf2x16 */
+        {"matmul_f16_legacy", 12, 6}, /* measurement-only manual f16 unpack */
         {"rms_norm_weight_rows", 12, 6},
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
         {"rope_tail", 52, 6},      /* 7 x uint32 + 6 x float */
@@ -2537,7 +2538,12 @@ int ds4_gpu_matmul_f16_tensor(
         return 0;
     }
 
-    auto si = g_vk.shader_map.find("matmul_f16");
+    /* Keep the qualified manual conversion as the default until the BC-250
+     * exactness/performance gate promotes this candidate.  Both pipelines
+     * stay in one binary so the opt-in A/B is independent of rebuilds. */
+    const char *shader_name = getenv("DS4_VULKAN_F16_NATIVE_UNPACK")
+        ? "matmul_f16" : "matmul_f16_legacy";
+    auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end()) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr, "ds4: [dbg] matmul_f16 shader unavailable\n");
@@ -2638,7 +2644,7 @@ int ds4_gpu_matmul_f16_tensor(
         w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
     }
     vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-    timeline_descriptors(c, "matmul_f16", bufs, 3);
+    timeline_descriptors(c, shader_name, bufs, 3);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
 
     struct { uint32_t in_dim, out_dim, n_tok; } pc = {
@@ -2646,14 +2652,14 @@ int ds4_gpu_matmul_f16_tensor(
     };
     vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     if ((uint32_t)out_dim <= 65534) {
-        timeline_dispatch(c, "matmul_f16", bufs, 3,
+        timeline_dispatch(c, shader_name, bufs, 3,
                           (uint32_t)out_dim, (uint32_t)n_tok, 1);
     } else {
         const uint32_t max_wg = 65534;
         uint32_t dispatched = 0;
         while (dispatched < (uint32_t)out_dim) {
             uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
-            timeline_dispatch(c, "matmul_f16", bufs, 3,
+            timeline_dispatch(c, shader_name, bufs, 3,
                               chunk, (uint32_t)n_tok, 1);
             dispatched += chunk;
         }
@@ -2675,7 +2681,7 @@ int ds4_gpu_matmul_f16_tensor(
     int ok = submit_and_wait();
     if (ok && !release_simple_descriptors(ds)) ok = 0;
     else if (ok) timeline_resource(c, TimelineEventKind::DescriptorFree,
-                                   "matmul_f16", 0);
+                                   shader_name, 0);
     return ok;
 }
 

@@ -137,6 +137,8 @@ struct TensorHeader {
 /* Forward declarations for VK_CHECK_RAW macro */
 #define VK_CHECK_RAW(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "ds4: VULKAN error %d at %s:%d\n", _r, __FILE__, __LINE__); return -1; } } while(0)
+#define VK_CHECK_BOOL(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
+    fprintf(stderr, "ds4: VULKAN error %d at %s:%d\n", _r, __FILE__, __LINE__); return 0; } } while(0)
 #define VK_CHECK_VOID(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "ds4: VULKAN error %d at %s:%d\n", _r, __FILE__, __LINE__); return; } } while(0)
 
@@ -808,14 +810,14 @@ static int begin_cmd(void) {
     if (c.recording) return 1;
     if (c.submitted) {
         const uint64_t wait_start = timeline_now_ns();
-        VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+        VK_CHECK_BOOL(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
         if (c.timeline_collecting) {
             TimelineEvent *event = timeline_add(c, TimelineEventKind::Wait, "begin_cmd");
             if (event) event->duration_ns = timeline_now_ns() - wait_start;
         }
         report_routed_timestamps(c);
         c.timeline_queries_pending = false;
-        VK_CHECK_RAW(vkResetFences(g_vk.device, 1, &c.fence));
+        VK_CHECK_BOOL(vkResetFences(g_vk.device, 1, &c.fence));
         c.submitted = false;
         /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
         c.cmd_buf_count++;
@@ -842,12 +844,12 @@ static int begin_cmd(void) {
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 1;
-        VK_CHECK_RAW(vkAllocateCommandBuffers(g_vk.device, &cbai, &cb));
+        VK_CHECK_BOOL(vkAllocateCommandBuffers(g_vk.device, &cbai, &cb));
     }
     c.cmd = cb;
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK_RAW(vkBeginCommandBuffer(c.cmd, &bi));
+    VK_CHECK_BOOL(vkBeginCommandBuffer(c.cmd, &bi));
     c.recording = true;
     c.command_count = 0;
     g_vk.cmd_gen++;
@@ -865,7 +867,7 @@ static int end_and_submit(void) {
     auto &c = get_cmd_ctx();
     if (!c.recording) return 1;
     if (c.command_count == 0) {
-        VK_CHECK_RAW(vkEndCommandBuffer(c.cmd));
+        VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
         c.recording = false;
         return 1;
     }
@@ -876,12 +878,12 @@ static int end_and_submit(void) {
         (void)base;
         (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
-    VK_CHECK_RAW(vkEndCommandBuffer(c.cmd));
+    VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
     const uint64_t submit_start = timeline_now_ns();
-    VK_CHECK_RAW(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
+    VK_CHECK_BOOL(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
     if (c.timeline_collecting) {
         TimelineEvent *event = timeline_add(c, TimelineEventKind::Submit, "queue_submit");
         if (event) {
@@ -897,7 +899,7 @@ static int wait_cmd(void) {
     auto &c = get_cmd_ctx();
     if (!c.submitted) return 1;
     const uint64_t wait_start = timeline_now_ns();
-    VK_CHECK_RAW(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
+    VK_CHECK_BOOL(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
     if (c.timeline_collecting) {
         TimelineEvent *event = timeline_add(c, TimelineEventKind::Wait, "wait_cmd");
         if (event) event->duration_ns = timeline_now_ns() - wait_start;
@@ -1247,7 +1249,7 @@ int ds4_gpu_end_commands(void) {
         timeline_dump(ctx);
     return ok;
 }
-int ds4_gpu_synchronize(void) { VK_CHECK_RAW(timeline_device_wait_idle("synchronize")); return 1; }
+int ds4_gpu_synchronize(void) { VK_CHECK_BOOL(timeline_device_wait_idle("synchronize")); return 1; }
 
 extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");

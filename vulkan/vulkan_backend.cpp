@@ -5926,12 +5926,73 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(
 {
     (void)layer_index;
     (void)force_resident;
-    return ds4gk_routed_common(
-        out, gate, up, mid, experts, model_map, model_size,
-        gate_offset, up_offset, down_offset, gate_type, down_type,
-        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-        n_total_expert, n_expert, clamp, x, nullptr, n_tokens, mid_is_f16) ? 1 : 0;
+    if (mid_is_f16) *mid_is_f16 = false;
+    if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
+        !x || n_tokens == 0) return 0;
+    constexpr uint32_t max_tokens_per_dispatch = 256u;
+    const uint64_t pair_values = (uint64_t)n_expert * expert_mid_dim;
+    const uint64_t expert_values = (uint64_t)n_expert * out_dim;
+    if (expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        n_expert == 0 || pair_values == 0 || expert_values == 0 ||
+        n_tokens > UINT64_MAX / pair_values ||
+        n_tokens > UINT64_MAX / expert_values ||
+        n_tokens > UINT64_MAX / expert_in_dim ||
+        n_tokens > UINT64_MAX / out_dim ||
+        n_tokens > UINT64_MAX / n_expert) return 0;
+    auto make_view = [](ds4_gpu_tensor &view, const ds4_gpu_tensor *base,
+                        uint64_t value_offset, uint64_t value_count,
+                        uint64_t element_bytes) {
+        if (!base || !base->ptr || value_offset > UINT64_MAX / element_bytes ||
+            value_count > UINT64_MAX / element_bytes) return false;
+        const uint64_t byte_offset = value_offset * element_bytes;
+        const uint64_t byte_count = value_count * element_bytes;
+        if (byte_offset > base->bytes || byte_count > base->bytes - byte_offset)
+            return false;
+        view = {};
+        view.ptr = (char *)base->ptr + byte_offset;
+        view.bytes = byte_count;
+        view.owner = 0;
+        view.device_id = base->device_id;
+        return true;
+    };
+    for (uint32_t token_base = 0; token_base < n_tokens; ) {
+        const uint32_t tile_tokens = std::min(max_tokens_per_dispatch,
+                                              n_tokens - token_base);
+        ds4_gpu_tensor out_view{}, gate_view{}, up_view{}, mid_view{};
+        ds4_gpu_tensor experts_view{}, selected_view{}, weights_view{}, x_view{};
+        if (!make_view(out_view, out, (uint64_t)token_base * out_dim,
+                       (uint64_t)tile_tokens * out_dim, sizeof(float)) ||
+            !make_view(gate_view, gate, (uint64_t)token_base * pair_values,
+                       (uint64_t)tile_tokens * pair_values, sizeof(float)) ||
+            !make_view(up_view, up, (uint64_t)token_base * pair_values,
+                       (uint64_t)tile_tokens * pair_values, sizeof(float)) ||
+            !make_view(mid_view, mid, (uint64_t)token_base * pair_values,
+                       (uint64_t)tile_tokens * pair_values, sizeof(float)) ||
+            !make_view(experts_view, experts,
+                       (uint64_t)token_base * expert_values,
+                       (uint64_t)tile_tokens * expert_values, sizeof(float)) ||
+            !make_view(selected_view, selected,
+                       (uint64_t)token_base * n_expert,
+                       (uint64_t)tile_tokens * n_expert, sizeof(int32_t)) ||
+            !make_view(weights_view, weights,
+                       (uint64_t)token_base * n_expert,
+                       (uint64_t)tile_tokens * n_expert, sizeof(float)) ||
+            !make_view(x_view, x, (uint64_t)token_base * expert_in_dim,
+                       (uint64_t)tile_tokens * expert_in_dim, sizeof(float)))
+            return 0;
+        bool tile_mid_is_f16 = false;
+        if (!ds4gk_routed_common(
+                &out_view, &gate_view, &up_view, &mid_view, &experts_view,
+                model_map, model_size, gate_offset, up_offset, down_offset,
+                gate_type, down_type, gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes, expert_in_dim,
+                expert_mid_dim, out_dim, &selected_view, &weights_view,
+                n_total_expert, n_expert, clamp, &x_view, nullptr,
+                tile_tokens, &tile_mid_is_f16) || tile_mid_is_f16)
+            return 0;
+        token_base += tile_tokens;
+    }
+    return 1;
 }
 
 /* =========================================================================

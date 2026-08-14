@@ -477,11 +477,11 @@ static int test_routed_moe_batch(void) {
     int rc = 0;
 
     /* ============ Case A: Q8_0 gate/up + Q8_0 down, small dims ============
-     * in=8, mid=8, out=8, 2 experts, n_tokens=2 with different routes. */
+     * Cross the backend's 256-token dispatch boundary with alternating routes. */
     {
         const uint32_t in_dim = 8, mid_dim = 8, out_dim = 8;
         const uint32_t n_total = 2, n_expert = 2;
-        const uint32_t n_tokens = 2;
+        const uint32_t n_tokens = 257;
         const float clamp = 0.25f;
         const uint64_t row_bytes = 34;               /* 1 Q8_0 block (8 < 32) */
         const uint64_t gate_expert_bytes = (uint64_t)mid_dim * row_bytes;
@@ -506,14 +506,18 @@ static int test_routed_moe_batch(void) {
             }
         }
 
-        std::vector<float> x = {
-            /* token 0 */
-            0.5f, -1.0f, 0.75f, 0.25f, -0.5f, 1.25f, -0.75f, 0.375f,
-            /* token 1 */
-            -0.25f, 0.8f, -0.6f, 0.1f, 1.0f, -0.35f, 0.5f, -1.1f,
-        };
-        std::vector<int32_t> sel = { 0, 1,   1, 0 };   /* token0: exp0,1; token1: exp1,0 */
-        std::vector<float> wgt = { 0.6f, 0.4f,   0.3f, 0.7f };
+        std::vector<float> x((uint64_t)n_tokens * in_dim);
+        std::vector<int32_t> sel((uint64_t)n_tokens * n_expert);
+        std::vector<float> wgt((uint64_t)n_tokens * n_expert);
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t i = 0; i < in_dim; i++)
+                x[(uint64_t)t * in_dim + i] =
+                    0.125f * (float)((int32_t)((t * 11u + i * 7u) % 17u) - 8);
+            sel[(uint64_t)t * n_expert] = (int32_t)(t & 1u);
+            sel[(uint64_t)t * n_expert + 1u] = (int32_t)(1u - (t & 1u));
+            wgt[(uint64_t)t * n_expert] = 0.6f;
+            wgt[(uint64_t)t * n_expert + 1u] = 0.4f;
+        }
         rc |= run_moe_batch_case("q8_0-small", 8, 8, in_dim, mid_dim, out_dim,
                                  n_total, n_expert, clamp, n_tokens,
                                  x, sel, wgt, model,

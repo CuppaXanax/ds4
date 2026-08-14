@@ -112,6 +112,39 @@ Do not restart routed fusion or cooperative routed MoE first. Both prior
 experiments failed qualification. Work inside the known-good architecture and
 measure one reduction/access-pattern change at a time.
 
+#### Layer 4 routed-MoE decode profile
+
+Two warm position-32 captures with `DS4_VULKAN_PROFILE_ROUTED_MOE=1` agreed to
+within 0--1 microseconds per substage. The seven compute substages were:
+
+| `routed_moe` dispatch | GPU ms | Share |
+|---|---:|---:|
+| `gate_iq2_words` | 0.556 | 38.33% |
+| `up_iq2_words` | 0.555 | 38.26% |
+| `down_words` | 0.245 | 16.86% |
+| `quantize_input` | 0.047 | 3.24% |
+| `requantization` | 0.042 | 2.90% |
+| `reduction` | 0.004 | 0.28% |
+| `swiglu` | 0.002 | 0.14% |
+
+The seven-stage total was 1.451 ms. Gate plus up owned 1.111 ms (76.59%);
+input quantization plus requantization owned only 0.089 ms (6.14%). The separate
+`validate_selected` safety dispatch measured 0.002 ms and is excluded from the
+seven-stage total. Layers 5--7 showed the same shape and near-identical times.
+
+This falsifies the mode-0 quantization hypothesis for decode. The first concrete
+shader target is mode 1 in `routed_moe.comp`, specifically the two IQ2 word
+gate/up projections. A paired gate/up dispatch that reuses the quantized input is
+the leading experiment, provided it preserves exact accumulation order and
+record locality. Down-word projection is the second target.
+
+Profiler caveat: routed profiling inserts serialization barriers around timestamp
+boundaries. These numbers rank isolated GPU work; they are not real layer wall
+time and must not be added to or compared directly with the historical 10.703 ms
+instrumented layer wall. The unprofiled position-32 layer wall remains about
+5.8 ms. Both profiled runs preserved the 2,605-byte artifact with SHA-256
+`0ca6c3758d9248c65edc71f0b32ae96489cf8419a9af61bf16d9ea1410be7ca5`.
+
 ### 6. Generic tensor memory is over-broadly host visible and coherent
 
 Generic Vulkan tensors request random host access plus persistent mapping. Before

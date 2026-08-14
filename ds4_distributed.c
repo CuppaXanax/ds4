@@ -14,6 +14,7 @@
  */
 
 #include "ds4_distributed.h"
+#include "ds4_dist_prefill.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -3510,7 +3511,34 @@ static int dist_coordinator_prefill_chunk_cap(
             return 1;
         }
     }
-    if (requested == 0) requested = prefill_cap;
+    if (requested == 0) {
+#if defined(DS4_VULKAN_BUILD)
+        /* A full session-cap item traverses distributed pipeline stages
+         * serially. Bound automatic Vulkan work independently of graph/KV
+         * capacity so all route stages can overlap. */
+        if (state && state->engine) {
+            const uint64_t hidden_values =
+                ds4_engine_hidden_f32_values(state->engine);
+            const uint32_t activation_bits =
+                dist_activation_bits_or_default(state->activation_bits);
+            if (hidden_values != 0) {
+                uint32_t compressor_alignment = 1u;
+                for (uint32_t layer = 0; layer < state->n_layers; layer++) {
+                    const uint32_t ratio =
+                        ds4_engine_layer_compress_ratio(state->engine, layer);
+                    if (ratio > compressor_alignment) compressor_alignment = ratio;
+                }
+                requested = ds4_dist_prefill_chunk_policy(
+                    prefill_cap,
+                    0,
+                    hidden_values,
+                    activation_bits,
+                    compressor_alignment);
+            }
+        }
+#endif
+        if (requested == 0) requested = prefill_cap;
+    }
     if (requested > prefill_cap) {
         if (errlen) {
             snprintf(err,

@@ -143,6 +143,42 @@ The already-qualified 287.224 ms/token, 3.482 TPS all-layer batching path is now
 the Vulkan default. The environment gate was removed rather than spending a
 fresh fleet cycle proving the same opt-in.
 
+### Completed: four-flight command submission ring
+
+The Vulkan backend now records through four command-buffer slots chained by one
+monotonic timeline semaphore. Submitting work no longer implies a host wait:
+the CPU waits only when it reuses a busy slot or reaches an explicit host-visible
+boundary such as router readback, final command completion, or synchronization.
+Layer-final descriptors and temporary tensors retire with the submission slot
+that owns them.
+
+The implementation also keeps every active command generation that references a
+cached weight, retains explicit pinned-cache semantics, serializes access to the
+single Vulkan queue, uses node-stable per-thread command contexts, and invalidates
+mapped tensors at every host-visible completion boundary. Diagnostic rollback is
+`DS4_VULKAN_COMMAND_RING=0`; `DS4_VULKAN_SUBMIT_COMMANDS` changes the rollover
+threshold for experiments. The qualified default remains 64 command-count units.
+
+Qualification on the BC-250 cluster against base `051b428` before integration:
+
+- focused rollover/order/lifetime test: PASS in ring and serial modes
+- complete GFX1013 Vulkan suite: 83/83 passing
+- same-binary ring/control artifact: 2,605 bytes, exact SHA-256
+  `0ca6c3758d9248c65edc71f0b32ae96489cf8419a9af61bf16d9ea1410be7ca5`
+- focused timeline stress, same 23 submissions: host waits 24 -> 21 and summed
+  host wait time 2.76 -> 2.14 ms (-22.5%)
+- matched warmed 3,812-token prompt plus 16-token decode: serial 17.02 prefill /
+  2.23 generation TPS; ring 17.02 prefill / 2.36 generation TPS
+- decode throughput gain: +5.83%; prefill unchanged
+- rollover sweep: 16 -> 2.35, 32 -> 2.37, 64 -> 2.36, 96 -> 2.36
+  generation TPS; 64 was retained as the conservative RADV bound
+- all eleven worker logs reported zero Vulkan, device-loss, or route errors
+
+GPT-5.6 Luna independently reviewed the synchronization and lifetime diff twice.
+Its findings drove the final active-generation weight tracking, pinned-cache
+repair, queue/context synchronization, host invalidation, empty-batch handling,
+and stronger deferred-temporary coverage before the final suite and fleet A/B.
+
 ### Milestone 1: aligned-Q8 hierarchical final reduction
 
 Scope only `matmul_q8_0_aligned.comp` plus its focused tests/instrumentation. Do
@@ -184,11 +220,11 @@ flushing and invalidating every live tensor around every submission.
 
 ## Agent operating model
 
-Use one GPT-5.6 Sol subagent as the milestone owner at a time. Its job is to
+Use one GPT-5.6 Luna subagent as the milestone owner at a time. Its job is to
 inspect, patch, commit, and write the exact remote validation recipe. The primary
-agent controls the fleet A/B, qualification decision, and integration. A Luna
-subagent is appropriate for bounded log/table reduction, but it should not race
-an independent code patch against the active milestone.
+agent controls the fleet A/B, qualification decision, and integration. A second
+subagent may reduce bounded logs or tables, but it must not race an independent
+code patch against the active milestone.
 
 The loop is intentionally:
 

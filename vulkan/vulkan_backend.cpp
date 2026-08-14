@@ -26,6 +26,7 @@
 #include <cassert>
 #include <vector>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
@@ -70,24 +71,34 @@ struct TimelineEvent {
     uint32_t count = 0;
 };
 
+static constexpr uint32_t DS4_VK_COMMAND_RING_SIZE = 4;
+
 struct VulkanCommandCtx {
     VkCommandPool   pool     = VK_NULL_HANDLE;
     VkCommandBuffer cmd      = VK_NULL_HANDLE;
-    VkFence         fence    = VK_NULL_HANDLE;
     VkSemaphore     semaphore = VK_NULL_HANDLE;
     VkQueryPool     timestamp_pool = VK_NULL_HANDLE;
     uint32_t        timestamp_cursor = 0;
     std::vector<RoutedTimestamp> routed_timestamps;
     uint64_t        event_counter = 0;
     uint32_t        command_count = 0;
-    bool            submitted = false;
     bool            recording = false;
     bool            first_cmd = true;
     VkDescriptorSet ds_q8s = VK_NULL_HANDLE;  /* simple shader DS */
     VkDescriptorSet ds_q8c = VK_NULL_HANDLE;  /* complex shader DS */
-    VkCommandBuffer cmd_rots[4] = {};
+    VkCommandBuffer cmd_rots[DS4_VK_COMMAND_RING_SIZE] = {};
+    VkQueryPool timestamp_pools[DS4_VK_COMMAND_RING_SIZE] = {};
+    uint64_t slot_submit_values[DS4_VK_COMMAND_RING_SIZE] = {};
+    uint64_t slot_generations[DS4_VK_COMMAND_RING_SIZE] = {};
+    uint32_t slot_timestamp_counts[DS4_VK_COMMAND_RING_SIZE] = {};
+    std::vector<RoutedTimestamp> slot_routed_timestamps[DS4_VK_COMMAND_RING_SIZE];
+    std::vector<VkDescriptorSet> slot_descriptors[DS4_VK_COMMAND_RING_SIZE];
+    std::vector<ds4_gpu_tensor *> slot_tensors[DS4_VK_COMMAND_RING_SIZE];
+    std::vector<void *> slot_in_place_ptrs[DS4_VK_COMMAND_RING_SIZE];
     uint32_t cmd_rot_idx = 0;
-    uint32_t cmd_buf_count = 0;
+    uint64_t last_submit_value = 0;
+    uint64_t completed_value = 0;
+    uint64_t recording_generation = 0;
     bool timeline_enabled = false;
     bool routed_profile_enabled = false;
     bool timeline_collecting = false;
@@ -156,8 +167,9 @@ static struct {
     std::vector<ShaderEntry> shaders;
     std::unordered_map<std::string, uint32_t> shader_map;
     
-    std::mutex          cmd_mutex;
-    std::unordered_map<std::thread::id, VulkanCommandCtx> cmd_ctxs;
+    std::recursive_mutex cmd_mutex;
+    std::mutex          queue_mutex;
+    std::map<std::thread::id, VulkanCommandCtx> cmd_ctxs;
     
     std::unordered_map<void*, TensorHeader*> tensor_headers;
     
@@ -170,7 +182,8 @@ static struct {
         VmaAllocation  allocation = VK_NULL_HANDLE;
         uint64_t       size = 0;
         uint64_t       last_used = 0;
-        uint64_t       last_gen = 0;   /* command-buffer generation of last use */
+        bool           pinned = false;
+        std::vector<uint64_t> active_generations;
         VkDescriptorBufferInfo desc_info{};
     };
     struct AlignedWeightEntry {
@@ -502,7 +515,7 @@ static int load_all_shaders(void) {
 /* ---- Command Context ---- */
 
 static VulkanCommandCtx &get_cmd_ctx(void) {
-    std::lock_guard<std::mutex> lock(g_vk.cmd_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     auto tid = std::this_thread::get_id();
     auto it = g_vk.cmd_ctxs.find(tid);
     if (it != g_vk.cmd_ctxs.end()) return it->second;
@@ -516,15 +529,12 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
         fprintf(stderr, "ds4: VULKAN failed to create command pool\n");
         abort();
     }
-    VkCommandBufferAllocateInfo cbai{};
-    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = ctx.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(g_vk.device, &cbai, &ctx.cmd) != VK_SUCCESS) abort();
-    VkFenceCreateInfo fci{}; fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (vkCreateFence(g_vk.device, &fci, nullptr, &ctx.fence) != VK_SUCCESS) abort();
     VkSemaphoreCreateInfo sci{}; sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkSemaphoreTypeCreateInfo stci{};
+    stci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    stci.initialValue = 0;
+    sci.pNext = &stci;
     if (vkCreateSemaphore(g_vk.device, &sci, nullptr, &ctx.semaphore) != VK_SUCCESS) abort();
     ctx.timeline_enabled = getenv("DS4_VULKAN_TIMELINE") != nullptr;
     ctx.routed_profile_enabled = getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") != nullptr;
@@ -539,17 +549,28 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
     if ((ctx.routed_profile_enabled || ctx.timeline_enabled ||
          getenv("DS4_VULKAN_TIMELINE_LAYER")) &&
         g_vk.timestamp_valid_bits != 0) {
-        VkQueryPoolCreateInfo qpci{};
-        qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpci.queryCount = 256;
-        if (vkCreateQueryPool(g_vk.device, &qpci, nullptr,
-                              &ctx.timestamp_pool) != VK_SUCCESS) {
-            fprintf(stderr, "ds4: VULKAN timestamp query pool unavailable\n");
+        bool query_pools_ok = true;
+        for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++) {
+            VkQueryPoolCreateInfo qpci{};
+            qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpci.queryCount = 256;
+            if (vkCreateQueryPool(g_vk.device, &qpci, nullptr,
+                                  &ctx.timestamp_pools[slot]) != VK_SUCCESS) {
+                query_pools_ok = false;
+                break;
+            }
+        }
+        if (!query_pools_ok) {
+            fprintf(stderr, "ds4: VULKAN timestamp query pools unavailable\n");
+            for (VkQueryPool &pool : ctx.timestamp_pools) {
+                if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
+                pool = VK_NULL_HANDLE;
+            }
         }
     }
-    g_vk.cmd_ctxs[tid] = ctx;
-    return g_vk.cmd_ctxs[tid];
+    auto inserted = g_vk.cmd_ctxs.emplace(tid, std::move(ctx));
+    return inserted.first->second;
 }
 
 static uint64_t timeline_now_ns(void) {
@@ -659,7 +680,7 @@ static TimelineEvent *timeline_add(VulkanCommandCtx &ctx, TimelineEventKind kind
     event.kind = kind;
     event.name = name;
     event.host_ns = timeline_now_ns();
-    event.generation = g_vk.cmd_gen;
+    event.generation = ctx.recording_generation;
     ctx.timeline_events.push_back(event);
     return &ctx.timeline_events.back();
 }
@@ -763,88 +784,169 @@ static void timeline_duration_current(TimelineEventKind kind, const char *name,
 }
 
 static VkResult timeline_device_wait_idle(const char *name) {
-    if (!getenv("DS4_VULKAN_TIMELINE")) return vkDeviceWaitIdle(g_vk.device);
+    const bool timeline = getenv("DS4_VULKAN_TIMELINE") != nullptr;
     const uint64_t start_ns = timeline_now_ns();
-    const VkResult result = vkDeviceWaitIdle(g_vk.device);
-    timeline_duration_current(TimelineEventKind::Wait, name, start_ns);
+    VkResult result;
+    {
+        std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+        result = vkDeviceWaitIdle(g_vk.device);
+    }
+    if (timeline)
+        timeline_duration_current(TimelineEventKind::Wait, name, start_ns);
     return result;
 }
 
-static void report_routed_timestamps(VulkanCommandCtx &ctx) {
-    if (ctx.timestamp_pool == VK_NULL_HANDLE || ctx.timestamp_cursor == 0) return;
+static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
+    const VkQueryPool pool = ctx.timestamp_pools[slot];
+    const uint32_t count = ctx.slot_timestamp_counts[slot];
+    if (pool == VK_NULL_HANDLE || count == 0) return;
     uint64_t ticks[256] = {};
     VkResult result = vkGetQueryPoolResults(
-        g_vk.device, ctx.timestamp_pool, 0, ctx.timestamp_cursor,
-        (size_t)ctx.timestamp_cursor * sizeof(uint64_t), ticks, sizeof(uint64_t),
+        g_vk.device, pool, 0, count,
+        (size_t)count * sizeof(uint64_t), ticks, sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) {
         fprintf(stderr, "ds4: VULKAN timestamp read failed: %d\n", result);
-        ctx.routed_timestamps.clear();
+        ctx.slot_routed_timestamps[slot].clear();
+        ctx.slot_timestamp_counts[slot] = 0;
         return;
     }
     const uint64_t mask = g_vk.timestamp_valid_bits >= 64
         ? UINT64_MAX : ((1ull << g_vk.timestamp_valid_bits) - 1ull);
     for (TimelineEvent &event : ctx.timeline_events) {
-        if (event.generation != g_vk.cmd_gen || event.first_query == UINT32_MAX) continue;
+        if (event.generation != ctx.slot_generations[slot] ||
+            event.first_query == UINT32_MAX) continue;
         const uint64_t begin = ticks[event.first_query] & mask;
         const uint64_t end = ticks[event.first_query + 1] & mask;
         event.gpu_ns = (uint64_t)((double)((end - begin) & mask) *
                                   g_vk.timestamp_period_ns);
         event.first_query = UINT32_MAX;
     }
-    if (!ctx.routed_timestamps.empty())
+    if (!ctx.slot_routed_timestamps[slot].empty())
         fprintf(stderr, "ds4: VULKAN routed_moe_gpu_ms");
-    for (const RoutedTimestamp &timestamp : ctx.routed_timestamps) {
+    for (const RoutedTimestamp &timestamp : ctx.slot_routed_timestamps[slot]) {
         const uint64_t begin = ticks[timestamp.first_query] & mask;
         const uint64_t end = ticks[timestamp.first_query + 1] & mask;
         const uint64_t elapsed = (end - begin) & mask;
         const double ms = (double)elapsed * g_vk.timestamp_period_ns / 1.0e6;
         fprintf(stderr, " %s=%.3f", timestamp.stage, ms);
     }
-    if (!ctx.routed_timestamps.empty()) fputc('\n', stderr);
-    ctx.routed_timestamps.clear();
+    if (!ctx.slot_routed_timestamps[slot].empty()) fputc('\n', stderr);
+    ctx.slot_routed_timestamps[slot].clear();
+    ctx.slot_timestamp_counts[slot] = 0;
+}
+
+static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
+    int ok = 1;
+    for (VkDescriptorSet set : ctx.slot_descriptors[slot]) {
+        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
+            ok = 0;
+    }
+    for (ds4_gpu_tensor *tensor : ctx.slot_tensors[slot]) {
+        if (!tensor) continue;
+        if (tensor->owner && tensor->ptr) {
+            auto it = g_vk.tensor_headers.find(tensor->ptr);
+            if (it != g_vk.tensor_headers.end()) {
+                if (getenv("DS4_VULKAN_TIMELINE"))
+                    timeline_resource(ctx, TimelineEventKind::TensorFree,
+                                      "tensor", it->second->bytes);
+                vmaDestroyBuffer(g_vk.allocator, it->second->buffer,
+                                 it->second->allocation);
+                free(it->second);
+                g_vk.tensor_headers.erase(it);
+            }
+        }
+        free(tensor);
+    }
+    for (void *ptr : ctx.slot_in_place_ptrs[slot]) {
+        auto it = g_vk.tensor_headers.find(ptr);
+        if (it == g_vk.tensor_headers.end()) continue;
+        if (getenv("DS4_VULKAN_TIMELINE"))
+            timeline_resource(ctx, TimelineEventKind::TensorFree,
+                              "tensor", it->second->bytes);
+        vmaDestroyBuffer(g_vk.allocator, it->second->buffer,
+                         it->second->allocation);
+        free(it->second);
+        g_vk.tensor_headers.erase(it);
+    }
+    ctx.slot_descriptors[slot].clear();
+    ctx.slot_tensors[slot].clear();
+    ctx.slot_in_place_ptrs[slot].clear();
+    return ok;
+}
+
+static int retire_completed_slots(VulkanCommandCtx &ctx, uint64_t completed) {
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    int ok = 1;
+    if (completed > ctx.completed_value) ctx.completed_value = completed;
+    for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++) {
+        const uint64_t value = ctx.slot_submit_values[slot];
+        if (value == 0 || value > ctx.completed_value) continue;
+        report_slot_timestamps(ctx, slot);
+        if (!retire_slot_resources(ctx, slot)) ok = 0;
+        ctx.slot_submit_values[slot] = 0;
+        ctx.slot_generations[slot] = 0;
+    }
+    ctx.timeline_queries_pending = false;
+    for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++)
+        ctx.timeline_queries_pending |= ctx.slot_timestamp_counts[slot] != 0;
+    return ok;
+}
+
+static int wait_for_submit_value(VulkanCommandCtx &ctx, uint64_t value,
+                                 const char *name) {
+    if (value == 0 || value <= ctx.completed_value) return 1;
+    uint64_t counter = 0;
+    VK_CHECK_BOOL(vkGetSemaphoreCounterValue(g_vk.device, ctx.semaphore, &counter));
+    if (counter < value) {
+        VkSemaphoreWaitInfo wait{};
+        wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &ctx.semaphore;
+        wait.pValues = &value;
+        const uint64_t wait_start = timeline_now_ns();
+        VK_CHECK_BOOL(vkWaitSemaphores(g_vk.device, &wait, UINT64_MAX));
+        if (ctx.timeline_collecting) {
+            TimelineEvent *event = timeline_add(ctx, TimelineEventKind::Wait, name);
+            if (event) event->duration_ns = timeline_now_ns() - wait_start;
+        }
+        counter = value;
+    }
+    return retire_completed_slots(ctx, counter);
+}
+
+static bool command_ring_enabled(void) {
+    const char *env = getenv("DS4_VULKAN_COMMAND_RING");
+    return !env || !env[0] || strcmp(env, "0") != 0;
 }
 
 static int begin_cmd(void) {
     auto &c = get_cmd_ctx();
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     if (c.recording) return 1;
-    if (c.submitted) {
-        const uint64_t wait_start = timeline_now_ns();
-        VK_CHECK_BOOL(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
-        if (c.timeline_collecting) {
-            TimelineEvent *event = timeline_add(c, TimelineEventKind::Wait, "begin_cmd");
-            if (event) event->duration_ns = timeline_now_ns() - wait_start;
-        }
-        report_routed_timestamps(c);
-        c.timeline_queries_pending = false;
-        VK_CHECK_BOOL(vkResetFences(g_vk.device, 1, &c.fence));
-        c.submitted = false;
-        /* Pool cleanup every 4 submissions (llama.cpp: every 10) */
-        c.cmd_buf_count++;
-        if (c.cmd_buf_count >= 4) {
-            /* llama.cpp-style cleanup.  RELEASE_RESOURCES also frees the
-             * driver's internal command-stream buffers, which avoids a RADV
-             * radv_amdgpu_cs_finalize crash after large prefill+decode. */
-            vkResetCommandPool(g_vk.device, c.pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT);
-            c.cmd_buf_count = 0;
-            c.cmd_rot_idx = 0;
-        } else {
-            c.cmd_rot_idx = (c.cmd_rot_idx + 1) % 4;
-        }
-    }
+    if (!command_ring_enabled() &&
+        !wait_for_submit_value(c, c.last_submit_value, "begin_cmd_serial"))
+        return 0;
+    const uint32_t slot = c.cmd_rot_idx;
+    if (!wait_for_submit_value(c, c.slot_submit_values[slot], "begin_cmd_slot"))
+        return 0;
+    c.timestamp_pool = c.timestamp_pools[slot];
     if (c.timestamp_pool != VK_NULL_HANDLE) {
         vkResetQueryPool(g_vk.device, c.timestamp_pool, 0, 256);
         c.timestamp_cursor = 0;
         c.routed_timestamps.clear();
     }
     /* Allocate or reuse CB */
-    VkCommandBuffer &cb = c.cmd_rots[c.cmd_rot_idx];
+    VkCommandBuffer &cb = c.cmd_rots[slot];
     if (cb == VK_NULL_HANDLE) {
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = c.pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 1;
         VK_CHECK_BOOL(vkAllocateCommandBuffers(g_vk.device, &cbai, &cb));
+    } else {
+        VK_CHECK_BOOL(vkResetCommandBuffer(
+            cb, VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT));
     }
     c.cmd = cb;
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -852,10 +954,10 @@ static int begin_cmd(void) {
     VK_CHECK_BOOL(vkBeginCommandBuffer(c.cmd, &bi));
     c.recording = true;
     c.command_count = 0;
-    g_vk.cmd_gen++;
+    c.recording_generation = ++g_vk.cmd_gen;
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] begin_cmd rot=%u gen=%llu\n",
-                c.cmd_rot_idx, (unsigned long long)g_vk.cmd_gen);
+                slot, (unsigned long long)c.recording_generation);
     return 1;
 }
 
@@ -865,6 +967,7 @@ static int begin_cmd(void) {
 
 static int end_and_submit(void) {
     auto &c = get_cmd_ctx();
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     if (!c.recording) return 1;
     if (c.command_count == 0) {
         VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
@@ -873,17 +976,36 @@ static int end_and_submit(void) {
     }
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
-                (unsigned)c.command_count, c.cmd_rot_idx, (unsigned long long)g_vk.cmd_gen);
+                (unsigned)c.command_count, c.cmd_rot_idx,
+                (unsigned long long)c.recording_generation);
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
         (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
     VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
+    const uint64_t wait_value = c.last_submit_value;
+    const uint64_t signal_value = wait_value + 1;
+    VkTimelineSemaphoreSubmitInfo timeline{};
+    timeline.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline.waitSemaphoreValueCount = wait_value != 0 ? 1u : 0u;
+    timeline.pWaitSemaphoreValues = wait_value != 0 ? &wait_value : nullptr;
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues = &signal_value;
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.pNext = &timeline;
+    si.waitSemaphoreCount = wait_value != 0 ? 1u : 0u;
+    si.pWaitSemaphores = wait_value != 0 ? &c.semaphore : nullptr;
+    si.pWaitDstStageMask = wait_value != 0 ? &wait_stage : nullptr;
     si.commandBufferCount = 1; si.pCommandBuffers = &c.cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &c.semaphore;
     const uint64_t submit_start = timeline_now_ns();
-    VK_CHECK_BOOL(vkQueueSubmit(g_vk.queue, 1, &si, c.fence));
+    {
+        std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+        VK_CHECK_BOOL(vkQueueSubmit(g_vk.queue, 1, &si, VK_NULL_HANDLE));
+    }
     if (c.timeline_collecting) {
         TimelineEvent *event = timeline_add(c, TimelineEventKind::Submit, "queue_submit");
         if (event) {
@@ -891,25 +1013,28 @@ static int end_and_submit(void) {
             event->count = c.command_count;
         }
     }
-    c.submitted = true;
+    const uint32_t slot = c.cmd_rot_idx;
+    c.last_submit_value = signal_value;
+    c.slot_submit_values[slot] = signal_value;
+    c.slot_generations[slot] = c.recording_generation;
+    c.slot_timestamp_counts[slot] = c.timestamp_cursor;
+    c.slot_routed_timestamps[slot].swap(c.routed_timestamps);
+    c.cmd_rot_idx = (slot + 1u) % DS4_VK_COMMAND_RING_SIZE;
     return 1;  /* DS4: non-zero = success */
 }
 
-static int wait_cmd(void) {
-    auto &c = get_cmd_ctx();
-    if (!c.submitted) return 1;
-    const uint64_t wait_start = timeline_now_ns();
-    VK_CHECK_BOOL(vkWaitForFences(g_vk.device, 1, &c.fence, VK_TRUE, UINT64_MAX));
-    if (c.timeline_collecting) {
-        TimelineEvent *event = timeline_add(c, TimelineEventKind::Wait, "wait_cmd");
-        if (event) event->duration_ns = timeline_now_ns() - wait_start;
-    }
-    report_routed_timestamps(c);
-    c.timeline_queries_pending = false;
+static void invalidate_live_tensors(void) {
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
         (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
+}
+
+static int wait_cmd(void) {
+    auto &c = get_cmd_ctx();
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    if (!wait_for_submit_value(c, c.last_submit_value, "wait_cmd")) return 0;
+    invalidate_live_tensors();
     return 1;  /* DS4: non-zero = success */
 }
 
@@ -923,10 +1048,40 @@ static int submit_and_wait(void) {
     return submit_and_wait_force();
 }
 
+static int defer_layer_batch_resources(VulkanCommandCtx &ctx) {
+    uint32_t slot = DS4_VK_COMMAND_RING_SIZE;
+    for (uint32_t candidate = 0;
+         candidate < DS4_VK_COMMAND_RING_SIZE; candidate++) {
+        if (ctx.slot_submit_values[candidate] == ctx.last_submit_value) {
+            slot = candidate;
+            break;
+        }
+    }
+    if (slot == DS4_VK_COMMAND_RING_SIZE) return 0;
+    auto &descriptors = ctx.slot_descriptors[slot];
+    descriptors.insert(descriptors.end(), ctx.layer_batch_descriptors.begin(),
+                       ctx.layer_batch_descriptors.end());
+    auto &tensors = ctx.slot_tensors[slot];
+    tensors.insert(tensors.end(), ctx.layer_batch_tensors.begin(),
+                   ctx.layer_batch_tensors.end());
+    auto &in_place_ptrs = ctx.slot_in_place_ptrs[slot];
+    in_place_ptrs.insert(in_place_ptrs.end(), ctx.layer_batch_in_place_ptrs.begin(),
+                         ctx.layer_batch_in_place_ptrs.end());
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    return 1;
+}
+
 static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     const bool was_active = ctx.layer_batch_active;
     ctx.layer_batch_active = false;
-    int ok = submit_and_wait_force();
+    const bool defer = ctx.command_count != 0 && !resume && !ctx.layer_timeline_active &&
+        command_ring_enabled();
+    int ok = defer ? end_and_submit() : submit_and_wait_force();
+    if (ok && defer) ok = defer_layer_batch_resources(ctx);
+    if (defer) return ok;
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
         if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
             ok = 0;
@@ -948,12 +1103,19 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     return ok;
 }
 
+static uint32_t command_submit_limit(void) {
+    const char *env = getenv("DS4_VULKAN_SUBMIT_COMMANDS");
+    if (!env || !env[0]) return 64;
+    const unsigned long parsed = strtoul(env, nullptr, 10);
+    return parsed >= 8 && parsed <= 1024 ? (uint32_t)parsed : 64;
+}
+
 /* Split long command buffers into multiple submissions (llama.cpp-style):
  * RADV can crash finalizing a huge CS right after a large prefill, and
  * in-flight weight eviction is bounded by keeping command buffers short. */
 static void maybe_submit(void) {
     auto &c = get_cmd_ctx();
-    if (c.command_count >= 64) {
+    if (c.recording && c.command_count >= command_submit_limit()) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr, "ds4: [dbg] maybe_submit cc=%u\n", (unsigned)c.command_count);
         end_and_submit();
@@ -962,6 +1124,9 @@ static void maybe_submit(void) {
 }
 
 /* ---- Compute Dispatch ---- */
+
+static void mark_bound_weight_buffers(VkDescriptorBufferInfo *buffers,
+                                      uint32_t count, uint64_t generation);
 
 static int dispatch_shader(const char *name,
                            const void *push, uint32_t push_size,
@@ -993,6 +1158,7 @@ static int dispatch_shader(const char *name,
         writes[i].pBufferInfo = &bufs[i];
     }
     if (n_bufs) vkUpdateDescriptorSets(g_vk.device, n_bufs, writes.data(), 0, nullptr);
+    mark_bound_weight_buffers(bufs, n_bufs, c.recording_generation);
     timeline_descriptors(c, name, bufs, n_bufs);
 
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1049,11 +1215,13 @@ int ds4_gpu_init(void) {
 void ds4_gpu_cleanup(void) {
     if (!g_vk.initialized) return;
     timeline_device_wait_idle("cleanup");
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     for (auto &[_, c] : g_vk.cmd_ctxs) {
+        (void)retire_completed_slots(c, c.last_submit_value);
         timeline_dump(c);
-        if (c.timestamp_pool) vkDestroyQueryPool(g_vk.device, c.timestamp_pool, nullptr);
+        for (VkQueryPool pool : c.timestamp_pools)
+            if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
-        if (c.fence) vkDestroyFence(g_vk.device, c.fence, nullptr);
         if (c.pool) vkDestroyCommandPool(g_vk.device, c.pool, nullptr);
     }
     g_vk.cmd_ctxs.clear();
@@ -1231,7 +1399,11 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t doff,
 /* ---- Commands ---- */
 
 int ds4_gpu_begin_commands(void) { return begin_cmd(); }
-int ds4_gpu_commands_active(void) { return get_cmd_ctx().recording ? 1 : 0; }
+int ds4_gpu_commands_active(void) {
+    auto &ctx = get_cmd_ctx();
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    return ctx.recording ? 1 : 0;
+}
 int ds4_gpu_flush_commands(void) {
     /* The engine keeps recording after a flush (e.g. SSD streaming async
      * loads), so start a fresh command buffer like Metal's next encoder. */
@@ -1249,7 +1421,14 @@ int ds4_gpu_end_commands(void) {
         timeline_dump(ctx);
     return ok;
 }
-int ds4_gpu_synchronize(void) { VK_CHECK_BOOL(timeline_device_wait_idle("synchronize")); return 1; }
+int ds4_gpu_synchronize(void) {
+    VK_CHECK_BOOL(timeline_device_wait_idle("synchronize"));
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    for (auto &[_, ctx] : g_vk.cmd_ctxs)
+        if (!retire_completed_slots(ctx, ctx.last_submit_value)) return 0;
+    invalidate_live_tensors();
+    return 1;
+}
 
 extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
@@ -1396,6 +1575,65 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
 
+static bool command_generation_active(uint64_t generation) {
+    if (generation == 0) return false;
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    for (const auto &[_, context] : g_vk.cmd_ctxs) {
+        if (context.recording &&
+            context.recording_generation == generation)
+            return true;
+        for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++)
+            if (context.slot_submit_values[slot] != 0 &&
+                context.slot_generations[slot] == generation)
+                return true;
+    }
+    return false;
+}
+
+static void prune_weight_generations(
+        decltype(g_vk.weight_cache)::mapped_type &entry) {
+    auto &generations = entry.active_generations;
+    generations.erase(std::remove_if(generations.begin(), generations.end(),
+        [](uint64_t generation) { return !command_generation_active(generation); }),
+        generations.end());
+}
+
+static void mark_weight_generation(
+    decltype(g_vk.weight_cache)::mapped_type &entry,
+    uint64_t generation) {
+    prune_weight_generations(entry);
+    if (command_generation_active(generation) &&
+        std::find(entry.active_generations.begin(), entry.active_generations.end(),
+                  generation) == entry.active_generations.end())
+        entry.active_generations.push_back(generation);
+}
+
+    static void mark_weight_generation(
+        decltype(g_vk.weight_cache)::mapped_type &entry) {
+        auto &ctx = get_cmd_ctx();
+        if (ctx.recording)
+        mark_weight_generation(entry, ctx.recording_generation);
+    }
+
+static bool weight_entry_in_use(
+        decltype(g_vk.weight_cache)::mapped_type &entry) {
+    if (entry.pinned) return true;
+    prune_weight_generations(entry);
+    return !entry.active_generations.empty();
+}
+
+static void mark_bound_weight_buffers(VkDescriptorBufferInfo *buffers,
+                                      uint32_t count, uint64_t generation) {
+    for (uint32_t i = 0; i < count; i++) {
+        for (auto &[_, entry] : g_vk.weight_cache)
+            if (entry.buffer == buffers[i].buffer)
+                mark_weight_generation(entry, generation);
+        for (auto &[_, entry] : g_vk.aligned_cache)
+            if (entry.gpu.buffer == buffers[i].buffer)
+                mark_weight_generation(entry.gpu, generation);
+    }
+}
+
 int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes, const char *label) {
     (void)label;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off) return 0;
@@ -1403,7 +1641,7 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
     g_vk.range_registry[off] = bytes;
     for (auto &[base, entry] : g_vk.weight_cache) {
         if (off >= base && off - base <= entry.size && bytes <= entry.size - (off - base)) {
-            entry.last_gen = UINT64_MAX;
+            entry.pinned = true;
             break;
         }
     }
@@ -1418,7 +1656,7 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
         if (offset >= base && offset - base <= e.size &&
             needed_bytes <= e.size - (offset - base)) {
             e.last_used = ++g_vk.lru_counter;
-            e.last_gen = g_vk.cmd_gen;
+            mark_weight_generation(e);
             return 1;
         }
     }
@@ -1498,7 +1736,12 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
                         VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                         si.commandBufferCount = 1; si.pCommandBuffers = &cb;
                         const uint64_t submit_start = timeline_now_ns();
-                        if (vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS) {
+                        VkResult submit_result;
+                        {
+                            std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+                            submit_result = vkQueueSubmit(g_vk.queue, 1, &si, fence);
+                        }
+                        if (submit_result == VK_SUCCESS) {
                             timeline_duration_current(TimelineEventKind::Submit,
                                                       "weight_upload", submit_start);
                             const uint64_t wait_start = timeline_now_ns();
@@ -1524,16 +1767,18 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
         return 0;
     }
 
-    g_vk.weight_cache[offset] = {buf, alloc, size, ++g_vk.lru_counter, g_vk.cmd_gen, {}};
+    g_vk.weight_cache[offset] = {
+        buf, alloc, size, ++g_vk.lru_counter, false, {}, {}};
+    mark_weight_generation(g_vk.weight_cache[offset]);
     g_vk.weight_used += size;
 
     /* LRU eviction (never evict the range just uploaded, nor any range still
-     * referenced by the command buffer currently being recorded). */
+     * referenced by a recording or submitted command buffer). */
     while (g_vk.weight_used > g_vk.weight_budget) {
         uint64_t lru_base = UINT64_MAX, lru_time = UINT64_MAX;
         for (auto &[b, e] : g_vk.weight_cache) {
             if (b == offset) continue;
-            if (e.last_gen == g_vk.cmd_gen) continue;
+            if (weight_entry_in_use(e)) continue;
             if (e.last_used < lru_time) { lru_time = e.last_used; lru_base = b; }
         }
         if (lru_base == UINT64_MAX) break;
@@ -1548,8 +1793,10 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
 }
 
 static bool current_commands_reference_weights(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     for (const auto &[_, context] : g_vk.cmd_ctxs)
-        if (context.recording && context.command_count != 0) return true;
+        if ((context.recording && context.command_count != 0) ||
+            context.last_submit_value > context.completed_value) return true;
     return false;
 }
 
@@ -1586,18 +1833,17 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
         uint64_t victim = UINT64_MAX;
         uint64_t oldest = UINT64_MAX;
         bool victim_aligned = false;
-        const bool protect_current = current_commands_reference_weights();
-        for (const auto &[candidate, value] : g_vk.aligned_cache) {
+        for (auto &[candidate, value] : g_vk.aligned_cache) {
             if (candidate == protected_offset ||
-                (protect_current && value.gpu.last_gen == g_vk.cmd_gen)) continue;
+            weight_entry_in_use(value.gpu)) continue;
             if (value.gpu.last_used < oldest) {
                 victim = candidate;
                 oldest = value.gpu.last_used;
                 victim_aligned = true;
             }
         }
-        for (const auto &[candidate, value] : g_vk.weight_cache) {
-            if ((protect_current && value.last_gen == g_vk.cmd_gen) ||
+        for (auto &[candidate, value] : g_vk.weight_cache) {
+            if (weight_entry_in_use(value) ||
                 value.last_used >= oldest) continue;
             victim = candidate;
             oldest = value.last_used;
@@ -1668,7 +1914,10 @@ static bool upload_aligned_artifact(const ds4_vulkan_q8_aligned_artifact &artifa
                 VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 si.commandBufferCount = 1; si.pCommandBuffers = &cb;
                 const uint64_t submit_start = timeline_now_ns();
-                ok = vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS;
+                {
+                    std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+                    ok = vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS;
+                }
                 if (ok) timeline_duration_current(TimelineEventKind::Submit,
                                                   "aligned_upload", submit_start);
             }
@@ -1717,7 +1966,7 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
             return false;
         }
         it->second.gpu.last_used = ++g_vk.lru_counter;
-        it->second.gpu.last_gen = g_vk.cmd_gen;
+        mark_weight_generation(it->second.gpu);
         entry = &it->second; return true;
     }
     ds4_vulkan_q8_aligned_artifact artifact{};
@@ -1751,7 +2000,10 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     if (ok) {
         g_vk.aligned_cache[offset] = {model_map, model_size, offset, in_dim, out_dim,
             artifact.blocks_per_row, artifact.scale_bytes, artifact.payload_offset,
-            artifact.payload_bytes, {buf, alloc, artifact.bytes, ++g_vk.lru_counter, g_vk.cmd_gen, {}}};
+            artifact.payload_bytes,
+            {buf, alloc, artifact.bytes, ++g_vk.lru_counter, false,
+             {}, {}}};
+        mark_weight_generation(g_vk.aligned_cache[offset].gpu);
         g_vk.weight_used += artifact.bytes;
         entry = &g_vk.aligned_cache.find(offset)->second;
     }
@@ -1934,7 +2186,9 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         writes[i].pBufferInfo = &buffers[i];
     }
     vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
-    timeline_descriptors(get_cmd_ctx(), shader.name.c_str(), buffers, count);
+    auto &ctx = get_cmd_ctx();
+    mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
+    timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
     return 1;
 }
 
@@ -1942,6 +2196,7 @@ static int release_simple_descriptors(VkDescriptorSet set) {
     auto &ctx = get_cmd_ctx();
     if (ctx.layer_batch_active) {
         ctx.layer_batch_descriptors.push_back(set);
+        maybe_submit();
         return 1;
     }
     const bool ok = vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
@@ -1955,6 +2210,7 @@ static int release_or_defer_simple_descriptors(VulkanCommandCtx &ctx,
                                                VkDescriptorSet set) {
     if (ctx.attention_output_batch) {
         ctx.attention_output_descriptors.push_back(set);
+        maybe_submit();
         return 1;
     }
     return release_simple_descriptors(set);
@@ -2274,7 +2530,7 @@ int ds4_gpu_matmul_q8_0_tensor(
     }
     if (wit != g_vk.weight_cache.end()) {
         wit->second.last_used = ++g_vk.lru_counter;
-        wit->second.last_gen = g_vk.cmd_gen;
+        mark_weight_generation(wit->second);
         wbuf = wit->second.buffer;
         wbuf_off = weight_offset - wit->first;
     } else {
@@ -2588,6 +2844,7 @@ int ds4_gpu_matmul_f16_tensor(
     }
     if (wit != g_vk.weight_cache.end()) {
         wit->second.last_used = ++g_vk.lru_counter;
+        mark_weight_generation(wit->second);
         wbuf = wit->second.buffer;
         wbuf_off = weight_offset - wit->first;
     } else {
@@ -2689,7 +2946,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
     }
     if (wit == g_vk.weight_cache.end()) return 0;
     wit->second.last_used = ++g_vk.lru_counter;
-    wit->second.last_gen = g_vk.cmd_gen;
+    mark_weight_generation(wit->second);
     wbuf = wit->second.buffer;
     woff = weight_offset - wit->first;
     const VkDeviceSize alignment = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
@@ -4090,7 +4347,7 @@ static int hc_cached_weight(uint64_t offset, uint64_t bytes,
                 (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
             if (alignment != 0 && relative % alignment != 0) return 0;
             it->second.last_used = ++g_vk.lru_counter;
-            it->second.last_gen = g_vk.cmd_gen;
+            mark_weight_generation(it->second);
             buffer = it->second.buffer;
             buffer_offset = relative;
             return 1;
@@ -4589,7 +4846,7 @@ static int dispatch_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weig
     for (auto &[base, entry] : g_vk.weight_cache) {
         (void)base;
         if (entry.buffer == bias_buf || entry.buffer == hash_buf)
-            entry.last_gen = g_vk.cmd_gen;
+            mark_weight_generation(entry);
     }
     const VkDeviceSize dummy_bytes = (VkDeviceSize)logits->bytes;
     VkDescriptorBufferInfo buffers[7] = {
@@ -7472,7 +7729,7 @@ static bool find_model_buffer(uint64_t offset, uint64_t bytes,
             buffer_offset = offset - base;
             range = bytes;
             entry.last_used = ++g_vk.lru_counter;
-            entry.last_gen = g_vk.cmd_gen;
+            mark_weight_generation(entry);
             timeline_resource(get_cmd_ctx(), TimelineEventKind::WeightUse,
                               "model_range", bytes, offset);
             return true;

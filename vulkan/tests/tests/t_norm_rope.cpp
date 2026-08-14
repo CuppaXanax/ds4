@@ -308,6 +308,12 @@ static int test_rope_tail(void) {
     if (rope_tail_one("rope_tail/indexer-tiled", 257, 64, 128, 64, 4096,
                       16384, false, 10000.0f, 0.25f, 1.0f, 1.0f,
                       32.0f, 1.0f) != 0) return 1;
+    /* (i) Exact compressed-indexer shape from the 1,596-token watchdog
+     * reproduction: model base 160K and interpolation scale 1/16. */
+    if (rope_tail_one("rope_tail/indexer-prefill-1596", 1596, 64, 128, 64,
+                      0, 16384, false, 160000.0f, 0.0625f, 1.0f,
+                      1.0f / (1.0f + 0.1f * logf(16.0f)),
+                      32.0f, 1.0f) != 0) return 1;
     return 0;
 }
 REGISTER_TEST(rope_tail, test_rope_tail);

@@ -106,6 +106,15 @@ struct VulkanCommandCtx {
     uint64_t layer_timeline_start_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
+    bool layer_batch_layer_open = false;
+    uint32_t layer_batch_span = 1;
+    uint32_t layer_batch_layers = 0;
+    uint32_t layer_batch_current_layer = UINT32_MAX;
+    uint32_t layer_batch_last_layer = UINT32_MAX;
+    const ds4_gpu_tensor *layer_batch_input_hc = nullptr;
+    const ds4_gpu_tensor *layer_batch_output_hc = nullptr;
+    const void *layer_batch_input_hc_ptr = nullptr;
+    const void *layer_batch_output_hc_ptr = nullptr;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
@@ -923,15 +932,42 @@ static int submit_and_wait(void) {
 
 static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     const bool was_active = ctx.layer_batch_active;
+    const bool was_layer_open = ctx.layer_batch_layer_open;
+    const uint32_t saved_span = ctx.layer_batch_span;
+    const uint32_t saved_current_layer = ctx.layer_batch_current_layer;
+    const ds4_gpu_tensor *saved_input_hc = ctx.layer_batch_input_hc;
+    const ds4_gpu_tensor *saved_output_hc = ctx.layer_batch_output_hc;
+    const void *saved_input_hc_ptr = ctx.layer_batch_input_hc_ptr;
+    const void *saved_output_hc_ptr = ctx.layer_batch_output_hc_ptr;
+    const auto is_persistent_hc_ptr = [&](const void *ptr) {
+        return ptr &&
+            (ptr == saved_input_hc_ptr || ptr == saved_output_hc_ptr);
+    };
+    bool persistent_hc_ok = true;
+    for (const ds4_gpu_tensor *tensor : ctx.layer_batch_tensors) {
+        if (tensor == saved_input_hc || tensor == saved_output_hc ||
+            (tensor && is_persistent_hc_ptr(tensor->ptr))) {
+            persistent_hc_ok = false;
+        }
+    }
+    for (const void *ptr : ctx.layer_batch_in_place_ptrs)
+        if (is_persistent_hc_ptr(ptr)) persistent_hc_ok = false;
+    if (!persistent_hc_ok)
+        fprintf(stderr,
+                "ds4: VULKAN persistent HC tensor freed inside layer batch\n");
     ctx.layer_batch_active = false;
     int ok = submit_and_wait_force();
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
         if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
             ok = 0;
     }
-    for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors)
+    for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors) {
+        if (tensor == saved_input_hc || tensor == saved_output_hc ||
+            (tensor && is_persistent_hc_ptr(tensor->ptr))) continue;
         ds4_gpu_tensor_free(tensor);
+    }
     for (void *ptr : ctx.layer_batch_in_place_ptrs) {
+        if (is_persistent_hc_ptr(ptr)) continue;
         auto it = g_vk.tensor_headers.find(ptr);
         if (it == g_vk.tensor_headers.end()) continue;
         vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
@@ -941,22 +977,91 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     ctx.layer_batch_descriptors.clear();
     ctx.layer_batch_tensors.clear();
     ctx.layer_batch_in_place_ptrs.clear();
+    if (!persistent_hc_ok) ok = 0;
     if (ok && resume && !ctx.recording) ok = begin_cmd();
-    ctx.layer_batch_active = was_active && resume && ok;
+    if (ok && resume && was_active && was_layer_open) {
+        /* A forced host read/flush creates a new bounded submission span, but
+         * the caller can still be inside the same logical layer.  Preserve
+         * that layer's guarded HC identities while dropping all retired
+         * resource generations. */
+        ctx.layer_batch_active = true;
+        ctx.layer_batch_layer_open = was_layer_open;
+        ctx.layer_batch_span = saved_span;
+        ctx.layer_batch_layers = 0;
+        ctx.layer_batch_current_layer = saved_current_layer;
+        ctx.layer_batch_last_layer = UINT32_MAX;
+        ctx.layer_batch_input_hc = saved_input_hc;
+        ctx.layer_batch_output_hc = saved_output_hc;
+        ctx.layer_batch_input_hc_ptr = saved_input_hc_ptr;
+        ctx.layer_batch_output_hc_ptr = saved_output_hc_ptr;
+    } else {
+        /* A flush/read between layers still leaves a fresh command buffer
+         * recording, but it does not resurrect an empty logical span. */
+        ctx.layer_batch_active = false;
+        ctx.layer_batch_layer_open = false;
+        ctx.layer_batch_span = 1;
+        ctx.layer_batch_layers = 0;
+        ctx.layer_batch_current_layer = UINT32_MAX;
+        ctx.layer_batch_last_layer = UINT32_MAX;
+        ctx.layer_batch_input_hc = nullptr;
+        ctx.layer_batch_output_hc = nullptr;
+        ctx.layer_batch_input_hc_ptr = nullptr;
+        ctx.layer_batch_output_hc_ptr = nullptr;
+    }
     return ok;
+}
+
+static int retire_layer_batch_for_host_access(void) {
+    auto &ctx = get_cmd_ctx();
+    return !ctx.layer_batch_active || retire_layer_batch_span(ctx, true);
 }
 
 /* Split long command buffers into multiple submissions (llama.cpp-style):
  * RADV can crash finalizing a huge CS right after a large prefill, and
  * in-flight weight eviction is bounded by keeping command buffers short. */
-static void maybe_submit(void) {
+static int maybe_submit(void) {
     auto &c = get_cmd_ctx();
     if (c.command_count >= 64) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr, "ds4: [dbg] maybe_submit cc=%u\n", (unsigned)c.command_count);
-        end_and_submit();
-        begin_cmd();
+        if (c.layer_batch_active) {
+            const bool layer_was_open = c.layer_batch_layer_open;
+            const uint32_t current_layer = c.layer_batch_current_layer;
+            const ds4_gpu_tensor *input_hc = c.layer_batch_input_hc;
+            const ds4_gpu_tensor *output_hc = c.layer_batch_output_hc;
+            const void *input_hc_ptr = c.layer_batch_input_hc_ptr;
+            const void *output_hc_ptr = c.layer_batch_output_hc_ptr;
+            if (!retire_layer_batch_span(c, true)) return 0;
+            /* A rotation inside a layer must have retired every prior
+             * descriptor/temp generation and restored the exact HC guard.
+             * Between layers, retirement intentionally leaves no live span. */
+            const bool safe = c.recording && c.command_count == 0 &&
+                c.layer_batch_descriptors.empty() &&
+                c.layer_batch_tensors.empty() &&
+                c.layer_batch_in_place_ptrs.empty() &&
+                (!layer_was_open ||
+                 (c.layer_batch_active && c.layer_batch_layer_open &&
+                  c.layer_batch_current_layer == current_layer &&
+                  c.layer_batch_input_hc == input_hc &&
+                  c.layer_batch_output_hc == output_hc &&
+                  c.layer_batch_input_hc_ptr == input_hc_ptr &&
+                  c.layer_batch_output_hc_ptr == output_hc_ptr)) &&
+                (layer_was_open || !c.layer_batch_active);
+            if (!safe) {
+                fprintf(stderr,
+                        "ds4: VULKAN unsafe layer-batch command rotation\n");
+                return 0;
+            }
+            if (getenv("DS4_VULKAN_DEBUG"))
+                fprintf(stderr,
+                        "ds4: [dbg] layer-batch lifetime-safe rotation layer=%u open=%d\n",
+                        current_layer, layer_was_open ? 1 : 0);
+            return 1;
+        }
+        if (!end_and_submit()) return 0;
+        if (!begin_cmd()) return 0;
     }
+    return 1;
 }
 
 /* ---- Compute Dispatch ---- */
@@ -1003,7 +1108,7 @@ static int dispatch_shader(const char *name,
 
     /* Reset descriptor pool periodically (simplified: reset each time) */
     /* In production, use multiple pools or recycle sets */
-    maybe_submit();
+    if (!maybe_submit()) return -1;
     return 0;
 }
 
@@ -1180,23 +1285,30 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
 }
 
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *t) { return t ? t->bytes : 0; }
-void *ds4_gpu_tensor_contents(ds4_gpu_tensor *t) { return t ? t->ptr : nullptr; }
+void *ds4_gpu_tensor_contents(ds4_gpu_tensor *t) {
+    if (!t) return nullptr;
+    if (!retire_layer_batch_for_host_access()) return nullptr;
+    return t->ptr;
+}
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *t, float value, uint64_t count) {
     if (!t || !t->ptr || !g_vk.initialized) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     float *d = (float*)t->ptr;
     for (uint64_t i = 0; i < count && i < t->bytes/4; i++) d[i] = value;
     return 1;
 }
 
 int ds4_gpu_tensor_write(ds4_gpu_tensor *t, uint64_t off, const void *data, uint64_t bytes) {
-    if (!t || !t->ptr || off + bytes > t->bytes) return 0;
+    if (!t || !t->ptr || off > t->bytes || bytes > t->bytes - off) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     memcpy((char*)t->ptr + off, data, bytes);
     return 1;
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *data, uint64_t bytes) {
-    if (!t || !t->ptr || off + bytes > t->bytes) return 0;
+    if (!t || !t->ptr || off > t->bytes || bytes > t->bytes - off) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     memcpy(data, (const char*)t->ptr + off, bytes);
     return 1;
 }
@@ -1204,7 +1316,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off, void *data, uint6
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t doff,
                          const ds4_gpu_tensor *src, uint64_t soff, uint64_t bytes) {
     if (!dst || !dst->ptr || !src || !src->ptr) return 0;
-    if (doff + bytes > dst->bytes || soff + bytes > src->bytes) return 0;
+    if (doff > dst->bytes || bytes > dst->bytes - doff ||
+        soff > src->bytes || bytes > src->bytes - soff) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     memcpy((char*)dst->ptr + doff, (const char*)src->ptr + soff, bytes);
     return 1;
 }
@@ -1212,6 +1326,9 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t doff,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t doff,
                                     const ds4_gpu_tensor *src, uint64_t soff, uint64_t count) {
     if (!dst || !dst->ptr || !src || !src->ptr) return 0;
+    if (doff > dst->bytes || count > (dst->bytes - doff) / sizeof(uint16_t) ||
+        soff > src->bytes || count > (src->bytes - soff) / sizeof(float)) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     const float *s = (const float*)((const char*)src->ptr + soff);
     uint16_t *d = (uint16_t*)((char*)dst->ptr + doff);
     for (uint64_t i = 0; i < count; i++) {
@@ -1241,13 +1358,20 @@ int ds4_gpu_flush_commands(void) {
     return ok;
 }
 int ds4_gpu_end_commands(void) {
-    int ok = submit_and_wait();
     auto &ctx = get_cmd_ctx();
+    int ok = ctx.layer_batch_active ? retire_layer_batch_span(ctx, false) :
+                                      submit_and_wait();
     if (ok && ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
         timeline_dump(ctx);
     return ok;
 }
-int ds4_gpu_synchronize(void) { VK_CHECK_RAW(timeline_device_wait_idle("synchronize")); return 1; }
+int ds4_gpu_synchronize(void) {
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active && !retire_layer_batch_span(ctx, false)) return 0;
+    if ((ctx.recording || ctx.submitted) && !submit_and_wait_force()) return 0;
+    VK_CHECK_RAW(timeline_device_wait_idle("synchronize"));
+    return 1;
+}
 
 extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
@@ -1284,28 +1408,119 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
     ctx.layer_timeline_stage_cursor = ctx.timeline_events.size();
 }
 
-extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
-    (void)layer;
-    auto &ctx = get_cmd_ctx();
-    if (ctx.layer_batch_active) return 0;
-    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())
-        return 0;
-    if (!ctx.recording && !begin_cmd()) return 0;
+static uint32_t requested_layer_batch_span(const VulkanCommandCtx &ctx) {
+    /* The general/per-layer timeline owns per-layer query state and keeps the
+     * old fence boundary.  Routed-stage profiling has a 256-query pool, enough
+     * for a bounded four-layer span, and is intentionally still supported. */
+    if (ctx.timeline_enabled || getenv("DS4_VULKAN_TIMELINE_LAYER")) return 1;
+    const char *value = getenv("DS4_VULKAN_BATCH_LAYER_SPAN");
+    if (!value || !value[0]) return 1;
+    char *end = nullptr;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    return end && !end[0] && parsed >= 1 && parsed <= 4 ?
+        (uint32_t)parsed : 1;
+}
+
+static bool layer_batch_hc_is_persistent(const ds4_gpu_tensor *tensor) {
+    if (!tensor || !tensor->ptr || !tensor->owner) return false;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    return find_tensor_buffer(tensor, buffer, offset);
+}
+
+static bool layer_batch_hc_was_deferred(const VulkanCommandCtx &ctx,
+                                        const ds4_gpu_tensor *tensor) {
+    if (!tensor) return true;
+    for (const ds4_gpu_tensor *deferred : ctx.layer_batch_tensors)
+        if (deferred == tensor ||
+            (deferred && deferred->ptr == tensor->ptr)) return true;
+    for (const void *ptr : ctx.layer_batch_in_place_ptrs)
+        if (ptr == tensor->ptr) return true;
+    return false;
+}
+
+static void start_layer_batch_span(VulkanCommandCtx &ctx, uint32_t layer,
+                                   const ds4_gpu_tensor *input_hc,
+                                   const ds4_gpu_tensor *output_hc) {
     ctx.layer_batch_descriptors.clear();
     ctx.layer_batch_tensors.clear();
     ctx.layer_batch_in_place_ptrs.clear();
-    ctx.layer_batch_descriptors.reserve(128);
-    ctx.layer_batch_tensors.reserve(32);
-    ctx.layer_batch_in_place_ptrs.reserve(16);
+    ctx.layer_batch_span = requested_layer_batch_span(ctx);
+    ctx.layer_batch_descriptors.reserve(128u * ctx.layer_batch_span);
+    ctx.layer_batch_tensors.reserve(32u * ctx.layer_batch_span);
+    ctx.layer_batch_in_place_ptrs.reserve(16u * ctx.layer_batch_span);
+    ctx.layer_batch_layers = 0;
+    ctx.layer_batch_current_layer = layer;
+    ctx.layer_batch_last_layer = UINT32_MAX;
+    ctx.layer_batch_input_hc = input_hc;
+    ctx.layer_batch_output_hc = output_hc;
+    ctx.layer_batch_input_hc_ptr = input_hc->ptr;
+    ctx.layer_batch_output_hc_ptr = output_hc->ptr;
+    ctx.layer_batch_layer_open = true;
     ctx.layer_batch_active = true;
+}
+
+extern "C" int ds4_gpu_batch_layer_begin(
+        uint32_t layer, const ds4_gpu_tensor *input_hc,
+        const ds4_gpu_tensor *output_hc) {
+    auto &ctx = get_cmd_ctx();
+    if (!layer_batch_hc_is_persistent(input_hc) ||
+        !layer_batch_hc_is_persistent(output_hc) ||
+        input_hc == output_hc || input_hc->ptr == output_hc->ptr) return 0;
+    if (ctx.layer_batch_active) {
+        if (ctx.layer_batch_layer_open) return 0;
+        const bool contiguous =
+            ctx.layer_batch_last_layer != UINT32_MAX &&
+            layer == ctx.layer_batch_last_layer + 1u;
+        const bool exact_ping_pong =
+            input_hc == ctx.layer_batch_output_hc &&
+            output_hc == ctx.layer_batch_input_hc &&
+            input_hc->ptr == ctx.layer_batch_output_hc_ptr &&
+            output_hc->ptr == ctx.layer_batch_input_hc_ptr;
+        if (contiguous && exact_ping_pong &&
+            ctx.layer_batch_layers < ctx.layer_batch_span) {
+            ctx.layer_batch_current_layer = layer;
+            ctx.layer_batch_input_hc = input_hc;
+            ctx.layer_batch_output_hc = output_hc;
+            ctx.layer_batch_input_hc_ptr = input_hc->ptr;
+            ctx.layer_batch_output_hc_ptr = output_hc->ptr;
+            ctx.layer_batch_layer_open = true;
+            return 1;
+        }
+        /* Non-contiguous/special graph flows retain exact behavior by ending
+         * the prior span before a fresh guarded span begins. */
+        if (!retire_layer_batch_span(ctx, true)) return 0;
+    }
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())
+        return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    start_layer_batch_span(ctx, layer, input_hc, output_hc);
     return 1;
 }
 
-extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
-    (void)layer;
+extern "C" int ds4_gpu_batch_layer_end(
+        uint32_t layer, const ds4_gpu_tensor *input_hc,
+        const ds4_gpu_tensor *output_hc) {
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_batch_active) return 1;
-    return retire_layer_batch_span(ctx, false);
+    const bool valid = ctx.layer_batch_layer_open &&
+        layer == ctx.layer_batch_current_layer &&
+        input_hc == ctx.layer_batch_input_hc &&
+        output_hc == ctx.layer_batch_output_hc &&
+        input_hc && input_hc->ptr == ctx.layer_batch_input_hc_ptr &&
+        output_hc && output_hc->ptr == ctx.layer_batch_output_hc_ptr &&
+        !layer_batch_hc_was_deferred(ctx, input_hc) &&
+        !layer_batch_hc_was_deferred(ctx, output_hc);
+    if (!valid) {
+        (void)retire_layer_batch_span(ctx, false);
+        return 0;
+    }
+    ctx.layer_batch_layer_open = false;
+    ctx.layer_batch_last_layer = layer;
+    ctx.layer_batch_layers++;
+    if (ctx.layer_batch_layers >= ctx.layer_batch_span)
+        return retire_layer_batch_span(ctx, false);
+    return 1;
 }
 
 int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
@@ -2157,6 +2372,7 @@ int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
         logits->bytes < (uint64_t)n_vocab * sizeof(float)) {
         return 0;
     }
+    if (!retire_layer_batch_for_host_access()) return 0;
     const float *values = (const float *)logits->ptr;
     uint32_t best = 0;
     float best_value = values[0];
@@ -2504,6 +2720,7 @@ int ds4_gpu_matmul_f32_tensor(
     if (!out || !out->ptr || !x || !x->ptr || !model_map) return 0;
     if (out->bytes < n_tok * out_dim * sizeof(float) ||
         x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     const float *xp = (const float *)x->ptr;
     const float *wp = (const float *)((const char *)model_map + weight_offset);
     float *op = (float *)out->ptr;
@@ -2671,8 +2888,8 @@ int ds4_gpu_matmul_f16_tensor(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 1, &mb, 0, nullptr, 0, nullptr);
 
-    maybe_submit();
-    int ok = submit_and_wait();
+    int ok = maybe_submit();
+    if (ok) ok = submit_and_wait();
     if (ok && !release_simple_descriptors(ds)) ok = 0;
     else if (ok) timeline_resource(c, TimelineEventKind::DescriptorFree,
                                    "matmul_f16", 0);
@@ -2958,6 +3175,7 @@ int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc,
         !ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes)) {
         return 0;
     }
+    if (!retire_layer_batch_for_host_access()) return 0;
     float *out = (float *)out_hc->ptr;
     ds4_embed_f16_row(out,
                       (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
@@ -2979,6 +3197,7 @@ int ds4_gpu_embed_tokens_hc_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor 
     const uint64_t out_bytes = (uint64_t)n_tokens * n_hc * n_embd * sizeof(float);
     if (tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) || out_hc->bytes < out_bytes)
         return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     const int32_t *tok = (const int32_t*)tokens->ptr;
     float *out = (float*)out_hc->ptr;
     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -3055,6 +3274,7 @@ int ds4_gpu_embed_token_q8_0_tensor(ds4_gpu_tensor *out,
     const uint64_t row_bytes = ((uint64_t)n_embd + 31u) / 32u * 34u;
     if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
         return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     ds4_embed_q8_0_row((float *)out->ptr,
                        (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
                        n_embd);
@@ -3067,6 +3287,7 @@ int ds4_gpu_embed_tokens_q8_0_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd)
 {
     if (!out || !tokens) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     const int32_t *tok = (const int32_t *)tokens->ptr;
     float *outf = (float *)out->ptr;
     const uint64_t row_bytes = ((uint64_t)n_embd + 31u) / 32u * 34u;
@@ -3093,6 +3314,7 @@ static int ds4_embed_token_f16_tensor(ds4_gpu_tensor *out,
     const uint64_t row_bytes = (uint64_t)n_embd * 2u;
     if (!ds4_embed_row_ok(model_map, model_size, weight_offset, (uint64_t)id, row_bytes))
         return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     ds4_embed_f16_row((float *)out->ptr,
                       (const uint8_t *)model_map + weight_offset + (uint64_t)id * row_bytes,
                       n_embd);
@@ -3105,6 +3327,7 @@ static int ds4_embed_tokens_f16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
     uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd)
 {
     if (!out || !tokens) return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     const int32_t *tok = (const int32_t *)tokens->ptr;
     float *outf = (float *)out->ptr;
     const uint64_t row_bytes = (uint64_t)n_embd * 2u;
@@ -6015,6 +6238,7 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         fprintf(stderr, "ds4: matmul_quant: tensor bytes too small\n");
         return 0;
     }
+    if (!retire_layer_batch_for_host_access()) return 0;
 
     const uint8_t *base = (const uint8_t *)model_map + weight_offset;
     const float *xp = (const float *)x->ptr;
@@ -7324,6 +7548,7 @@ extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out,
     (void)remote_tmp;
     if (!out || !local || !remote || !out->ptr || !local->ptr || !remote->ptr)
         return 0;
+    if (!retire_layer_batch_for_host_access()) return 0;
     float *op = (float*)out->ptr;
     const float *lp = (const float*)local->ptr;
     const float *rp = (const float*)remote->ptr;

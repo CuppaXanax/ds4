@@ -25147,13 +25147,16 @@ static bool metal_graph_encode_decode_layer(
         int                     token) {
 #ifdef DS4_VULKAN_BUILD
     ds4_gpu_timeline_layer_begin(il);
-    if (ds4_gpu_batch_layer_begin(il) == 0) return false;
+    ds4_gpu_tensor *const input_hc = metal_graph_cur_hc(g);
+    ds4_gpu_tensor *const output_hc = metal_graph_after_ffn_hc(g);
+    if (ds4_gpu_batch_layer_begin(il, input_hc, output_hc) == 0) return false;
 #endif
     const bool ok = metal_graph_encode_decode_layer_phase(
             g, model, layer, il, pos, raw_cache, raw_cap, raw_row, n_raw,
             token, METAL_DECODE_LAYER_FULL);
 #ifdef DS4_VULKAN_BUILD
-    const bool batch_end_ok = ds4_gpu_batch_layer_end(il) != 0;
+    const bool batch_end_ok =
+        ds4_gpu_batch_layer_end(il, input_hc, output_hc) != 0;
     ds4_gpu_timeline_layer_end(il);
     return ok && batch_end_ok;
 #else

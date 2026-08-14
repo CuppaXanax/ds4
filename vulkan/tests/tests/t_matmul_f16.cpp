@@ -14,6 +14,15 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+
+static void set_layer_batch_span(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DS4_VULKAN_BATCH_LAYER_SPAN", value);
+#else
+    setenv("DS4_VULKAN_BATCH_LAYER_SPAN", value, 1);
+#endif
+}
 
 /* f32 -> IEEE half (round toward zero; test values are normal-range). */
 static uint16_t f32_to_f16(float f) {
@@ -148,6 +157,42 @@ static int test_matmul_f16(void) {
                 }
             }
         }
+    }
+
+    /* Cross the backend's 64-dispatch command-buffer rotation while a layer
+     * span is open.  The rotation must fence and retire prior descriptor/temp
+     * generations, then restore the exact layer/HC guard before dispatch 65. */
+    if (rc == 0) {
+        set_layer_batch_span("4");
+        int rotation_ok = ds4_gpu_begin_commands() != 0 &&
+            ds4_gpu_batch_layer_begin(17, x, out) != 0;
+        for (uint32_t dispatch = 0; rotation_ok && dispatch < 65; dispatch++) {
+            rotation_ok = ds4_gpu_matmul_f16_tensor(
+                out, model, model_size, weight_offset,
+                in_dim, out_dim, x, n_tok) != 0;
+        }
+        if (rotation_ok) {
+            rotation_ok = ds4_gpu_batch_layer_end(17, x, out) != 0 &&
+                ds4_gpu_end_commands() != 0;
+        }
+        if (!rotation_ok) (void)ds4_gpu_synchronize();
+        float rotated[n_tok * out_dim];
+        if (!rotation_ok ||
+            ds4_gpu_tensor_read(out, 0, rotated, sizeof(rotated)) == 0) {
+            rc = 1;
+        } else {
+            for (uint64_t i = 0; i < n_tok * out_dim; i++) {
+                if (!(std::fabsf(rotated[i] - ref[i]) <= 1e-3f)) {
+                    fprintf(stderr,
+                            "matmul_f16 rotation mismatch at %llu got=%g want=%g\n",
+                            (unsigned long long)i,
+                            (double)rotated[i], (double)ref[i]);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+        set_layer_batch_span("1");
     }
 
     free(model);

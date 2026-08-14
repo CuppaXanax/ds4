@@ -852,7 +852,8 @@ static int test_routed_moe_one(void) {
          * command scope; this exercises the forced retirement before the
          * host reads the validation flag. */
         if (rc == 0 &&
-            (!ds4_gpu_begin_commands() || !ds4_gpu_batch_layer_begin(0))) {
+            (!ds4_gpu_begin_commands() ||
+             !ds4_gpu_batch_layer_begin(0, x_t, out_t))) {
             rc = 1;
         }
         if (rc == 0 &&
@@ -865,7 +866,8 @@ static int test_routed_moe_one(void) {
                     "routed_moe_one: batched out-of-range expert should return 0\n");
             rc = 1;
         }
-        if (!ds4_gpu_batch_layer_end(0) || !ds4_gpu_end_commands()) rc = 1;
+        if (!ds4_gpu_batch_layer_end(0, x_t, out_t) ||
+            !ds4_gpu_end_commands()) rc = 1;
         ds4_gpu_tensor_free(out_t);
         ds4_gpu_tensor_free(sel_t);
         ds4_gpu_tensor_free(w_t);

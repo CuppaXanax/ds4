@@ -68,6 +68,8 @@
 #define DS4_DIST_RECV_TRANSPORT_ERROR 1
 #define DS4_DIST_RECV_REMOTE_ERROR 2
 #define DS4_DIST_SNAPSHOT_CHUNK_BYTES (8u * 1024u * 1024u)
+#define DS4_DIST_ROUTE_RECOVERY_TIMEOUT_MS 10000u
+#define DS4_DIST_ROUTE_RECOVERY_POLL_MS 100u
 
 typedef struct {
     uint32_t magic;
@@ -2107,50 +2109,6 @@ static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     memset(plan, 0, sizeof(*plan));
 }
 
-static bool dist_route_entry_matches_worker(
-        const ds4_dist_route_entry *route,
-        const ds4_dist_worker_entry *worker) {
-    const bool route_has_output = (route->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
-    return route->port == worker->listen_port &&
-           strcmp(route->host, worker->peer_host) == 0 &&
-           route->layer_start == worker->layer_start &&
-           route->layer_end == worker->layer_end &&
-           route_has_output == (worker->has_output != 0);
-}
-
-static void dist_coordinator_forget_route_workers(
-        ds4_dist_coordinator_state *state,
-        const ds4_dist_route_plan *plan) {
-    bool removed_any = false;
-    pthread_mutex_lock(&state->mu);
-    for (uint32_t i = 0; i < plan->count; i++) {
-        ds4_dist_worker_entry **link = &state->workers;
-        while (*link) {
-            ds4_dist_worker_entry *entry = *link;
-            if (!dist_route_entry_matches_worker(&plan->entry[i], entry)) {
-                link = &entry->next;
-                continue;
-            }
-            *link = entry->next;
-            close(entry->fd);
-            DIST_COORD_DEBUG(state,
-                             "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
-                             plan->entry[i].host,
-                             plan->entry[i].port,
-                             entry->layer_start,
-                             entry->layer_end,
-                             entry->has_output ? "+output" : "");
-            free(entry);
-            removed_any = true;
-            break;
-        }
-    }
-    if (removed_any) state->generation++;
-    pthread_mutex_unlock(&state->mu);
-
-    if (removed_any && dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
-}
-
 static bool dist_route_plan_append_blob(
         ds4_dist_route_plan *plan,
         const ds4_dist_route_entry *entry,
@@ -2346,6 +2304,48 @@ static bool dist_coordinator_ensure_route(
         char *err,
         size_t errlen) {
     return dist_coordinator_build_route_plan(state, plan, generation, err, errlen);
+}
+
+static bool dist_coordinator_wait_for_route(
+        ds4_dist_coordinator_state *state,
+        ds4_dist_route_plan *plan,
+        uint64_t *generation,
+        char *err,
+        size_t errlen) {
+    char last_err[256] = "distributed route unavailable";
+    uint32_t waited_ms = 0;
+
+    for (;;) {
+        if (dist_coordinator_ensure_route(state,
+                                          plan,
+                                          generation,
+                                          last_err,
+                                          sizeof(last_err))) {
+            if (err && errlen) err[0] = '\0';
+            return true;
+        }
+
+        pthread_mutex_lock(&state->mu);
+        const bool shutting_down = state->shutting_down;
+        pthread_mutex_unlock(&state->mu);
+        if (shutting_down || waited_ms >= DS4_DIST_ROUTE_RECOVERY_TIMEOUT_MS) break;
+
+        const struct timespec ts = {
+            .tv_sec = 0,
+            .tv_nsec = (long)DS4_DIST_ROUTE_RECOVERY_POLL_MS * 1000L * 1000L,
+        };
+        nanosleep(&ts, NULL);
+        waited_ms += DS4_DIST_ROUTE_RECOVERY_POLL_MS;
+    }
+
+    if (err && errlen) {
+        snprintf(err,
+                 errlen,
+                 "distributed route unavailable after %u ms: %s",
+                 waited_ms,
+                 last_err);
+    }
+    return false;
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -2973,20 +2973,44 @@ static int dist_coordinator_rebuild_from_transcript(
         uint64_t *request_id,
         float *logits,
         uint64_t *plan_generation,
-        bool forget_route,
+        bool rebuild_route,
         char *err,
         size_t errlen) {
+    char original_err[256] = "distributed route failure";
+    if (err && err[0] != '\0') snprintf(original_err, sizeof(original_err), "%s", err);
+
     DIST_COORD_DEBUG(state,
                      "ds4: distributed coordinator: replaying %d tokens after distributed %s\n",
                      transcript->len,
-                     forget_route ? "route failure" : "KV mismatch");
-    if (forget_route) {
-        dist_coordinator_forget_route_workers(state, plan);
+                     rebuild_route ? "route failure" : "KV mismatch");
+    if (rebuild_route) {
+        fprintf(stderr,
+                "ds4: distributed coordinator: %s; rebuilding data route and replaying transcript\n",
+                original_err);
         dist_route_plan_free(plan);
         uint64_t generation = 0;
-        if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
+        char recovery_err[256] = {0};
+        if (!dist_coordinator_wait_for_route(state,
+                                             plan,
+                                             &generation,
+                                             recovery_err,
+                                             sizeof(recovery_err))) {
+            if (err && errlen) {
+                snprintf(err,
+                         errlen,
+                         "distributed recovery after '%s' failed: %s",
+                         original_err,
+                         recovery_err);
+            }
+            return 1;
+        }
         if (plan_generation) *plan_generation = generation;
-    } else if (plan->count == 0) {
+    } else {
+        fprintf(stderr,
+                "ds4: distributed coordinator: %s; replaying transcript on current route\n",
+                original_err);
+    }
+    if (!rebuild_route && plan->count == 0) {
         uint64_t generation = 0;
         if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
         if (plan_generation) *plan_generation = generation;
@@ -3000,6 +3024,15 @@ static int dist_coordinator_rebuild_from_transcript(
                                         logits,
                                         err,
                                         errlen) != 0) {
+        if (err && errlen) {
+            char replay_err[256] = {0};
+            snprintf(replay_err, sizeof(replay_err), "%s", err);
+            snprintf(err,
+                     errlen,
+                     "distributed replay after '%s' failed: %s",
+                     original_err,
+                     replay_err);
+        }
         return 1;
     }
     return 0;

@@ -294,12 +294,12 @@ REGISTER_TEST(indexer_topk, test_indexer_topk);
 /* The canonical indexer keeps up to 512 compressed rows.  This exercises the
  * full output width without making the regular small ordering test expensive. */
 static int test_indexer_topk_512_masked(void) {
-    const uint32_t n_comp = 520, n_tokens = 1, top_k = 512;
+    const uint32_t n_comp = 4096, n_tokens = 1, top_k = 512;
     std::vector<float> scores(n_comp);
     const uint32_t finite_rows = 37;
     for (uint32_t c = 0; c < finite_rows; c++) scores[c] = (float)(finite_rows - c);
-    for (uint32_t c = finite_rows; c < 437; c++) scores[c] = -INFINITY;
-    for (uint32_t c = 437; c < n_comp; c++) scores[c] = NAN;
+    for (uint32_t c = finite_rows; c < 3500; c++) scores[c] = -INFINITY;
+    for (uint32_t c = 3500; c < n_comp; c++) scores[c] = NAN;
 
     std::vector<uint32_t> ref(top_k);
     ref_topk_row(scores.data(), n_comp, top_k, ref.data());

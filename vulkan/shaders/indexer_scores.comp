@@ -1,5 +1,5 @@
 #version 460 core
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) buffer Scores { float scores[]; };
 layout(set = 0, binding = 1) readonly buffer Q { float q[]; };
@@ -17,7 +17,10 @@ layout(push_constant) uniform PC {
     float scale;
 } pc;
 
+shared float head_scores[64];
+
 void main() {
+    const uint lane = gl_LocalInvocationIndex;
     uint c = gl_WorkGroupID.x;
     uint t = gl_WorkGroupID.y;
     if (c >= pc.n_comp || t >= pc.n_tokens) return;
@@ -32,14 +35,36 @@ void main() {
         }
     }
 
-    float total = 0.0;
-    for (uint h = 0u; h < pc.n_head; ++h) {
-        uint q_base = (t * pc.n_head + h) * pc.head_dim;
+    if (pc.n_head > 64u) {
+        if (lane != 0u) return;
+        float total = 0.0;
+        for (uint h = 0u; h < pc.n_head; ++h) {
+            uint q_base = (t * pc.n_head + h) * pc.head_dim;
+            uint k_base = c * pc.head_dim;
+            float dot = 0.0;
+            for (uint d = 0u; d < pc.head_dim; ++d)
+                dot += q[q_base + d] * index_comp[k_base + d];
+            total += max(dot, 0.0) * weights[t * pc.n_head + h];
+        }
+        scores[t * pc.n_comp + c] = total * pc.scale;
+        return;
+    }
+
+    float value = 0.0;
+    if (lane < pc.n_head) {
+        uint q_base = (t * pc.n_head + lane) * pc.head_dim;
         uint k_base = c * pc.head_dim;
         float dot = 0.0;
         for (uint d = 0u; d < pc.head_dim; ++d)
             dot += q[q_base + d] * index_comp[k_base + d];
-        total += max(dot, 0.0) * weights[t * pc.n_head + h];
+        value = max(dot, 0.0) * weights[t * pc.n_head + lane];
     }
-    scores[t * pc.n_comp + c] = total * pc.scale;
+    head_scores[lane] = value;
+    barrier();
+    if (lane == 0u) {
+        float total = 0.0;
+        for (uint h = 0u; h < pc.n_head; ++h)
+            total += head_scores[h];
+        scores[t * pc.n_comp + c] = total * pc.scale;
+    }
 }

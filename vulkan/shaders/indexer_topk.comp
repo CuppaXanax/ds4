@@ -1,8 +1,12 @@
 #version 460 core
-layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer Selected { uint selected[]; };
 layout(set = 0, binding = 1) readonly buffer Scores { float scores[]; };
 layout(push_constant) uniform PC { uint n_comp; uint n_tokens; uint top_k; } pc;
+
+const uint MAX_COMP = 4096u;
+shared float sort_score[MAX_COMP];
+shared uint sort_index[MAX_COMP];
 
 bool score_better(float av, uint ai, float bv, uint bi) {
     if (isnan(av)) return isnan(bv) && ai < bi;
@@ -11,47 +15,45 @@ bool score_better(float av, uint ai, float bv, uint bi) {
 }
 
 void main() {
+    const uint lane = gl_LocalInvocationIndex;
     uint t = gl_WorkGroupID.x;
     const uint MAX_TOP_K = 512u;
-    if (t >= pc.n_tokens || pc.top_k > MAX_TOP_K) return;
-    float best_score[MAX_TOP_K];
-    uint best_index[MAX_TOP_K];
-    best_score[0] = scores[t * pc.n_comp];
-    best_index[0] = 0u;
-    for (uint c = 1u; c < pc.top_k; ++c) {
-        float value = scores[t * pc.n_comp + c];
-        uint at = c;
-        for (uint k = 0u; k < c; ++k) {
-            if (score_better(value, c, best_score[k], best_index[k])) {
-                at = k;
-                break;
-            }
-        }
-        for (uint k = c; k > at; --k) {
-            best_score[k] = best_score[k - 1u];
-            best_index[k] = best_index[k - 1u];
-        }
-        best_score[at] = value;
-        best_index[at] = c;
+    if (t >= pc.n_tokens || pc.top_k > MAX_TOP_K || pc.n_comp > MAX_COMP) return;
+
+    uint sort_size = 1u;
+    while (sort_size < pc.n_comp) sort_size <<= 1u;
+    for (uint c = lane; c < sort_size; c += 64u) {
+        sort_score[c] = c < pc.n_comp
+            ? scores[t * pc.n_comp + c]
+            : uintBitsToFloat(0x7fc00000u);
+        sort_index[c] = c < pc.n_comp ? c : 0xffffffffu;
     }
-    for (uint c = pc.top_k; c < pc.n_comp; ++c) {
-        float value = scores[t * pc.n_comp + c];
-        uint at = pc.top_k;
-        for (uint k = 0u; k < pc.top_k; ++k) {
-            if (score_better(value, c, best_score[k], best_index[k])) {
-                at = k;
-                break;
+    barrier();
+
+    for (uint span = 2u; span <= sort_size; span <<= 1u) {
+        for (uint stride = span >> 1u; stride != 0u; stride >>= 1u) {
+            for (uint i = lane; i < sort_size; i += 64u) {
+                const uint other = i ^ stride;
+                if (other > i) {
+                    const float av = sort_score[i];
+                    const uint ai = sort_index[i];
+                    const float bv = sort_score[other];
+                    const uint bi = sort_index[other];
+                    const bool descending = (i & span) == 0u;
+                    const bool swap = descending
+                        ? score_better(bv, bi, av, ai)
+                        : score_better(av, ai, bv, bi);
+                    if (swap) {
+                        sort_score[i] = bv;
+                        sort_index[i] = bi;
+                        sort_score[other] = av;
+                        sort_index[other] = ai;
+                    }
+                }
             }
-        }
-        if (at < pc.top_k) {
-            for (uint k = pc.top_k - 1u; k > at; --k) {
-                best_score[k] = best_score[k - 1u];
-                best_index[k] = best_index[k - 1u];
-            }
-            best_score[at] = value;
-            best_index[at] = c;
+            barrier();
         }
     }
-    for (uint k = 0u; k < pc.top_k; ++k)
-        selected[t * pc.top_k + k] = best_index[k];
+    for (uint k = lane; k < pc.top_k; k += 64u)
+        selected[t * pc.top_k + k] = sort_index[k];
 }

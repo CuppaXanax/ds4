@@ -60,7 +60,7 @@ static float f16_to_f32(uint16_t h) {
 static int test_matmul_f16(void) {
     const uint64_t in_dim   = 8;
     const uint64_t out_dim  = 4;
-    const uint64_t n_tok    = 2;
+    const uint64_t n_tok    = 257;
     const uint64_t w_elems  = out_dim * in_dim;         /* 32 f16 values */
     const uint64_t w_bytes  = w_elems * 2;              /* 2 bytes per f16 */
     const uint64_t header   = 16;                       /* mimic file header */
@@ -131,7 +131,7 @@ static int test_matmul_f16(void) {
             for (uint64_t i = 0; i < in_dim; i++)
                 fprintf(stderr, "%.3f ", xv[i]);
             fprintf(stderr, "\n");
-            for (uint64_t t = 0; t < n_tok; t++) {
+            for (uint64_t t = 0; t < 2; t++) {
                 for (uint64_t o = 0; o < out_dim; o++) {
                     fprintf(stderr, "out[%llu][%llu] got=%.6f want=%.6f %s\n",
                             (unsigned long long)t, (unsigned long long)o,

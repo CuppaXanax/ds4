@@ -2532,12 +2532,17 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                n_tok)
 {
     DS4_VK_TRACE_KERNEL("matmul_f16");
-    (void)model_map; (void)model_size;
-    if (!out || !x) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         if (getenv("DS4_VULKAN_DEBUG"))
-            fprintf(stderr, "ds4: [dbg] matmul_f16 missing tensor\n");
+            fprintf(stderr, "ds4: [dbg] matmul_f16 invalid arguments\n");
         return 0;
     }
+    if (out_dim > UINT64_MAX / in_dim || out_dim * in_dim > UINT64_MAX / 2u ||
+        weight_offset > model_size || out_dim * in_dim * 2u > model_size - weight_offset ||
+        n_tok > UINT64_MAX / in_dim || n_tok * in_dim > x->bytes / sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim || n_tok * out_dim > out->bytes / sizeof(float))
+        return 0;
 
     auto si = g_vk.shader_map.find("matmul_f16");
     if (si == g_vk.shader_map.end()) {
@@ -2548,7 +2553,6 @@ int ds4_gpu_matmul_f16_tensor(
     auto &sh = g_vk.shaders[si->second];
     auto &c = get_cmd_ctx();
     if (!c.recording && !begin_cmd()) return 0;
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
 
     auto find_buf = [](const void *ptr, VkBuffer &buf, VkDeviceSize &off) -> bool {
         auto it = g_vk.tensor_headers.find(const_cast<void*>(ptr));
@@ -2612,73 +2616,44 @@ int ds4_gpu_matmul_f16_tensor(
         wbuf = wit->second.buffer;
         wbuf_off = 0;
     }
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &sh.desc_layout;
-    VkDescriptorSet ds = VK_NULL_HANDLE;
-    const VkResult alloc_result = vkAllocateDescriptorSets(g_vk.device, &dai, &ds);
-    if (alloc_result != VK_SUCCESS) {
-        if (getenv("DS4_VULKAN_DEBUG"))
-            fprintf(stderr,
-                    "ds4: [dbg] matmul_f16 descriptor allocation failed: %d\n",
-                    alloc_result);
-        return 0;
-    }
-    VkDeviceSize x_size = std::min<VkDeviceSize>(xbuf == obuf ? (ooff - xoff) : VK_WHOLE_SIZE, in_dim * n_tok * sizeof(float));
     const VkDeviceSize w_size = std::min<VkDeviceSize>(
         wit->second.size - (wbuf_off > wit->second.size ? 0 : wbuf_off),
         weight_bytes);  /* f16 weights: 2 bytes per element */
-    VkDeviceSize o_size = out_dim * n_tok * sizeof(float);
-    VkDescriptorBufferInfo bufs[3] = {
-        {xbuf, xoff, x_size}, {wbuf, wbuf_off, w_size}, {obuf, ooff, o_size},
-    };
-    VkWriteDescriptorSet w[3];
-    for (int i = 0; i < 3; i++) {
-        w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
+    if (out_dim > g_vk.caps.max_compute_work_group_count[0] ||
+        sh.push_size != 3u * sizeof(uint32_t)) return 0;
+    constexpr uint64_t max_tokens_per_dispatch = 256u;
+    const uint64_t x_row_bytes = in_dim * sizeof(float);
+    const uint64_t out_row_bytes = out_dim * sizeof(float);
+    const VkDeviceSize align =
+        (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    for (uint64_t token_base = 0; token_base < n_tok; ) {
+        const uint32_t tile_tokens = (uint32_t)std::min<uint64_t>(
+            max_tokens_per_dispatch, n_tok - token_base);
+        if (!c.recording && !begin_cmd()) return 0;
+        if (token_base > UINT64_MAX / x_row_bytes ||
+            token_base > UINT64_MAX / out_row_bytes) return fail_simple_dispatch(c);
+        const uint64_t x_delta = token_base * x_row_bytes;
+        const uint64_t out_delta = token_base * out_row_bytes;
+        if (x_delta > UINT64_MAX - xoff || out_delta > UINT64_MAX - ooff)
+            return fail_simple_dispatch(c);
+        const VkDeviceSize tile_xoff = xoff + x_delta;
+        const VkDeviceSize tile_ooff = ooff + out_delta;
+        if ((align && ((tile_xoff | tile_ooff | (VkDeviceSize)wbuf_off) % align) != 0))
+            return fail_simple_dispatch(c);
+        VkDescriptorBufferInfo bufs[3] = {
+            {xbuf, tile_xoff, (VkDeviceSize)tile_tokens * x_row_bytes},
+            {wbuf, (VkDeviceSize)wbuf_off, w_size},
+            {obuf, tile_ooff, (VkDeviceSize)tile_tokens * out_row_bytes},
+        };
+        struct { uint32_t in_dim, out_dim, n_tok; } pc = {
+            (uint32_t)in_dim, (uint32_t)out_dim, tile_tokens};
+        const bool more_tiles = token_base + tile_tokens < n_tok;
+        if (!record_simple_shader("matmul_f16", &pc, sizeof(pc), bufs, 3,
+                                  (uint32_t)out_dim, tile_tokens, 1,
+                                  more_tiles)) return 0;
+        token_base += tile_tokens;
     }
-    vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-    timeline_descriptors(c, "matmul_f16", bufs, 3);
-    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
-
-    struct { uint32_t in_dim, out_dim, n_tok; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok
-    };
-    vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    if ((uint32_t)out_dim <= 65534) {
-        timeline_dispatch(c, "matmul_f16", bufs, 3,
-                          (uint32_t)out_dim, (uint32_t)n_tok, 1);
-    } else {
-        const uint32_t max_wg = 65534;
-        uint32_t dispatched = 0;
-        while (dispatched < (uint32_t)out_dim) {
-            uint32_t chunk = std::min((uint32_t)out_dim - dispatched, max_wg);
-            timeline_dispatch(c, "matmul_f16", bufs, 3,
-                              chunk, (uint32_t)n_tok, 1);
-            dispatched += chunk;
-        }
-    }
-    c.command_count++;
-
-    /* Memory barrier: visibility for subsequent dispatches */
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    timeline_barrier(c, "matmul_f16_compute_dependency");
-    vkCmdPipelineBarrier(c.cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, nullptr, 0, nullptr);
-
-    maybe_submit();
-    int ok = submit_and_wait();
-    if (ok && !release_simple_descriptors(ds)) ok = 0;
-    else if (ok) timeline_resource(c, TimelineEventKind::DescriptorFree,
-                                   "matmul_f16", 0);
-    return ok;
+    return 1;
 }
 
 /* ---- rms_norm_weight_rows_tensor dispatch ---- */

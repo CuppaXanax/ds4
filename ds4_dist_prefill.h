@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define DS4_DIST_PREFILL_WIRE_TARGET_BYTES (16ull * 1024ull * 1024ull)
+#define DS4_DIST_PREFILL_WIRE_TARGET_BYTES (8ull * 1024ull * 1024ull)
 #define DS4_DIST_PREFILL_EXECUTION_TILE_TOKENS 256u
 
 static inline uint32_t ds4_dist_prefill_chunk_policy(

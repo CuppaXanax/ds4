@@ -19,7 +19,7 @@ int main(void) {
 
     CHECK_EQ(ds4_dist_prefill_chunk_policy(
                      4096, 0, flash_hidden_values, 32, 128),
-             256, "32-bit Flash uses a 16 MiB work item");
+             128, "32-bit Flash uses an 8 MiB work item");
     CHECK_EQ(ds4_dist_prefill_chunk_policy(
                      4096, 0, flash_hidden_values, 16, 128),
              256, "16-bit Flash reaches the execution-tile cap");
@@ -37,10 +37,10 @@ int main(void) {
              128, "capacity is rounded to a compressor boundary");
     CHECK_EQ(ds4_dist_prefill_chunk_policy(
                      4096, 0, flash_hidden_values, 32, 96),
-             192, "wire target is rounded to compressor alignment");
+             96, "wire target is rounded to compressor alignment");
     CHECK_EQ(ds4_dist_prefill_chunk_policy(
                      4096, 0, 8u * 4096u, 32, 128),
-             128, "wider hidden state reduces the wire-sized chunk");
+             64, "wider hidden state reduces the wire-sized chunk");
     CHECK_EQ(ds4_dist_prefill_chunk_policy(
                      4096, 0, 0, 32, 128),
              4096, "missing model shape preserves session capacity");

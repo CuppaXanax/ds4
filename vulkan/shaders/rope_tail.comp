@@ -11,39 +11,52 @@ layout(push_constant) uniform PC {
     float beta_fast; float beta_slow;
 } pc;
 
+shared float rope_cos[256];
+shared float rope_sin[256];
+
 void main() {
+    uint token = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationIndex;
     uint pair_count = pc.n_rot / 2u;
-    uint gid = gl_GlobalInvocationID.x;
-    uint total = pc.n_tok * pc.n_head * pair_count;
-    if (gid >= total) return;
-    uint pair = gid % pair_count;
-    uint row = gid / pair_count;
-    uint t = row / pc.n_head;
-    uint i = pair * 2u;
-    uint off = row * pc.head_dim + (pc.head_dim - pc.n_rot);
-    float theta_extrap = float(pc.pos0 + t) * pow(pc.freq_base,
-                                                   -float(i) / float(pc.n_rot));
-    float theta_interp = pc.freq_scale * theta_extrap;
-    float theta = theta_interp;
-    float mscale = pc.attn_factor;
-    if (pc.ext_factor != 0.0) {
-        float denom = 2.0 * log(pc.freq_base);
-        float corr0 = max(0.0, floor(float(pc.n_rot) *
-            log(float(pc.n_ctx_orig) / (pc.beta_fast * 2.0 * 3.141592653589793)) / denom));
-        float corr1 = min(float(pc.n_rot - 1u), ceil(float(pc.n_rot) *
-            log(float(pc.n_ctx_orig) / (pc.beta_slow * 2.0 * 3.141592653589793)) / denom));
-        float y = (float(pair) - corr0) / max(0.001, corr1 - corr0);
-        float mix = (1.0 - clamp(y, 0.0, 1.0)) * pc.ext_factor;
-        theta = theta_interp * (1.0 - mix) + theta_extrap * mix;
-        mscale *= 1.0 + 0.1 * log(1.0 / pc.freq_scale);
+    if (token >= pc.n_tok || pair_count > 256u) return;
+
+    if (lane < pair_count) {
+        uint i = lane * 2u;
+        float theta_extrap = float(pc.pos0 + token) * pow(pc.freq_base,
+                                                           -float(i) / float(pc.n_rot));
+        float theta_interp = pc.freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = pc.attn_factor;
+        if (pc.ext_factor != 0.0) {
+            float denom = 2.0 * log(pc.freq_base);
+            float corr0 = max(0.0, floor(float(pc.n_rot) *
+                log(float(pc.n_ctx_orig) / (pc.beta_fast * 2.0 * 3.141592653589793)) / denom));
+            float corr1 = min(float(pc.n_rot - 1u), ceil(float(pc.n_rot) *
+                log(float(pc.n_ctx_orig) / (pc.beta_slow * 2.0 * 3.141592653589793)) / denom));
+            float y = (float(lane) - corr0) / max(0.001, corr1 - corr0);
+            float mix = (1.0 - clamp(y, 0.0, 1.0)) * pc.ext_factor;
+            theta = theta_interp * (1.0 - mix) + theta_extrap * mix;
+            mscale *= 1.0 + 0.1 * log(1.0 / pc.freq_scale);
+        }
+        const float two_pi = 6.283185307179586;
+        theta -= round(theta / two_pi) * two_pi;
+        rope_cos[lane] = cos(theta) * mscale;
+        rope_sin[lane] = (pc.inverse != 0 ? -1.0 : 1.0) * sin(theta) * mscale;
     }
-    const float two_pi = 6.283185307179586;
-    theta -= round(theta / two_pi) * two_pi;
-    float c = cos(theta) * mscale;
-    float s = sin(theta) * mscale;
-    if (pc.inverse != 0) s = -s;
-    float v0 = x_buf[off + i];
-    float v1 = x_buf[off + i + 1u];
-    x_buf[off + i] = v0 * c - v1 * s;
-    x_buf[off + i + 1u] = v0 * s + v1 * c;
+    barrier();
+
+    const uint rotations = pc.n_head * pair_count;
+    for (uint at = lane; at < rotations; at += 256u) {
+        uint head = at / pair_count;
+        uint pair = at - head * pair_count;
+        uint i = pair * 2u;
+        uint row = token * pc.n_head + head;
+        uint off = row * pc.head_dim + (pc.head_dim - pc.n_rot);
+        float v0 = x_buf[off + i];
+        float v1 = x_buf[off + i + 1u];
+        float c = rope_cos[pair];
+        float s = rope_sin[pair];
+        x_buf[off + i] = v0 * c - v1 * s;
+        x_buf[off + i + 1u] = v0 * s + v1 * c;
+    }
 }

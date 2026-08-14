@@ -2936,8 +2936,7 @@ int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
                   beta_fast, beta_slow};
         vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(push), &push);
-        const uint64_t tile_pairs = (uint64_t)tile_n * pairs_per_token;
-        const uint32_t groups = (uint32_t)((tile_pairs + 255u) / 256u);
+        const uint32_t groups = tile_n;
         if (groups == 0 || groups > 65535u) {
             if (!release_simple_descriptors(set)) return 0;
             return fail_simple_dispatch(ctx);

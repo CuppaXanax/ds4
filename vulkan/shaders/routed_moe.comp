@@ -1,5 +1,4 @@
 #version 460 core
-#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -8,7 +7,7 @@ layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
 layout(set = 0, binding = 2) readonly buffer B2 { uint b2[]; };
 layout(set = 0, binding = 3) readonly buffer B3 { uint b3[]; };
 layout(set = 0, binding = 4) buffer B4 { uint b4[]; };
-layout(set = 0, binding = 5) buffer B5 { uint b5[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { uint b5[]; };
 
 layout(push_constant) uniform PC {
     uint mode;
@@ -31,8 +30,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float q8_values[256];
-
-#include "iq2_tables.glsl"
+shared uint iq2_lut[544];
 
 uint weight_byte(uint byte_idx, uint total_bytes) {
     if (byte_idx >= total_bytes) return 0u;
@@ -60,18 +58,23 @@ int packed_i8(uint word, uint byte_idx) {
     return v < 128u ? int(v) : int(v) - 256;
 }
 
+void iq2_grid_words(uint index, out uint lo, out uint hi) {
+    lo = iq2_lut[index * 2u];
+    hi = iq2_lut[index * 2u + 1u];
+}
+
+uint iq2_sign_mask(uint index) {
+    uint word = iq2_lut[512u + (index >> 2u)];
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
 int input_i8(uint byte_idx) {
     uint v = (b0[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
     return v < 128u ? int(v) : int(v) - 256;
 }
 
 float f16(uint h) {
-    uint s = h & 0x8000u;
-    uint e = (h >> 10u) & 31u;
-    uint m = h & 1023u;
-    if (e == 0u) return (s != 0u ? -1.0 : 1.0) * (float(m) * exp2(-24.0));
-    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
-    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) * exp2(float(e) - 15.0);
+    return unpackHalf2x16(h).x;
 }
 
 float q8_value(uint token, uint block, uint i) {
@@ -214,11 +217,16 @@ float iq2_block_dot(uint row_byte, uint input_token, uint input_blocks,
             uint s1 = (a >> (14u * pair + 7u)) & 127u;
             uint g0 = (q >> (16u * pair)) & 255u;
             uint g1 = (q >> (16u * pair + 8u)) & 255u;
+            uint grid0_lo, grid0_hi, grid1_lo, grid1_hi;
+            iq2_grid_words(g0, grid0_lo, grid0_hi);
+            iq2_grid_words(g1, grid1_lo, grid1_hi);
+            uint signs0 = iq2_sign_mask(s0);
+            uint signs1 = iq2_sign_mask(s1);
             for (uint j = 0u; j < 8u; ++j) {
-                int v0 = int(iq2_grid[g0 * 8u + j]);
-                int v1 = int(iq2_grid[g1 * 8u + j]);
-                if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
-                if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
+                int v0 = packed_i8(j < 4u ? grid0_lo : grid0_hi, j);
+                int v1 = packed_i8(j < 4u ? grid1_lo : grid1_hi, j);
+                if ((signs0 & (1u << j)) != 0u) v0 = -v0;
+                if ((signs1 & (1u << j)) != 0u) v1 = -v1;
                 int q80 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + j);
                 int q81 = input_i8((xb + 1u) * 4u + ib * 32u + pair * 16u + 8u + j);
                 sum += int(ls) * (v0 * q80 + v1 * q81);
@@ -248,16 +256,21 @@ float iq2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
             uint s1 = (a >> (14u * pair + 7u)) & 127u;
             uint g0 = (q >> (16u * pair)) & 255u;
             uint g1 = (q >> (16u * pair + 8u)) & 255u;
+            uint grid0_lo, grid0_hi, grid1_lo, grid1_hi;
+            iq2_grid_words(g0, grid0_lo, grid0_hi);
+            iq2_grid_words(g1, grid1_lo, grid1_hi);
+            uint signs0 = iq2_sign_mask(s0);
+            uint signs1 = iq2_sign_mask(s1);
             uint q8_word = xb + 1u + ib * 8u + pair * 4u;
             uint q80_lo = b0[q8_word];
             uint q80_hi = b0[q8_word + 1u];
             uint q81_lo = b0[q8_word + 2u];
             uint q81_hi = b0[q8_word + 3u];
             for (uint j = 0u; j < 8u; ++j) {
-                int v0 = int(iq2_grid[g0 * 8u + j]);
-                int v1 = int(iq2_grid[g1 * 8u + j]);
-                if ((iq2_signs[s0] & (1u << j)) != 0u) v0 = -v0;
-                if ((iq2_signs[s1] & (1u << j)) != 0u) v1 = -v1;
+                int v0 = packed_i8(j < 4u ? grid0_lo : grid0_hi, j);
+                int v1 = packed_i8(j < 4u ? grid1_lo : grid1_hi, j);
+                if ((signs0 & (1u << j)) != 0u) v0 = -v0;
+                if ((signs1 & (1u << j)) != 0u) v1 = -v1;
                 uint q80_word = j < 4u ? q80_lo : q80_hi;
                 uint q81_word = j < 4u ? q81_lo : q81_hi;
                 int q80 = packed_i8(q80_word, j);
@@ -292,6 +305,63 @@ float reduce_row_sum(float value, uint lanes_per_row) {
     return q8_values[lid - lane];
 }
 
+void quantize_block_parallel(uint token, uint block, uint count) {
+    uint lid = gl_LocalInvocationIndex;
+    uint input_index = block * count + lid;
+    float value = lid < count && input_index < pc.in_dim
+        ? uintBitsToFloat(b0[token * pc.in_dim + input_index])
+        : 0.0;
+    q8_values[lid] = value;
+    iq2_lut[lid] = floatBitsToUint(abs(value));
+    iq2_lut[256u + lid] = lid;
+    barrier();
+    for (uint stride = 128u; stride != 0u; stride >>= 1u) {
+        if (lid < stride) {
+            float right = uintBitsToFloat(iq2_lut[lid + stride]);
+            float left = uintBitsToFloat(iq2_lut[lid]);
+            if (right > left) {
+                iq2_lut[lid] = iq2_lut[lid + stride];
+                iq2_lut[256u + lid] = iq2_lut[256u + lid + stride];
+            }
+        }
+        barrier();
+    }
+    uint stride = pc.gate_type == 8u ? 36u : 292u;
+    uint base = token * pc.q8_blocks * stride + block * stride;
+    if (lid == 0u) {
+        float maximum = uintBitsToFloat(iq2_lut[0]);
+        float selected = q8_values[iq2_lut[256u]];
+        float inv = pc.gate_type == 8u
+            ? (maximum == 0.0 ? 0.0 : 127.0 / maximum)
+            : (selected == 0.0 ? 0.0 : -127.0 / selected);
+        iq2_lut[543u] = floatBitsToUint(inv);
+        b4[base / 4u] = floatBitsToUint(inv == 0.0 ? 0.0 : 1.0 / inv);
+    }
+    barrier();
+    float inv = uintBitsToFloat(iq2_lut[543u]);
+    uint q8_count = pc.gate_type == 8u ? 32u : 256u;
+    if (lid < q8_count / 4u) {
+        uint i = lid * 4u;
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; ++j)
+            packed |= (uint(int(clamp(roundEven(q8_values[i + j] * inv),
+                                      -128.0, 127.0))) & 255u) << (8u * j);
+        b4[base / 4u + 1u + lid] = packed;
+    }
+    if (pc.gate_type != 8u && lid < 8u) {
+        int sum0 = 0;
+        int sum1 = 0;
+        for (uint j = 0u; j < 16u; ++j) {
+            sum0 += int(clamp(roundEven(q8_values[lid * 32u + j] * inv),
+                              -128.0, 127.0));
+            sum1 += int(clamp(roundEven(q8_values[lid * 32u + 16u + j] * inv),
+                              -128.0, 127.0));
+        }
+        b4[base / 4u + 65u + lid] =
+            (uint(sum0) & 65535u) | ((uint(sum1) & 65535u) << 16u);
+    }
+}
+
 void main() {
     uint lid = gl_LocalInvocationIndex;
     uint token = gl_WorkGroupID.y;
@@ -305,41 +375,7 @@ void main() {
         uint block = gl_WorkGroupID.x;
         if (token >= pc.n_tokens || block >= pc.q8_blocks) return;
         uint count = pc.gate_type == 8u ? 32u : 256u;
-        uint input_index = block * count + lid;
-        q8_values[lid] = lid < count && input_index < pc.in_dim ?
-            uintBitsToFloat(b0[token * pc.in_dim + input_index]) : 0.0;
-        barrier();
-        if (lid == 0u) {
-            float maximum = 0.0;
-            float selected = 0.0;
-            for (uint i = 0u; i < 256u; ++i) {
-            if (abs(q8_values[i]) > maximum) { maximum = abs(q8_values[i]); selected = q8_values[i]; }
-            }
-            uint stride = pc.gate_type == 8u ? 36u : 292u;
-            uint base = token * pc.q8_blocks * stride + block * stride;
-            float inv = pc.gate_type == 8u
-                ? (maximum == 0.0 ? 0.0 : 127.0 / maximum)
-                : (selected == 0.0 ? 0.0 : -127.0 / selected);
-            b4[base / 4u] = floatBitsToUint(inv == 0.0 ? 0.0 : 1.0 / inv);
-            uint q8_count = pc.gate_type == 8u ? 32u : 256u;
-            for (uint i = 0u; i < q8_count; i += 4u) {
-                uint packed = 0u;
-                for (uint j = 0u; j < 4u; ++j)
-                    packed |= (uint(int(clamp(roundEven(q8_values[i + j] * inv),
-                                              -128.0, 127.0))) & 255u) << (8u * j);
-                b4[base / 4u + 1u + i / 4u] = packed;
-            }
-            if (pc.gate_type != 8u) {
-                for (uint i = 0u; i < 16u; ++i) {
-                    int s = 0;
-                    for (uint j = 0u; j < 16u; ++j)
-                        s += int(clamp(roundEven(q8_values[i * 16u + j] * inv), -128.0, 127.0));
-                    uint word = base / 4u + 65u + (i >> 1u);
-                    if ((i & 1u) == 0u) b4[word] = uint(s) & 65535u;
-                    else b4[word] |= (uint(s) & 65535u) << 16u;
-                }
-            }
-        }
+        quantize_block_parallel(token, block, count);
         return;
     }
     if (pc.mode == 1u) {
@@ -359,6 +395,10 @@ void main() {
             if (row_valid && lane == 0u)
                 b4[(token * pc.n_selected + rank) * pc.mid_dim + row] = 0u;
             return;
+        }
+        if (pc.gate_type == 16u) {
+            for (uint i = lid; i < 544u; i += 256u) iq2_lut[i] = b5[i];
+            barrier();
         }
         uint rb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
         float partial = 0.0;
@@ -413,6 +453,10 @@ void main() {
             if (row_valid && lane == 0u)
                 b4[(token * pc.n_selected + rank) * pc.out_dim + row] = 0u;
             return;
+        }
+        if (pc.down_type == 16u) {
+            for (uint i = lid; i < 544u; i += 256u) iq2_lut[i] = b5[i];
+            barrier();
         }
         uint rb = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
         uint q8_token = token * pc.n_selected + rank;

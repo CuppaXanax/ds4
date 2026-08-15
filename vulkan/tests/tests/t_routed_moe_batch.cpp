@@ -601,6 +601,30 @@ static int test_routed_moe_batch(void) {
                                  gate_offset, up_offset, down_offset,
                                  gate_expert_bytes, gate_row_bytes,
                                  down_expert_bytes, down_row_bytes);
+
+        const uint64_t iq2_down_row_bytes = 8 * sizeof(iq2_block);
+        const uint64_t iq2_down_expert_bytes =
+            (uint64_t)out_dim * iq2_down_row_bytes;
+        for (uint32_t e = 0; e < n_total; e++) {
+            for (uint32_t row = 0; row < out_dim; row++) {
+                for (uint32_t block = 0; block < 8; block++) {
+                    iq2_block value{};
+                    value.d = f32_to_f16(0.125f);
+                    std::memcpy(model.data() + down_offset +
+                                    (uint64_t)e * iq2_down_expert_bytes +
+                                    (uint64_t)row * iq2_down_row_bytes +
+                                    (uint64_t)block * sizeof(value),
+                                &value, sizeof(value));
+                }
+            }
+        }
+        rc |= run_moe_batch_case("iq2xxs-all", 16, 16,
+                                 in_dim, mid_dim, out_dim,
+                                 n_total, n_expert, clamp, n_tokens,
+                                 x, sel, wgt, model,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 iq2_down_expert_bytes, iq2_down_row_bytes);
     }
 
     /* ============ Error paths ============================================= */

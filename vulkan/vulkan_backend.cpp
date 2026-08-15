@@ -172,6 +172,7 @@ static struct {
     std::map<std::thread::id, VulkanCommandCtx> cmd_ctxs;
     
     std::unordered_map<void*, TensorHeader*> tensor_headers;
+    ds4_gpu_tensor     routed_iq2_lut;
     
     /* Weight cache: maps model file offset -> VkBuffer with weights copied to
      * GPU.  Ranges are uploaded lazily on first kernel use (see ensure_weight)
@@ -283,7 +284,7 @@ static int select_physical_device(void) {
         VK_VERSION_PATCH(props.driverVersion));
     ds4_vulkan_driver_version = strdup(ver);
 
-    /* Check subgroup support */
+    /* Check subgroup support. */
     VkPhysicalDeviceSubgroupProperties sg{};
     sg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     VkPhysicalDeviceProperties2 p2{};
@@ -417,7 +418,7 @@ static int load_spirv(const std::string &path, std::vector<uint32_t> &out) {
 }
 
 static int create_compute_pipeline(ShaderEntry &entry) {
-    VkDescriptorSetLayoutBinding bindings[8] = {};
+    VkDescriptorSetLayoutBinding bindings[9] = {};
     for (uint32_t i = 0; i < entry.binding_count; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -490,6 +491,7 @@ static int load_all_shaders(void) {
         {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
         {"router_select", 24, 7}, /* n_tokens, hash_rows, token, bias/hash, scale */
         {"routed_moe", 68, 6}, /* canonical Q8_K/IQ2_XXS/Q2_K routed MoE */
+        {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -5371,6 +5373,26 @@ static void ds4gk_iq2xxs_ensure(void) {
     std::call_once(ds4gk_iq2xxs_once, ds4gk_iq2xxs_signed_grid_init);
 }
 
+static bool ds4gk_routed_iq2_lut_ensure(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
+    if (g_vk.routed_iq2_lut.ptr) return true;
+    uint32_t words[544] = {};
+    for (uint32_t i = 0; i < 256; i++) {
+        words[i * 2] = (uint32_t)ds4gk_iq2xxs_grid[i];
+        words[i * 2 + 1] = (uint32_t)(ds4gk_iq2xxs_grid[i] >> 32);
+    }
+    for (uint32_t i = 0; i < 128; i++)
+        words[512 + i / 4] |= (uint32_t)ds4gk_ksigns_iq2xs[i] << (8 * (i & 3));
+    ds4_gpu_tensor lut{};
+    if (ds4_gpu_tensor_alloc_on(&lut, 0, sizeof(words)) != 0) return false;
+    if (!ds4_gpu_tensor_write(&lut, 0, words, sizeof(words))) {
+        ds4_gpu_tensor_free_in_place(&lut);
+        return false;
+    }
+    g_vk.routed_iq2_lut = lut;
+    return true;
+}
+
 /* IEEE half -> f32 (copied from ds4.c). */
 static inline float ds4gk_f16_to_f32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -5800,18 +5822,18 @@ static bool ds4gk_routed_model(uint64_t offset, uint64_t bytes,
     return info.range != 0;
 }
 
-static bool ds4gk_routed_dispatch(const char *stage,
-                                  const ds4gk_routed_pc &pc,
-                                  VkDescriptorBufferInfo *buffers,
-                                  uint32_t gx, uint32_t gy, uint32_t gz,
-                                  std::vector<VkDescriptorSet> &sets) {
-    auto si = g_vk.shader_map.find("routed_moe");
+static bool ds4gk_routed_dispatch_shader(
+        const char *shader_name, const char *stage,
+        const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
+        uint32_t buffer_count, uint32_t gx, uint32_t gy, uint32_t gz,
+        std::vector<VkDescriptorSet> &sets) {
+    auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end()) return false;
     auto &ctx = get_cmd_ctx();
     if (!ctx.recording && !begin_cmd()) return false;
     auto &shader = g_vk.shaders[si->second];
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (!allocate_simple_descriptors(shader, buffers, 6, set)) return false;
+    if (!allocate_simple_descriptors(shader, buffers, buffer_count, set)) return false;
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             shader.layout, 0, 1, &set, 0, nullptr);
@@ -5825,7 +5847,7 @@ static bool ds4gk_routed_dispatch(const char *stage,
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             ctx.timestamp_pool, first_query);
     }
-    timeline_dispatch(ctx, stage, buffers, 6, gx, gy, gz);
+    timeline_dispatch(ctx, stage, buffers, buffer_count, gx, gy, gz);
     ctx.command_count++;
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -5848,6 +5870,15 @@ static bool ds4gk_routed_dispatch(const char *stage,
     }
     sets.push_back(set);
     return true;
+}
+
+static bool ds4gk_routed_dispatch(const char *stage,
+                                  const ds4gk_routed_pc &pc,
+                                  VkDescriptorBufferInfo *buffers,
+                                  uint32_t gx, uint32_t gy, uint32_t gz,
+                                  std::vector<VkDescriptorSet> &sets) {
+    return ds4gk_routed_dispatch_shader(
+        "routed_moe", stage, pc, buffers, 6, gx, gy, gz, sets);
 }
 
 static uint32_t ds4gk_routed_projection_groups(uint32_t rows,
@@ -5978,15 +6009,17 @@ static bool ds4gk_routed_common(
     pc = {0, gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
-          (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
-    VkDescriptorBufferInfo q8_info, invalid_info;
-    ok = ds4gk_routed_buffer(&q8, q8_info) &&
-         ds4gk_routed_buffer(&invalid, invalid_info);
-    if (ok) {
+             (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
+    VkDescriptorBufferInfo q8_info, invalid_info, iq2_lut_info;
+    ok = ds4gk_routed_iq2_lut_ensure() &&
+         ds4gk_routed_buffer(&q8, q8_info) &&
+            ds4gk_routed_buffer(&invalid, invalid_info) &&
+         ds4gk_routed_buffer(&g_vk.routed_iq2_lut, iq2_lut_info);
+     if (ok) {
         pc.mode = 5;
         VkDescriptorBufferInfo validate_buffers[6] = {
             selected_info, selected_info, selected_info, selected_info,
-            invalid_info, invalid_info};
+            invalid_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("validate_selected", pc,
             validate_buffers, 1, n_tokens, 1, sets) &&
              ds4gk_routed_flush(sets);
@@ -5998,7 +6031,7 @@ static bool ds4gk_routed_common(
     }
     if (ok) {
         VkDescriptorBufferInfo quantize_buffers[6] = {
-            x_info, x_info, x_info, x_info, q8_info, q8_info};
+            x_info, x_info, x_info, x_info, q8_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("quantize_input", pc,
             quantize_buffers, gate_blocks, n_tokens, 1, sets);
         if (ok && getenv("DS4_VULKAN_DEBUG")) {
@@ -6012,6 +6045,7 @@ static bool ds4gk_routed_common(
             }
         }
     }
+    bool fused_gate_up = false;
     if (ok) {
         pc.mode = 1;
         const char *iq2_words_env = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
@@ -6020,28 +6054,43 @@ static bool ds4gk_routed_common(
         const bool iq2_words = gate_type == 16 && (gate_bytes & 3u) == 0u &&
             (!iq2_words_env || strcmp(iq2_words_env, "0") != 0);
         pc.q2_words = iq2_words ? 1u : 0u;
-        VkDescriptorBufferInfo gate_buffers[6] = {
-            q8_info, gate_model, gate_model, selected_info, gate_info, gate_info};
-        ok = ds4gk_routed_dispatch(iq2_words ? "gate_iq2_words" : "gate", pc,
-            gate_buffers,
-            ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
-            n_tokens, n_expert, sets);
-        if (ok) {
-            pc.add_enabled = 1;
-            VkDescriptorBufferInfo up_buffers[6] = {
-                q8_info, up_model, up_model, selected_info, up_info, up_info};
-            ok = ds4gk_routed_dispatch(iq2_words ? "up_iq2_words" : "up", pc,
-                up_buffers,
+        fused_gate_up = iq2_words &&
+            g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end();
+        if (fused_gate_up) {
+            VkDescriptorBufferInfo fused_buffers[9] = {
+                q8_info, gate_model, up_model, selected_info, gate_info,
+                up_info, mid_info, weights_info, iq2_lut_info};
+            ok = ds4gk_routed_dispatch_shader(
+                "routed_moe_fused", "gate_up_swiglu_iq2", pc,
+                fused_buffers, 9,
                 ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
                 n_tokens, n_expert, sets);
-            pc.add_enabled = 0;
+        } else {
+            VkDescriptorBufferInfo gate_buffers[6] = {
+                q8_info, gate_model, gate_model, selected_info, gate_info,
+                iq2_lut_info};
+            ok = ds4gk_routed_dispatch(iq2_words ? "gate_iq2_words" : "gate", pc,
+                gate_buffers,
+                ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
+                n_tokens, n_expert, sets);
+            if (ok) {
+                pc.add_enabled = 1;
+                VkDescriptorBufferInfo up_buffers[6] = {
+                    q8_info, up_model, up_model, selected_info, up_info,
+                    iq2_lut_info};
+                ok = ds4gk_routed_dispatch(iq2_words ? "up_iq2_words" : "up", pc,
+                    up_buffers,
+                    ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
+                    n_tokens, n_expert, sets);
+                pc.add_enabled = 0;
+            }
         }
         pc.q2_words = 0;
     }
-    if (ok) {
+    if (ok && !fused_gate_up) {
         pc.mode = 2;
         VkDescriptorBufferInfo swiglu_buffers[6] = {
-            gate_info, up_info, weights_info, weights_info, mid_info, mid_info};
+            gate_info, up_info, weights_info, weights_info, mid_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("swiglu", pc,
             swiglu_buffers,
             (expert_mid_dim + 255u) / 256u, n_tokens, n_expert, sets);
@@ -6051,7 +6100,7 @@ static bool ds4gk_routed_common(
         pc.q8_blocks = (uint32_t)mid_blocks;
         pc.n_tokens = n_tokens * n_expert;
         VkDescriptorBufferInfo mid_quantize_buffers[6] = {
-            mid_info, mid_info, mid_info, mid_info, q8_info, q8_info};
+            mid_info, mid_info, mid_info, mid_info, q8_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("requantization", pc,
             mid_quantize_buffers,
             mid_blocks, n_tokens * n_expert, 1, sets);
@@ -6070,7 +6119,7 @@ static bool ds4gk_routed_common(
         pc.mode = 3; pc.n_tokens = n_tokens;
         pc.q2_words = down_type == 10;
         VkDescriptorBufferInfo down_buffers[6] = {
-            q8_info, down_model, down_model, selected_info, exp_info, exp_info};
+            q8_info, down_model, down_model, selected_info, exp_info, iq2_lut_info};
         const char *down_stage = pc.q2_words ? "down_words" : "down_raw";
         ok = ds4gk_routed_dispatch(down_stage, pc,
             down_buffers,
@@ -6086,7 +6135,7 @@ static bool ds4gk_routed_common(
     if (ok) {
         pc.mode = 4; pc.add_enabled = add_in ? 1u : 0u;
         VkDescriptorBufferInfo reduce_buffers[6] = {
-            add_info, exp_info, out_info, out_info, out_info, out_info};
+            add_info, exp_info, out_info, out_info, out_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("reduction", pc,
             reduce_buffers,
             (out_dim + 255u) / 256u, n_tokens, 1, sets);

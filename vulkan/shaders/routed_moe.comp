@@ -29,6 +29,12 @@ layout(push_constant) uniform PC {
     uint q2_words;
 } pc;
 
+/* 255 is the canonical runtime-switch build. Specialized builds use the
+ * same push-constant and descriptor ABI while compiling unused modes out. */
+#ifndef DS4_ROUTED_MODE
+#define DS4_ROUTED_MODE 255
+#endif
+
 shared float q8_values[256];
 shared uint iq2_lut[544];
 
@@ -39,7 +45,7 @@ uint weight_byte(uint byte_idx, uint total_bytes) {
 
 int weight_i8(uint byte_idx, uint total_bytes) {
     uint v = weight_byte(byte_idx, total_bytes);
-    return v < 128u ? int(v) : int(v) - 256;
+    return bitfieldExtract(int(v), 0, 8);
 }
 
 /* Load four little-endian weight bytes without asking the compiler to recover
@@ -54,8 +60,7 @@ uint weight_u32(uint byte_idx) {
 }
 
 int packed_i8(uint word, uint byte_idx) {
-    uint v = (word >> ((byte_idx & 3u) * 8u)) & 255u;
-    return v < 128u ? int(v) : int(v) - 256;
+    return bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
 }
 
 void iq2_grid_words(uint index, out uint lo, out uint hi) {
@@ -69,8 +74,8 @@ uint iq2_sign_mask(uint index) {
 }
 
 int input_i8(uint byte_idx) {
-    uint v = (b0[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
-    return v < 128u ? int(v) : int(v) - 256;
+    return bitfieldExtract(int(b0[byte_idx >> 2u]),
+                           int((byte_idx & 3u) * 8u), 8);
 }
 
 float f16(uint h) {
@@ -182,10 +187,8 @@ float q2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
                 uint q1 = (q1_word >> ((k & 3u) * 8u + shift)) & 3u;
                 uint q8_word0 = q8_words[k >> 2u];
                 uint q8_word1 = q8_words[4u + (k >> 2u)];
-                int x0 = int((q8_word0 >> ((k & 3u) * 8u)) & 255u);
-                int x1 = int((q8_word1 >> ((k & 3u) * 8u)) & 255u);
-                if (x0 >= 128) x0 -= 256;
-                if (x1 >= 128) x1 -= 256;
+                int x0 = bitfieldExtract(int(q8_word0), int((k & 3u) * 8u), 8);
+                int x1 = bitfieldExtract(int(q8_word1), int((k & 3u) * 8u), 8);
                 isum += int(scale0) * int(q0) * x0;
                 isum += int(scale1) * int(q1) * x1;
             }
@@ -365,12 +368,15 @@ void quantize_block_parallel(uint token, uint block, uint count) {
 void main() {
     uint lid = gl_LocalInvocationIndex;
     uint token = gl_WorkGroupID.y;
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 5
     if (pc.mode == 5u) {
         if (token < pc.n_tokens && lid < pc.n_selected &&
             b0[token * pc.n_selected + lid] >= pc.n_total_expert)
             atomicOr(b4[0], 1u);
         return;
     }
+#endif
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 0
     if (pc.mode == 0u) {
         uint block = gl_WorkGroupID.x;
         if (token >= pc.n_tokens || block >= pc.q8_blocks) return;
@@ -378,6 +384,8 @@ void main() {
         quantize_block_parallel(token, block, count);
         return;
     }
+#endif
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 1
     if (pc.mode == 1u) {
         uint lanes_per_row = pc.q8_blocks <= 8u ? 8u :
                              pc.q8_blocks <= 16u ? 16u :
@@ -424,6 +432,8 @@ void main() {
         }
         return;
     }
+#endif
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 2
     if (pc.mode == 2u) {
         uint row = gl_GlobalInvocationID.x;
         uint rank = gl_WorkGroupID.z;
@@ -436,6 +446,8 @@ void main() {
         b4[at] = floatBitsToUint((g / (1.0 + exp(-g))) * u * uintBitsToFloat(b2[token * pc.n_selected + rank]));
         return;
     }
+#endif
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 3
     if (pc.mode == 3u) {
         uint lanes_per_row = pc.q8_blocks <= 8u ? 8u :
                              pc.q8_blocks <= 16u ? 16u :
@@ -477,6 +489,8 @@ void main() {
             b4[(token * pc.n_selected + rank) * pc.out_dim + row] = floatBitsToUint(v);
         return;
     }
+#endif
+#if DS4_ROUTED_MODE == 255 || DS4_ROUTED_MODE == 4
     if (pc.mode == 4u) {
         uint row = gl_GlobalInvocationID.x;
         if (token >= pc.n_tokens || row >= pc.out_dim) return;
@@ -485,4 +499,5 @@ void main() {
         if (pc.add_enabled != 0u) v += uintBitsToFloat(b0[row]);
         b4[token * pc.out_dim + row] = floatBitsToUint(v);
     }
+#endif
 }

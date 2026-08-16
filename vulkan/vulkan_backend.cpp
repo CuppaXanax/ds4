@@ -138,6 +138,11 @@ struct TensorHeader {
     VmaAllocation  allocation = VK_NULL_HANDLE;
     uint64_t       bytes = 0;
     bool           is_managed = false;
+    /* Mapped host-coherent allocations do not need VMA cache maintenance.
+     * Keep the property on the allocation header so submit/wait can avoid
+     * paying for flush/invalidate calls without changing non-coherent
+     * behavior. */
+    bool           host_coherent = false;
 };
 
 /* ds4_gpu_tensor struct definition comes from ds4_gpu_mgpu.h (the header
@@ -459,11 +464,14 @@ static int load_all_shaders(void) {
         {"swiglu", 16, 6}, {"matmul_f32", 12, 6},
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_aligned", 20, 4},
+        {"matmul_q8_0_aligned_bfe", 20, 4},
+        {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
         {"group_copy", 24, 6},
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
+        {"matmul_f16_fast", 12, 3}, /* FP64 lane dots with chunked reduction */
         {"rms_norm_weight_rows", 12, 6},
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
         {"rope_tail", 52, 6},      /* 7 x uint32 + 6 x float */
@@ -491,6 +499,9 @@ static int load_all_shaders(void) {
         {"output_hc_weights", 16, 4}, /* n_hc, n_tokens, eps, reserved */
         {"router_select", 24, 7}, /* n_tokens, hash_rows, token, bias/hash, scale */
         {"routed_moe", 68, 6}, /* canonical Q8_K/IQ2_XXS/Q2_K routed MoE */
+        {"routed_moe_mode0", 68, 6}, {"routed_moe_mode1", 68, 6},
+        {"routed_moe_mode2", 68, 6}, {"routed_moe_mode3", 68, 6},
+        {"routed_moe_mode4", 68, 6}, {"routed_moe_mode5", 68, 6},
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
     };
     for (auto &l : list) {
@@ -982,7 +993,8 @@ static int end_and_submit(void) {
                 (unsigned long long)c.recording_generation);
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
-        (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
+        if (!header->host_coherent)
+            (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
     VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
@@ -1028,7 +1040,8 @@ static int end_and_submit(void) {
 static void invalidate_live_tensors(void) {
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
-        (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
+        if (!header->host_coherent)
+            (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
 }
 
@@ -1303,7 +1316,15 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     t->bytes = bytes; t->owner = 1;
 
     TensorHeader *h = (TensorHeader*)calloc(1, sizeof(TensorHeader));
+    if (!h) {
+        vmaDestroyBuffer(g_vk.allocator, buf, alloc);
+        free(t);
+        return nullptr;
+    }
     h->buffer = buf; h->allocation = alloc; h->bytes = bytes;
+    VkMemoryPropertyFlags memory_properties = 0;
+    vmaGetAllocationMemoryProperties(g_vk.allocator, alloc, &memory_properties);
+    h->host_coherent = (memory_properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     g_vk.tensor_headers[t->ptr] = h;
     if (getenv("DS4_VULKAN_TIMELINE"))
         timeline_resource(get_cmd_ctx(), TimelineEventKind::TensorAlloc,
@@ -2143,16 +2164,29 @@ static bool shader_f32_domain(uint64_t a, uint64_t b, uint64_t c) {
     return ab == 0 || c <= UINT32_MAX / ab;
 }
 
-static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording) {
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    timeline_barrier(ctx, "simple_compute_dependency");
-    vkCmdPipelineBarrier(ctx.cmd,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+/* Set only around the production full-layer router call whose routed
+ * consumer is guaranteed to carry the deferred selected/weights barrier. */
+static thread_local bool g_router_overlap_hint = false;
+
+extern "C" void ds4_gpu_router_overlap_hint(int active) {
+    g_router_overlap_hint = active != 0;
+}
+
+static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording,
+                                  bool allow_router_defer = false) {
+    const bool defer_router_dependency =
+        allow_router_defer && g_router_overlap_hint && ctx.layer_batch_active;
+    if (!defer_router_dependency) {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        timeline_barrier(ctx, "simple_compute_dependency");
+        vkCmdPipelineBarrier(ctx.cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
     ctx.command_count++;
     if (ctx.attention_output_batch) return 1;
     int ok = submit_and_wait();
@@ -2713,9 +2747,24 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
           (requested_scale_bytes > g_vk.caps.max_storage_buffer_range ||
            requested_payload_bytes > g_vk.caps.max_storage_buffer_range))))
         use_aligned = false;
-    const char *shader_name = use_aligned ? "matmul_q8_0_aligned" :
-                                            "matmul_q8_0_prequant";
+    const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
+    const char *rows8_env = getenv("DS4_VULKAN_Q8_ROWS8");
+    const bool use_rows8 = use_aligned &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
+        !(rows8_env && strcmp(rows8_env, "0") == 0) &&
+        n_tok == 1 && in_dim == 1024 && blocks == 32 &&
+        out_dim == 32768;
+    const char *shader_name = use_rows8
+        ? "matmul_q8_0_rows8_bfe"
+        : (use_aligned
+            ? (q8_mode && strcmp(q8_mode, "exact") == 0
+                ? "matmul_q8_0_aligned" : "matmul_q8_0_aligned_bfe")
+            : "matmul_q8_0_prequant");
     auto si = g_vk.shader_map.find(shader_name);
+    if (si == g_vk.shader_map.end() && use_rows8) {
+        shader_name = "matmul_q8_0_aligned_bfe";
+        si = g_vk.shader_map.find(shader_name);
+    }
     if (si == g_vk.shader_map.end() && use_aligned) {
         use_aligned = false;
         shader_name = "matmul_q8_0_prequant";
@@ -2745,12 +2794,16 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     }
     buffers[descriptor_count++] = {obuf, ooff,
         (VkDeviceSize)(n_tok * out_dim * sizeof(float))};
+    const uint32_t dispatch_x = use_rows8
+        ? (uint32_t)((out_dim + 7u) / 8u) : y_scale;
+    const uint32_t dispatch_y = use_rows8 ? 1u : (uint32_t)y_count64;
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks, y_scale};
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks,
+        use_rows8 ? 8u : y_scale};
     if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader(shader_name, &pc, sizeof(pc),
-                                buffers, descriptor_count, y_scale, (uint32_t)y_count64,
+                                buffers, descriptor_count, dispatch_x, dispatch_y,
                                 (uint32_t)n_tok, resume_recording);
 }
 
@@ -2802,7 +2855,10 @@ int ds4_gpu_matmul_f16_tensor(
         n_tok > UINT64_MAX / out_dim || n_tok * out_dim > out->bytes / sizeof(float))
         return 0;
 
-    auto si = g_vk.shader_map.find("matmul_f16");
+    const char *f16_mode = getenv("DS4_VULKAN_F16_MODE");
+    const char *shader_name = f16_mode && strcmp(f16_mode, "exact") == 0
+        ? "matmul_f16" : "matmul_f16_fast";
+    auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end()) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr, "ds4: [dbg] matmul_f16 shader unavailable\n");
@@ -2907,7 +2963,7 @@ int ds4_gpu_matmul_f16_tensor(
         struct { uint32_t in_dim, out_dim, n_tok; } pc = {
             (uint32_t)in_dim, (uint32_t)out_dim, tile_tokens};
         const bool more_tiles = token_base + tile_tokens < n_tok;
-        if (!record_simple_shader("matmul_f16", &pc, sizeof(pc), bufs, 3,
+        if (!record_simple_shader(shader_name, &pc, sizeof(pc), bufs, 3,
                                   (uint32_t)out_dim, tile_tokens, 1,
                                   more_tiles)) return 0;
         token_base += tile_tokens;
@@ -4874,7 +4930,7 @@ static int dispatch_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weig
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
     timeline_dispatch(ctx, "router_select", buffers, 7, n_tokens, 1, 1);
-    int ok = finish_simple_dispatch(ctx, resume_recording);
+    int ok = finish_simple_dispatch(ctx, resume_recording, true);
     if (!release_simple_descriptors(set)) ok = 0;
     return ok;
 }
@@ -5822,6 +5878,90 @@ static bool ds4gk_routed_model(uint64_t offset, uint64_t bytes,
     return info.range != 0;
 }
 
+static const char *ds4gk_routed_mode_shader(const char *fallback,
+                                             uint32_t mode) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_SPECIALIZED");
+    if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
+        return fallback;
+    if (mode > 5u) return fallback;
+    static const char *const names[] = {
+        "routed_moe_mode0", "routed_moe_mode1", "routed_moe_mode2",
+        "routed_moe_mode3", "routed_moe_mode4", "routed_moe_mode5"};
+    const char *name = names[mode];
+    return g_vk.shader_map.find(name) != g_vk.shader_map.end() ? name : fallback;
+}
+
+/* Routed stages use a fixed descriptor ABI: b4 is the stage output for every
+ * canonical/specialized mode, while the fused gate/up shader additionally
+ * writes b5 and b6. Keep the dependency scoped to those output ranges so a
+ * routed dispatch does not publish unrelated allocations through a global
+ * memory barrier. The next stage may read or reuse the scratch range. */
+static void ds4gk_routed_output_barrier(
+        VulkanCommandCtx &ctx, const char *shader_name,
+        VkDescriptorBufferInfo *buffers, uint32_t buffer_count) {
+    VkBufferMemoryBarrier barriers[3] = {};
+    uint32_t count = 0;
+    auto add = [&](uint32_t binding) {
+        if (binding >= buffer_count || buffers[binding].buffer == VK_NULL_HANDLE ||
+            buffers[binding].range == 0 || count >= 3) return;
+        VkBufferMemoryBarrier &barrier = barriers[count++];
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffers[binding].buffer;
+        barrier.offset = buffers[binding].offset;
+        barrier.size = buffers[binding].range;
+    };
+    add(4);
+    if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
+        add(5);
+        add(6);
+    }
+    if (count == 0) return;
+    timeline_barrier(ctx, "routed_moe_output_dependency");
+    vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                         count, barriers, 0, nullptr);
+}
+
+/* Publish router-selected IDs/weights only when the routed consumer needs
+ * them. This leaves independent shared-expert work between router selection
+ * and the first routed consumer in a layer batch. */
+static void ds4gk_routed_input_barrier(
+        VulkanCommandCtx &ctx, const char *shader_name,
+        const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
+        uint32_t buffer_count) {
+    VkBufferMemoryBarrier barriers[2] = {};
+    uint32_t count = 0;
+    auto add = [&](uint32_t binding) {
+        if (binding >= buffer_count || buffers[binding].buffer == VK_NULL_HANDLE ||
+            buffers[binding].range == 0 || count >= 2) return;
+        VkBufferMemoryBarrier &barrier = barriers[count++];
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffers[binding].buffer;
+        barrier.offset = buffers[binding].offset;
+        barrier.size = buffers[binding].range;
+    };
+    if (pc.mode == 1u || pc.mode == 3u) add(3); /* selected IDs */
+    if (pc.mode == 2u) add(2);                  /* router weights */
+    if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
+        add(7);                                 /* fused weights */
+    if (count == 0) return;
+    timeline_barrier(ctx, "routed_moe_input_dependency");
+    vkCmdPipelineBarrier(ctx.cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, count, barriers, 0, nullptr);
+}
+
 static bool ds4gk_routed_dispatch_shader(
         const char *shader_name, const char *stage,
         const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
@@ -5839,6 +5979,7 @@ static bool ds4gk_routed_dispatch_shader(
                             shader.layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
+    ds4gk_routed_input_barrier(ctx, shader_name, pc, buffers, buffer_count);
     uint32_t first_query = UINT32_MAX;
     if (ctx.routed_profile_enabled && ctx.timestamp_pool != VK_NULL_HANDLE &&
         ctx.timestamp_cursor <= 254) {
@@ -5849,14 +5990,7 @@ static bool ds4gk_routed_dispatch_shader(
     }
     timeline_dispatch(ctx, stage, buffers, buffer_count, gx, gy, gz);
     ctx.command_count++;
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    timeline_barrier(ctx, "routed_moe_compute_dependency");
-    vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
-                         0, nullptr, 0, nullptr);
+    ds4gk_routed_output_barrier(ctx, shader_name, buffers, buffer_count);
     if (first_query != UINT32_MAX) {
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             ctx.timestamp_pool, first_query + 1);
@@ -5878,7 +6012,8 @@ static bool ds4gk_routed_dispatch(const char *stage,
                                   uint32_t gx, uint32_t gy, uint32_t gz,
                                   std::vector<VkDescriptorSet> &sets) {
     return ds4gk_routed_dispatch_shader(
-        "routed_moe", stage, pc, buffers, 6, gx, gy, gz, sets);
+        ds4gk_routed_mode_shader("routed_moe", pc.mode),
+        stage, pc, buffers, 6, gx, gy, gz, sets);
 }
 
 static uint32_t ds4gk_routed_projection_groups(uint32_t rows,
@@ -5910,7 +6045,11 @@ static bool ds4gk_routed_common(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t n_tokens, bool *mid_is_f16) {
+        uint32_t n_tokens, bool *mid_is_f16, bool validate_selected) {
+    /* A layer command batch consumes GPU-produced IDs; the routed shaders
+     * already bounds-check them, so its one-token and batched calls pass
+     * validate_selected=false.  Calls outside a batch retain validation for
+     * focused CPU-written invalid-ID tests. */
     if (mid_is_f16) *mid_is_f16 = false;
     if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
@@ -5992,12 +6131,15 @@ static bool ds4gk_routed_common(
         return false;
     ds4_gpu_tensor q8{}, invalid{};
     if (ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) != 0 ||
-        ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0) {
+        (validate_selected &&
+         ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0)) {
         ds4_gpu_tensor_free_in_place(&q8);
+        ds4_gpu_tensor_free_in_place(&invalid);
         return false;
     }
     const uint32_t zero = 0;
-    if (!ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
+    if (validate_selected &&
+        !ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
         ds4_gpu_tensor_free_in_place(&invalid);
         ds4_gpu_tensor_free_in_place(&q8);
         return false;
@@ -6010,12 +6152,12 @@ static bool ds4gk_routed_common(
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
              (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
-    VkDescriptorBufferInfo q8_info, invalid_info, iq2_lut_info;
+    VkDescriptorBufferInfo q8_info, invalid_info{}, iq2_lut_info;
     ok = ds4gk_routed_iq2_lut_ensure() &&
          ds4gk_routed_buffer(&q8, q8_info) &&
-            ds4gk_routed_buffer(&invalid, invalid_info) &&
+         (!validate_selected || ds4gk_routed_buffer(&invalid, invalid_info)) &&
          ds4gk_routed_buffer(&g_vk.routed_iq2_lut, iq2_lut_info);
-     if (ok) {
+    if (ok && validate_selected) {
         pc.mode = 5;
         VkDescriptorBufferInfo validate_buffers[6] = {
             selected_info, selected_info, selected_info, selected_info,
@@ -6188,7 +6330,8 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
         gate_offset, up_offset, down_offset, gate_type, down_type,
         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-        n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16) ? 1 : 0;
+        n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16,
+        !get_cmd_ctx().layer_batch_active) ? 1 : 0;
 }
 
 /* Prefill routed MoE over n_tokens tokens.  Same math as the single-token
@@ -6294,7 +6437,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(
                 down_expert_bytes, down_row_bytes, expert_in_dim,
                 expert_mid_dim, out_dim, &selected_view, &weights_view,
                 n_total_expert, n_expert, clamp, &x_view, nullptr,
-                tile_tokens, &tile_mid_is_f16) || tile_mid_is_f16)
+                tile_tokens, &tile_mid_is_f16,
+                !get_cmd_ctx().layer_batch_active) || tile_mid_is_f16)
             return 0;
         token_base += tile_tokens;
     }

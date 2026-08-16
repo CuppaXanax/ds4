@@ -19989,6 +19989,9 @@ extern void ds4_gpu_set_decode_attn_rope_fuse(
         uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig,
         bool inverse, float freq_base, float freq_scale, float ext_factor,
         float attn_factor, float beta_fast, float beta_slow);
+#ifdef DS4_VULKAN_BUILD
+extern void ds4_gpu_router_overlap_hint(int active);
+#endif
 extern int ds4_gpu_kv_rope_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv, ds4_gpu_tensor *raw_cache, uint32_t raw_cap,
         uint32_t row, uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
@@ -23863,7 +23866,16 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok && router_shared_done == 0 && router_only_done == 0)
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
                                                      DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
-        if (ok && !router_project_select_fused)
+        if (ok && !router_project_select_fused) {
+#if defined(DS4_VULKAN_BUILD)
+            const bool router_overlap_active =
+                phase == METAL_DECODE_LAYER_FULL &&
+                !g->ssd_streaming && !g->quality && g->tp_world < 2 &&
+                !decode_stage_profile && !g->cuda_tp_decode &&
+                !g->cuda_tp_moe && !g->cuda_tp_shared &&
+                fuse_shared_gate_up;
+            ds4_gpu_router_overlap_hint(router_overlap_active ? 1 : 0);
+#endif
             ok = ds4_gpu_router_select_tensor(metal_graph_router_selected(g), metal_graph_router_weights(g), metal_graph_router_probs(g),
                                                     model->map, model->size,
                                                     layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
@@ -23878,6 +23890,10 @@ static bool metal_graph_encode_decode_layer_phase(
                                                     layer->ffn_exp_probs_b != NULL,
                                                     layer->ffn_gate_tid2eid != NULL,
                                                     metal_graph_router_logits(g)) != 0;
+#if defined(DS4_VULKAN_BUILD)
+            ds4_gpu_router_overlap_hint(0);
+#endif
+        }
         }
         if (ok) ok = metal_graph_decode_set_hash_selected_override(model,
                                                                    layer,
@@ -24753,6 +24769,35 @@ static bool metal_graph_encode_decode_layer_phase(
         parallel_full_ffn = false;
 #endif
     }
+    /* On the Vulkan single-GPU path the shared expert depends only on
+     * ffn_norm, not on router-selected IDs. Record its fused gate/up work
+     * before the routed consumer so it can overlap the router completion in
+     * the layer command batch. Keep streaming, split-phase, profiling, TP,
+     * and already-fused paths on their existing ordering. */
+    bool shared_gate_up_prelaunched = false;
+#if defined(DS4_VULKAN_BUILD)
+    if (ok && phase == METAL_DECODE_LAYER_FULL && !external_routed &&
+        !g->ssd_streaming && !decode_stage_profile &&
+        !g->cuda_tp_decode && !g->cuda_tp_shared &&
+        !tp_fold_ffn && !cuda_tp_moe && !parallel_full_ffn &&
+        !overlap_selected_shared && router_shared_done == 0 &&
+        fuse_shared_gate_up) {
+        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                metal_graph_shared_gate(g),
+                metal_graph_shared_up(g),
+                metal_graph_shared_mid(g),
+                model->map,
+                model->size,
+                layer->ffn_gate_shexp->abs_offset,
+                layer->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD,
+                shared_dim,
+                metal_graph_ffn_norm(g),
+                DS4_SWIGLU_CLAMP_EXP) != 0;
+        shared_gate_up_prelaunched = ok;
+        DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    }
+#endif
     if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
@@ -24858,7 +24903,8 @@ static bool metal_graph_encode_decode_layer_phase(
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                                tp_half, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
-    } else if (ok && fuse_shared_gate_up && router_shared_done == 0) {
+    } else if (ok && fuse_shared_gate_up && router_shared_done == 0 &&
+               !shared_gate_up_prelaunched) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
                                                          metal_graph_shared_up(g),
                                                          metal_graph_shared_mid(g),
@@ -24870,7 +24916,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                          shared_dim,
                                                          metal_graph_ffn_norm(g),
                                                          DS4_SWIGLU_CLAMP_EXP) != 0;
-    } else if (router_shared_done == 0) {
+    } else if (router_shared_done == 0 && !shared_gate_up_prelaunched) {
         if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_gate(g),
                                                            model,
                                                            layer->ffn_gate_shexp,

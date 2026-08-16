@@ -53,8 +53,7 @@ uint up_weight_u32(uint byte_idx) {
 }
 
 int packed_i8(uint word, uint byte_idx) {
-    uint value = (word >> ((byte_idx & 3u) * 8u)) & 255u;
-    return value < 128u ? int(value) : int(value) - 256;
+    return bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
 }
 
 float f16(uint value) {

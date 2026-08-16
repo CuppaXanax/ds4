@@ -7737,6 +7737,12 @@ static bool ffn_replay_track_source(FfnReplayBody &body, uint64_t source) {
     return true;
 }
 
+static uint32_t ffn_replay_env_enabled(const char *name, bool default_value) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return default_value ? 1u : 0u;
+    return (value[0] == '0' || value[0] == 'n' || value[0] == 'N') ? 0u : 1u;
+}
+
 /* Record and replay the strict single-GPU Flash FFN body.  The body contains
  * no position-dependent state: router IDs/weights are written by the first
  * dispatch and consumed directly by the routed shaders.  Each command-ring
@@ -7795,9 +7801,24 @@ extern "C" int ds4_gpu_vulkan_ffn_replay_one(
         args->expert_in_dim, args->expert_mid_dim, args->routed_out_dim,
         args->shared_dim, args->n_total_expert, args->n_expert,
         args->n_expert_used, args->n_embd, args->n_hc,
-        args->router_has_bias ? 1u : 0u};
+        args->router_has_bias ? 1u : 0u,
+        /* These values select different push constants, descriptors, or
+         * shader binaries.  Keep them in the cache identity even though
+         * normal production never mutates the environment mid-token. */
+        ffn_replay_env_enabled("DS4_VULKAN_ROUTED_IQ2_WORDS", true),
+        ffn_replay_env_enabled("DS4_VULKAN_ROUTED_MID_ONLY", true),
+        ffn_replay_env_enabled("DS4_VULKAN_ROUTED_DOWN_REDUCE", true),
+        ffn_replay_env_enabled("DS4_VULKAN_ROUTED_WAVE64", true),
+        ffn_replay_env_enabled("DS4_VULKAN_Q8_WAVE64", true),
+        ffn_replay_env_enabled("DS4_VULKAN_Q8_ROWS2", true),
+        ffn_replay_env_enabled("DS4_VULKAN_Q8_ROWS8", true),
+        (getenv("DS4_VULKAN_Q8_MODE") &&
+         strcmp(getenv("DS4_VULKAN_Q8_MODE"), "exact") == 0) ? 1u : 0u};
+    uint32_t clamp_bits = 0;
+    memcpy(&clamp_bits, &args->clamp, sizeof(clamp_bits));
     key.insert(key.end(), scalar_key, scalar_key +
                sizeof(scalar_key) / sizeof(scalar_key[0]));
+    key.push_back(clamp_bits);
 
     for (FfnReplayBody &body : ctx.ffn_replay_bodies) {
         if (body.key != key) continue;

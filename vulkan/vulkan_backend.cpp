@@ -530,6 +530,7 @@ static int load_all_shaders(void) {
         {"routed_moe_mode2", 68, 6}, {"routed_moe_mode3", 68, 6},
         {"routed_moe_mode4", 68, 6}, {"routed_moe_mode5", 68, 6},
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
+        {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
     };
     for (auto &l : list) {
@@ -6456,10 +6457,9 @@ static const char *ds4gk_routed_mode_shader(const char *fallback,
 }
 
 /* The production Flash decode appliance already keeps router IDs and route
- * weights on the device for the whole layer command batch.  On that narrow
- * shape, gate/up are consumed only by the fused IQ2 SwiGLU stage; no later
- * stage reads their f32 scratch tensors.  Let the fused shader skip those
- * two stores while retaining the generic/public ABI everywhere else. */
+ * weights on the device for the whole layer command batch. On that narrow
+ * shape a compact fused shader writes Q8 mid directly; gate/up/f32-mid
+ * tensors and their descriptor bindings do not exist. */
 static bool ds4gk_routed_mid_only_appliance(
         uint32_t gate_type, uint32_t down_type,
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
@@ -6467,7 +6467,10 @@ static bool ds4gk_routed_mid_only_appliance(
     const char *enabled = getenv("DS4_VULKAN_ROUTED_MID_ONLY");
     if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
         return false;
-    return get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
+    const char *iq2_words = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
+    if (iq2_words && strcmp(iq2_words, "0") == 0) return false;
+    return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
+        get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
         gate_type == 16u && down_type == 10u &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u &&
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
@@ -6492,9 +6495,9 @@ static bool ds4gk_routed_down_reduce_appliance(
 }
 
 /* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
- * while the fused gate/up shader additionally writes b5 and b6 (or only b6
- * in its production mid-only appliance mode). The compact Q2 appliance has
- * its output at b3 because it does not bind the dead expert-output scratch.
+ * while the generic fused gate/up shader additionally writes b5 and b6. The
+ * compact mid-only shader writes b4; the compact Q2 appliance writes b3
+ * because it does not bind the dead expert-output scratch.
  * Keep dependencies scoped to actual output ranges so routed dispatches do
  * not publish unrelated allocations through a global memory barrier. */
 static void ds4gk_routed_output_barrier(
@@ -6558,6 +6561,8 @@ static void ds4gk_routed_input_barrier(
     if (pc.mode == 2u) add(2);                  /* router weights */
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
         add(7);                                 /* fused weights */
+    if (shader_name && strcmp(shader_name, "routed_moe_fused_mid") == 0)
+        add(5);                                 /* compact fused weights */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_input_dependency");
     vkCmdPipelineBarrier(ctx.cmd,
@@ -6662,9 +6667,11 @@ static bool ds4gk_routed_common(
     const bool fused_down_reduce = ds4gk_routed_down_reduce_appliance(
         down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
+    const bool mid_only = ds4gk_routed_mid_only_appliance(
+        gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert, n_tokens);
     if (mid_is_f16) *mid_is_f16 = false;
-    if (!out || !gate || !up || !mid || (!experts && !fused_down_reduce) ||
-        !selected || !weights ||
+    if (!out || !mid || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
         expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
         (gate_type != 8 && gate_type != 10 && gate_type != 16) ||
@@ -6705,18 +6712,55 @@ static bool ds4gk_routed_common(
         selected->bytes < selected_values * sizeof(int32_t) ||
         weights->bytes < selected_values * sizeof(float) ||
         x->bytes < x_values * sizeof(float) ||
-        gate->bytes < pair_values * sizeof(float) || up->bytes < pair_values * sizeof(float) ||
-        mid->bytes < pair_values * sizeof(float) ||
-        (!fused_down_reduce && experts->bytes < expert_values * sizeof(float)) ||
+        (gate && gate->bytes < pair_values * sizeof(float)) ||
+        (up && up->bytes < pair_values * sizeof(float)) ||
+        (experts && experts->bytes < expert_values * sizeof(float)) ||
         out->bytes < out_values * sizeof(float) ||
         (add_in && add_in->bytes < (uint64_t)out_dim * sizeof(float)))
         return false;
+
+    /* The decode appliance does not expose gate/up or per-expert down
+     * intermediates. Keep the public API fallback intact by allocating those
+     * tensors only when a diagnostic switch or unsupported shape selects the
+     * generic stages. The destructor also covers every early-return path. */
+    struct RoutedOwnedScratch {
+        ds4_gpu_tensor gate{}, up{}, mid{}, experts{};
+        ~RoutedOwnedScratch() {
+            ds4_gpu_tensor_free_in_place(&experts);
+            ds4_gpu_tensor_free_in_place(&mid);
+            ds4_gpu_tensor_free_in_place(&up);
+            ds4_gpu_tensor_free_in_place(&gate);
+        }
+    } owned;
+    const uint64_t pair_bytes = pair_values * sizeof(float);
+    const uint64_t expert_bytes = expert_values * sizeof(float);
+    if (!gate && !mid_only) {
+        if (ds4_gpu_tensor_alloc_on(&owned.gate, 0, pair_bytes) != 0)
+            return false;
+        gate = &owned.gate;
+    }
+    if (!up && !mid_only) {
+        if (ds4_gpu_tensor_alloc_on(&owned.up, 0, pair_bytes) != 0)
+            return false;
+        up = &owned.up;
+    }
+    if (!mid_only && mid->bytes < pair_bytes) {
+        if (ds4_gpu_tensor_alloc_on(&owned.mid, 0, pair_bytes) != 0)
+            return false;
+        mid = &owned.mid;
+    }
+    if (!experts && !fused_down_reduce) {
+        if (ds4_gpu_tensor_alloc_on(&owned.experts, 0, expert_bytes) != 0)
+            return false;
+        experts = &owned.experts;
+    }
 
     VkDescriptorBufferInfo x_info, out_info, gate_info, up_info, mid_info, exp_info;
     VkDescriptorBufferInfo gate_model, up_model, down_model;
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
-        !ds4gk_routed_buffer(gate, gate_info) || !ds4gk_routed_buffer(up, up_info) ||
+        (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
+                       !ds4gk_routed_buffer(up, up_info))) ||
         !ds4gk_routed_buffer(mid, mid_info) ||
         (!fused_down_reduce && !ds4gk_routed_buffer(experts, exp_info)) ||
         !ds4gk_routed_buffer(selected, selected_info) || !ds4gk_routed_buffer(weights, weights_info))
@@ -6729,11 +6773,16 @@ static bool ds4gk_routed_common(
         return false;
 
     uint64_t q8_blocks = 0, q8_bytes = 0;
+    uint64_t input_q8_bytes = 0, mid_q8_bytes = 0;
     const uint64_t q8_stride = gate_type == 8 ? 36 : 292;
     if (!checked_u64_product((uint64_t)n_tokens * n_expert,
                              std::max(gate_blocks, mid_blocks), q8_blocks) ||
         !checked_u64_product(q8_blocks,
                              std::max<uint64_t>(q8_stride, down_type == 8 ? 36 : 292), q8_bytes) ||
+        !checked_u64_product((uint64_t)n_tokens * gate_blocks,
+                             q8_stride, input_q8_bytes) ||
+        !checked_u64_product((uint64_t)n_tokens * n_expert * mid_blocks,
+                             down_type == 8 ? 36u : 292u, mid_q8_bytes) ||
         q8_bytes > UINT32_MAX * (uint64_t)sizeof(uint32_t))
         return false;
     if (gate_blocks > g_vk.caps.max_compute_work_group_count[0] ||
@@ -6744,8 +6793,32 @@ static bool ds4gk_routed_common(
         g_vk.caps.max_compute_work_group_size[0] < 256 ||
         g_vk.caps.max_compute_work_group_invocations < 256)
         return false;
-    ds4_gpu_tensor q8{}, invalid{};
-    if (ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0 ||
+    ds4_gpu_tensor q8{}, compact_mid_q8{}, invalid{};
+    const VkDeviceSize storage_alignment =
+        std::max<VkDeviceSize>(1u,
+            (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment);
+    /* The compact appliance owns each complete 256-value Q8_K block in one
+     * workgroup. It serializes the same 16 projection row tiles inside that
+     * group, preserving their reduction order and the canonical max/rounding
+     * rules while avoiding a device-wide rendezvous and f32 materialization. */
+    const uint64_t mid_q8_offset = mid_only
+        ? (input_q8_bytes + storage_alignment - 1u) /
+              storage_alignment * storage_alignment
+        : 0u;
+    const bool persistent_q8 = mid_only && mid_q8_offset <= mid->bytes &&
+        mid_q8_bytes <= mid->bytes - mid_q8_offset;
+    if (persistent_q8) {
+        q8.ptr = mid->ptr;
+        q8.bytes = input_q8_bytes;
+        q8.owner = 0;
+        q8.device_id = mid->device_id;
+        compact_mid_q8.ptr = (char *)mid->ptr + mid_q8_offset;
+        compact_mid_q8.bytes = mid_q8_bytes;
+        compact_mid_q8.owner = 0;
+        compact_mid_q8.device_id = mid->device_id;
+    }
+    if ((!persistent_q8 &&
+         ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0) ||
         (validate_selected &&
          ds4_gpu_tensor_alloc_host_scratch_in_place(&invalid,
                                                     sizeof(uint32_t)) != 0)) {
@@ -6768,9 +6841,12 @@ static bool ds4gk_routed_common(
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
              (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
-    VkDescriptorBufferInfo q8_info, invalid_info{}, iq2_lut_info;
+    VkDescriptorBufferInfo q8_info, compact_mid_q8_info{}, invalid_info{}, iq2_lut_info;
     ok = ds4gk_routed_iq2_lut_ensure() &&
          ds4gk_routed_buffer(&q8, q8_info) &&
+         (!mid_only || (persistent_q8 &&
+                        ds4gk_routed_buffer(&compact_mid_q8,
+                                            compact_mid_q8_info))) &&
          (!validate_selected || ds4gk_routed_buffer(&invalid, invalid_info)) &&
          ds4gk_routed_buffer(&g_vk.routed_iq2_lut, iq2_lut_info);
     if (ok && validate_selected) {
@@ -6812,16 +6888,19 @@ static bool ds4gk_routed_common(
         const bool iq2_words = gate_type == 16 && (gate_bytes & 3u) == 0u &&
             (!iq2_words_env || strcmp(iq2_words_env, "0") != 0);
         pc.q2_words = iq2_words ? 1u : 0u;
-        fused_gate_up = iq2_words &&
-            g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end();
-        if (fused_gate_up) {
-            const bool mid_only = ds4gk_routed_mid_only_appliance(
-                gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
-                n_total_expert, n_expert, n_tokens);
-            /* add_enabled is unused by routed_moe_fused's generic mode.  In
-             * the bounded appliance it is a source-compatible flag telling
-             * the shader not to materialise dead gate/up f32 outputs. */
-            pc.add_enabled = mid_only ? 1u : 0u;
+        fused_gate_up = iq2_words && (mid_only ||
+            g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
+        if (mid_only) {
+            VkDescriptorBufferInfo fused_buffers[7] = {
+                q8_info, gate_model, up_model, selected_info,
+                compact_mid_q8_info,
+                weights_info, iq2_lut_info};
+            ok = ds4gk_routed_dispatch_shader(
+                "routed_moe_fused_mid", "gate_up_swiglu_iq2_q8", pc,
+                fused_buffers, 7,
+                (expert_mid_dim + 255u) / 256u,
+                n_tokens, n_expert, sets);
+        } else if (fused_gate_up) {
             VkDescriptorBufferInfo fused_buffers[9] = {
                 q8_info, gate_model, up_model, selected_info, gate_info,
                 up_info, mid_info, weights_info, iq2_lut_info};
@@ -6830,7 +6909,6 @@ static bool ds4gk_routed_common(
                 fused_buffers, 9,
                 ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
                 n_tokens, n_expert, sets);
-            pc.add_enabled = 0;
         } else {
             VkDescriptorBufferInfo gate_buffers[6] = {
                 q8_info, gate_model, gate_model, selected_info, gate_info,
@@ -6861,7 +6939,7 @@ static bool ds4gk_routed_common(
             swiglu_buffers,
             (expert_mid_dim + 255u) / 256u, n_tokens, n_expert, sets);
     }
-    if (ok) {
+    if (ok && !mid_only) {
         pc.mode = 0; pc.gate_type = down_type; pc.in_dim = expert_mid_dim;
         pc.q8_blocks = (uint32_t)mid_blocks;
         pc.n_tokens = n_tokens * n_expert;
@@ -6881,13 +6959,19 @@ static bool ds4gk_routed_common(
             }
         }
     }
+    if (mid_only) {
+        pc.gate_type = down_type;
+        pc.in_dim = expert_mid_dim;
+        pc.q8_blocks = (uint32_t)mid_blocks;
+    }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
         pc.q2_words = down_type == 10;
         if (fused_down_reduce) {
             pc.add_enabled = add_in ? 1u : 0u;
             VkDescriptorBufferInfo down_reduce_buffers[5] = {
-                q8_info, down_model, selected_info, out_info, add_info};
+                mid_only ? compact_mid_q8_info : q8_info,
+                down_model, selected_info, out_info, add_info};
             const uint32_t rows_per_group = 32u / n_expert;
             ok = ds4gk_routed_dispatch_shader(
                 "routed_moe_down_reduce_q2", "down_reduce_q2", pc,
@@ -6896,7 +6980,8 @@ static bool ds4gk_routed_common(
                 n_tokens, 1, sets);
         } else {
             VkDescriptorBufferInfo down_buffers[6] = {
-                q8_info, down_model, down_model, selected_info, exp_info,
+                mid_only ? compact_mid_q8_info : q8_info,
+                down_model, down_model, selected_info, exp_info,
                 iq2_lut_info};
             const char *down_stage = pc.q2_words ? "down_words" : "down_raw";
             ok = ds4gk_routed_dispatch(down_stage, pc,

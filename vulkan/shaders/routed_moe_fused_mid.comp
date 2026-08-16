@@ -1,0 +1,262 @@
+#version 460 core
+
+/* Exact Flash IQ2 gate/up + SwiGLU -> Q8_K appliance. One workgroup owns one
+ * 256-value output block. It evaluates the block's 16 row tiles with the same
+ * 16-lane reduction tree as routed_moe_fused.comp, then applies the canonical
+ * routed_moe mode-0 Q8_K quantizer without a global f32 round trip. */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { uint b2[]; };
+layout(set = 0, binding = 3) readonly buffer B3 { uint b3[]; };
+layout(set = 0, binding = 4) buffer B4 { uint b4[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { uint b5[]; };
+layout(set = 0, binding = 6) readonly buffer B6 { uint b6[]; };
+
+layout(push_constant) uniform PC {
+    uint mode;
+    uint gate_type;
+    uint down_type;
+    uint in_dim;
+    uint mid_dim;
+    uint out_dim;
+    uint n_tokens;
+    uint n_selected;
+    uint n_total_expert;
+    uint gate_expert_bytes;
+    uint gate_row_bytes;
+    uint down_expert_bytes;
+    uint down_row_bytes;
+    uint q8_blocks;
+    float clamp_value;
+    uint add_enabled;
+    uint q2_words;
+} pc;
+
+shared float gate_values[256];
+shared float up_values[256];
+shared float mid_values[256];
+shared uint iq2_lut[544];
+
+uint weight_u32(uint byte_idx) {
+    uint word_idx = byte_idx >> 2u;
+    uint shift = (byte_idx & 3u) * 8u;
+    uint lo = b1[word_idx];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (b1[word_idx + 1u] << (32u - shift));
+}
+
+uint up_weight_u32(uint byte_idx) {
+    uint word_idx = byte_idx >> 2u;
+    uint shift = (byte_idx & 3u) * 8u;
+    uint lo = b2[word_idx];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (b2[word_idx + 1u] << (32u - shift));
+}
+
+int packed_i8(uint word, uint byte_idx) {
+    return bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
+}
+
+float f16(uint value) {
+    return unpackHalf2x16(value).x;
+}
+
+void iq2_grid_words(uint index, out uint lo, out uint hi) {
+    lo = iq2_lut[index * 2u];
+    hi = iq2_lut[index * 2u + 1u];
+}
+
+uint iq2_sign_mask(uint index) {
+    uint word = iq2_lut[512u + (index >> 2u)];
+    return (word >> ((index & 3u) * 8u)) & 255u;
+}
+
+void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
+                        uint block, out float gate, out float up) {
+    uint wb = row_byte + block * 66u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    float input_scale = uintBitsToFloat(b0[xb]);
+    float gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
+    float up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
+    int gate_sum = 0;
+    int up_sum = 0;
+    for (uint ib = 0u; ib < 8u; ++ib) {
+        uint qbase = wb + 2u + ib * 8u;
+        uint gate_q = weight_u32(qbase);
+        uint gate_aux = weight_u32(qbase + 4u);
+        uint up_q = up_weight_u32(qbase);
+        uint up_aux = up_weight_u32(qbase + 4u);
+        int gate_ls = int(2u * (gate_aux >> 28u) + 1u);
+        int up_ls = int(2u * (up_aux >> 28u) + 1u);
+        for (uint pair = 0u; pair < 2u; ++pair) {
+            uint q8_word = xb + 1u + ib * 8u + pair * 4u;
+            uint q80_lo = b0[q8_word];
+            uint q80_hi = b0[q8_word + 1u];
+            uint q81_lo = b0[q8_word + 2u];
+            uint q81_hi = b0[q8_word + 3u];
+
+            uint gate_s0 = (gate_aux >> (14u * pair)) & 127u;
+            uint gate_s1 = (gate_aux >> (14u * pair + 7u)) & 127u;
+            uint gate_g0 = (gate_q >> (16u * pair)) & 255u;
+            uint gate_g1 = (gate_q >> (16u * pair + 8u)) & 255u;
+            uint gate_grid0_lo, gate_grid0_hi, gate_grid1_lo, gate_grid1_hi;
+            iq2_grid_words(gate_g0, gate_grid0_lo, gate_grid0_hi);
+            iq2_grid_words(gate_g1, gate_grid1_lo, gate_grid1_hi);
+            uint gate_signs0 = iq2_sign_mask(gate_s0);
+            uint gate_signs1 = iq2_sign_mask(gate_s1);
+
+            uint up_s0 = (up_aux >> (14u * pair)) & 127u;
+            uint up_s1 = (up_aux >> (14u * pair + 7u)) & 127u;
+            uint up_g0 = (up_q >> (16u * pair)) & 255u;
+            uint up_g1 = (up_q >> (16u * pair + 8u)) & 255u;
+            uint up_grid0_lo, up_grid0_hi, up_grid1_lo, up_grid1_hi;
+            iq2_grid_words(up_g0, up_grid0_lo, up_grid0_hi);
+            iq2_grid_words(up_g1, up_grid1_lo, up_grid1_hi);
+            uint up_signs0 = iq2_sign_mask(up_s0);
+            uint up_signs1 = iq2_sign_mask(up_s1);
+
+            for (uint j = 0u; j < 8u; ++j) {
+                int q80 = packed_i8(j < 4u ? q80_lo : q80_hi, j);
+                int q81 = packed_i8(j < 4u ? q81_lo : q81_hi, j);
+
+                int gate_v0 = packed_i8(j < 4u ? gate_grid0_lo : gate_grid0_hi, j);
+                int gate_v1 = packed_i8(j < 4u ? gate_grid1_lo : gate_grid1_hi, j);
+                if ((gate_signs0 & (1u << j)) != 0u) gate_v0 = -gate_v0;
+                if ((gate_signs1 & (1u << j)) != 0u) gate_v1 = -gate_v1;
+                gate_sum += gate_ls * (gate_v0 * q80 + gate_v1 * q81);
+
+                int up_v0 = packed_i8(j < 4u ? up_grid0_lo : up_grid0_hi, j);
+                int up_v1 = packed_i8(j < 4u ? up_grid1_lo : up_grid1_hi, j);
+                if ((up_signs0 & (1u << j)) != 0u) up_v0 = -up_v0;
+                if ((up_signs1 & (1u << j)) != 0u) up_v1 = -up_v1;
+                up_sum += up_ls * (up_v0 * q80 + up_v1 * q81);
+            }
+        }
+    }
+    gate = 0.125 * gate_scale * float(gate_sum);
+    up = 0.125 * up_scale * float(up_sum);
+}
+
+void reduce_pair(float gate, float up, uint lanes_per_row,
+                 out float gate_total, out float up_total) {
+    uint lid = gl_LocalInvocationIndex;
+    uint lane = lid & (lanes_per_row - 1u);
+    gate_values[lid] = gate;
+    up_values[lid] = up;
+    barrier();
+    for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            gate_values[lid] += gate_values[lid + stride];
+            up_values[lid] += up_values[lid + stride];
+        }
+        barrier();
+    }
+    gate_total = gate_values[lid - lane];
+    up_total = up_values[lid - lane];
+}
+
+void quantize_mid_block(uint token, uint rank, uint block) {
+    uint lid = gl_LocalInvocationIndex;
+    iq2_lut[lid] = floatBitsToUint(abs(mid_values[lid]));
+    iq2_lut[256u + lid] = lid;
+    barrier();
+    for (uint stride = 128u; stride != 0u; stride >>= 1u) {
+        if (lid < stride) {
+            float right = uintBitsToFloat(iq2_lut[lid + stride]);
+            float left = uintBitsToFloat(iq2_lut[lid]);
+            if (right > left) {
+                iq2_lut[lid] = iq2_lut[lid + stride];
+                iq2_lut[256u + lid] = iq2_lut[256u + lid + stride];
+            }
+        }
+        barrier();
+    }
+    uint q8_token = token * pc.n_selected + rank;
+    uint base = (q8_token * (pc.mid_dim / 256u) + block) * 73u;
+    if (lid == 0u) {
+        float selected = mid_values[iq2_lut[256u]];
+        float inv = selected == 0.0 ? 0.0 : -127.0 / selected;
+        iq2_lut[543u] = floatBitsToUint(inv);
+        b4[base] = floatBitsToUint(inv == 0.0 ? 0.0 : 1.0 / inv);
+    }
+    barrier();
+    float inv = uintBitsToFloat(iq2_lut[543u]);
+    if (lid < 64u) {
+        uint i = lid * 4u;
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; ++j)
+            packed |= (uint(int(clamp(roundEven(mid_values[i + j] * inv),
+                                      -128.0, 127.0))) & 255u) << (8u * j);
+        b4[base + 1u + lid] = packed;
+    }
+    if (lid < 8u) {
+        int sum0 = 0;
+        int sum1 = 0;
+        for (uint j = 0u; j < 16u; ++j) {
+            sum0 += int(clamp(roundEven(mid_values[lid * 32u + j] * inv),
+                              -128.0, 127.0));
+            sum1 += int(clamp(roundEven(mid_values[lid * 32u + 16u + j] * inv),
+                              -128.0, 127.0));
+        }
+        b4[base + 65u + lid] =
+            (uint(sum0) & 65535u) | ((uint(sum1) & 65535u) << 16u);
+    }
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint token = gl_WorkGroupID.y;
+    uint rank = gl_WorkGroupID.z;
+    uint output_block = gl_WorkGroupID.x;
+    const uint lanes_per_row = 16u;
+    const uint rows_per_tile = 16u;
+    uint lane = lid & (lanes_per_row - 1u);
+    uint row_in_tile = lid / lanes_per_row;
+    if (token >= pc.n_tokens || rank >= pc.n_selected ||
+        output_block >= pc.mid_dim / 256u) return;
+    uint expert = b3[token * pc.n_selected + rank];
+    for (uint i = lid; i < 544u; i += 256u) iq2_lut[i] = b6[i];
+    barrier();
+
+    for (uint tile = 0u; tile < 16u; ++tile) {
+        uint local_row = tile * rows_per_tile + row_in_tile;
+        uint row = output_block * 256u + local_row;
+        float gate_partial = 0.0;
+        float up_partial = 0.0;
+        if (expert < pc.n_total_expert) {
+            uint row_byte = expert * pc.gate_expert_bytes +
+                            row * pc.gate_row_bytes;
+            float gate_block, up_block;
+            iq2_block_dot_pair(row_byte, token, pc.q8_blocks, lane,
+                               gate_block, up_block);
+            gate_partial += gate_block;
+            up_partial += up_block;
+        }
+        float gate, up;
+        reduce_pair(gate_partial, up_partial, lanes_per_row, gate, up);
+        if (lane == 0u) {
+            if (expert >= pc.n_total_expert) {
+                mid_values[local_row] = 0.0;
+            } else {
+                if (pc.clamp_value > 1.0e-6) {
+                    gate = min(gate, pc.clamp_value);
+                    up = clamp(up, -pc.clamp_value, pc.clamp_value);
+                }
+                float activation_clamp = pc.clamp_value > 0.0
+                    ? pc.clamp_value : 3.402823e38;
+                float activated_gate = min(gate, activation_clamp);
+                float activated_up = clamp(up, -activation_clamp,
+                                           activation_clamp);
+                float route_weight = uintBitsToFloat(
+                    b5[token * pc.n_selected + rank]);
+                mid_values[local_row] =
+                    (activated_gate / (1.0 + exp(-activated_gate))) *
+                    activated_up * route_weight;
+            }
+        }
+    }
+    barrier();
+    quantize_mid_block(token, rank, output_block);
+}

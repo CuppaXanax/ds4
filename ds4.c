@@ -17011,6 +17011,18 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
+#if defined(DS4_VULKAN_BUILD)
+    /* The exact decode appliance writes its persistent Q8_K mid directly.
+     * Gate/up, f32 mid, and per-expert down values never leave their fused
+     * dispatches. 292 bytes is one padded Q8_K block in the Vulkan backend. */
+    const uint64_t routed_input_q8_blocks =
+        ((uint64_t)DS4_N_EMBD + 255u) / 256u;
+    const uint64_t routed_mid_q8_blocks =
+        (routed_mid_dim + 255u) / 256u;
+    const uint64_t routed_decode_scratch_bytes =
+        routed_input_q8_blocks * 292u + 255u +
+        (uint64_t)DS4_N_EXPERT_USED * routed_mid_q8_blocks * 292u;
+#endif
     /* Distributed coordinators do not normally own the output head. The
      * logits workspace still has a fixed model-vocabulary shape, while the
      * actual head is encoded only on a node that bound its tensors. */
@@ -17247,6 +17259,13 @@ static bool metal_graph_alloc_raw_cap(
         g->router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT * sizeof(float));
         g->router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(int));
         g->router_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(float));
+#if defined(DS4_VULKAN_BUILD)
+        g->routed_gate_by_tier[t] = NULL;
+        g->routed_up_by_tier[t] = NULL;
+        g->routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                t, routed_decode_scratch_bytes);
+        g->routed_down_by_tier[t] = NULL;
+#else
         g->routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
         g->routed_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
@@ -17255,6 +17274,7 @@ static bool metal_graph_alloc_raw_cap(
                 (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
         g->routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+#endif
         g->routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
         if (g->cuda_tp_decode) {
             g->tp_peer_tmp_by_tier[t] =
@@ -17470,8 +17490,12 @@ static bool metal_graph_alloc_raw_cap(
             g->shared_out_by_tier[t] &&
             g->router_logits_by_tier[t] && g->router_probs_by_tier[t] &&
             g->router_selected_by_tier[t] && g->router_weights_by_tier[t] &&
+#if defined(DS4_VULKAN_BUILD)
+            g->routed_mid_by_tier[t] && g->routed_out_by_tier[t] &&
+#else
             g->routed_gate_by_tier[t] && g->routed_up_by_tier[t] && g->routed_mid_by_tier[t] &&
             g->routed_down_by_tier[t] && g->routed_out_by_tier[t] &&
+#endif
             (!g->cuda_tp_decode || g->tp_peer_tmp_by_tier[t]) &&
             g->after_ffn_hc_by_tier[t] &&
             g->batch_cur_hc_by_tier[t] && g->batch_next_hc_by_tier[t] && g->batch_flat_hc_by_tier[t] &&
@@ -49134,6 +49158,15 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
                                     (DS4_N_HEAD / DS4_N_OUT_GROUP) : 0;
     const uint64_t shared_dim     = DS4_N_FF_EXP;
     const uint64_t routed_mid_dim = DS4_N_FF_EXP;
+#if defined(DS4_VULKAN_BUILD)
+    const uint64_t routed_input_q8_blocks =
+        ((uint64_t)DS4_N_EMBD + 255u) / 256u;
+    const uint64_t routed_mid_q8_blocks =
+        (routed_mid_dim + 255u) / 256u;
+    const uint64_t routed_q8_scratch =
+        routed_input_q8_blocks * 292u + 255u +
+        (uint64_t)DS4_N_EXPERT_USED * routed_mid_q8_blocks * 292u;
+#endif
     const uint64_t vocab_dim      = DS4_N_VOCAB;
     uint64_t output_logits_elems  = vocab_dim;
     const int planner_n_gpus = e ? e->gpu_cfg.n_gpus : 0;
@@ -49251,10 +49284,14 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     total += (uint64_t)DS4_N_EXPERT * sizeof(float);       /* router_probs_by_tier */
     total += (uint64_t)DS4_N_EXPERT_USED * sizeof(int);    /* router_selected_by_tier */
     total += (uint64_t)DS4_N_EXPERT_USED * sizeof(float);  /* router_weights_by_tier */
+#if defined(DS4_VULKAN_BUILD)
+    total += routed_q8_scratch;                                           /* routed Q8 mid */
+#else
     total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_gate */
     total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_up */
     total += (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float); /* routed_mid */
     total += (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);     /* routed_down */
+#endif
     total += (uint64_t)DS4_N_EMBD * sizeof(float);                         /* routed_out */
     total += DS4_CUDA_TP_PEER_TMP_BYTES;                                   /* tp_peer_tmp_by_tier */
     total += hc_dim * sizeof(float);                                       /* after_ffn_hc */

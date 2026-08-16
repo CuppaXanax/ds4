@@ -110,9 +110,20 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 #ifdef DS4_VULKAN_BUILD
+typedef struct {
+    double wall_ms;
+    double gpu_ms;
+    double submit_cpu_ms;
+    double wait_cpu_ms;
+    uint64_t dispatches;
+    uint64_t barriers;
+    uint32_t submissions;
+    uint32_t waits;
+} ds4_gpu_timeline_stats;
 void ds4_gpu_timeline_layer_begin(uint32_t layer);
 void ds4_gpu_timeline_layer_end(uint32_t layer);
 void ds4_gpu_timeline_stage_end(const char *stage);
+int ds4_gpu_timeline_layer_read_stats(ds4_gpu_timeline_stats *out);
 int ds4_gpu_batch_layer_begin(uint32_t layer);
 /* Attach a prefill layer lifetime scope without submitting or waiting on
  * preceding work already recorded in the command stream. */

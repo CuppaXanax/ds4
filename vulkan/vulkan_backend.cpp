@@ -143,6 +143,7 @@ struct VulkanCommandCtx {
     uint64_t layer_timeline_start_ns = 0;
     uint64_t layer_timeline_stop_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
+    ds4_gpu_timeline_stats last_timeline_stats = {};
     bool layer_batch_active = false;
     bool worker_slice_active = false;
     uint32_t worker_slice_start = UINT32_MAX;
@@ -770,9 +771,12 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
     uint32_t gpu_intervals = 0;
     uint32_t submissions = 0;
     uint32_t waits = 0;
+    uint64_t dispatches = 0;
+    uint64_t barriers = 0;
     std::unordered_map<std::string, uint64_t> stage_gpu_ns;
     for (const TimelineEvent &event : ctx.timeline_events) {
         if (event.kind == TimelineEventKind::Dispatch) {
+            dispatches++;
             gpu_ns += event.gpu_ns;
             stage_gpu_ns[event.stage ? event.stage : "unassigned"] += event.gpu_ns;
             if (event.gpu_start_ns != 0 && event.gpu_end_ns >= event.gpu_start_ns) {
@@ -783,6 +787,9 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
             }
             if (event.host_end_ns >= event.host_ns)
                 host_record_ns += event.host_end_ns - event.host_ns;
+        }
+        else if (event.kind == TimelineEventKind::Barrier) {
+            barriers++;
         }
         else if (event.kind == TimelineEventKind::Submit) {
             submissions++;
@@ -806,6 +813,14 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
         ? ctx.layer_timeline_stop_ns : timeline_now_ns();
     const uint64_t wall_ns = wall_stop_ns >= ctx.layer_timeline_start_ns
         ? wall_stop_ns - ctx.layer_timeline_start_ns : 0;
+    ctx.last_timeline_stats.wall_ms = (double)wall_ns / 1.0e6;
+    ctx.last_timeline_stats.gpu_ms = (double)gpu_ns / 1.0e6;
+    ctx.last_timeline_stats.submit_cpu_ms = (double)submit_ns / 1.0e6;
+    ctx.last_timeline_stats.wait_cpu_ms = (double)fence_ns / 1.0e6;
+    ctx.last_timeline_stats.dispatches = dispatches;
+    ctx.last_timeline_stats.barriers = barriers;
+    ctx.last_timeline_stats.submissions = submissions;
+    ctx.last_timeline_stats.waits = waits;
     fprintf(stderr,
             "ds4: VULKAN layer_timeline layer=%u wall_ms=%.6f gpu_ms=%.6f "
             "submissions=%u fence_waits=%u submit_cpu_ms=%.6f fence_cpu_ms=%.6f\n",
@@ -2022,6 +2037,12 @@ extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
     timeline_layer_summary(ctx);
 }
 
+extern "C" int ds4_gpu_timeline_layer_read_stats(ds4_gpu_timeline_stats *out) {
+    if (!out) return 0;
+    *out = get_cmd_ctx().last_timeline_stats;
+    return 1;
+}
+
 extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
     const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
     if (!target || !target[0]) return;
@@ -2066,13 +2087,14 @@ extern "C" int ds4_gpu_worker_slice_begin(uint32_t layer_start,
                                             uint32_t layer_end) {
     auto &ctx = get_cmd_ctx();
     const char *worker_slice_env = getenv("DS4_VULKAN_WORKER_SLICE_BATCH");
+    const bool slice_bench = getenv("DS4_VULKAN_SLICE_BENCH") != nullptr;
     if (ctx.worker_slice_active || ctx.layer_batch_active ||
         layer_end < layer_start ||
         layer_end - layer_start + 1u != 4u ||
         (worker_slice_env && strcmp(worker_slice_env, "0") == 0) ||
         getenv("DS4_DIST_DECODE_PROFILE") != nullptr ||
-        getenv("DS4_VULKAN_TIMELINE") != nullptr ||
-        getenv("DS4_VULKAN_TIMELINE_LAYER") != nullptr ||
+        (!slice_bench && getenv("DS4_VULKAN_TIMELINE") != nullptr) ||
+        (!slice_bench && getenv("DS4_VULKAN_TIMELINE_LAYER") != nullptr) ||
         getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") != nullptr ||
         getenv("DS4_VULKAN_DEBUG") != nullptr ||
         getenv("DS4_METAL_LAYER_STAGE_PROFILE") != nullptr ||

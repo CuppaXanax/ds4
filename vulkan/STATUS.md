@@ -183,7 +183,7 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_store_raw_kv_batch_tensor` | VERIFIED |
 | `ds4_gpu_store_raw_kv_tensor` | STUB |
 
-## matmul (1 real / 16 stub)
+## matmul (2 real / 15 stub)
 
 | function | status |
 |---|---|
@@ -209,7 +209,7 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_matmul_q8_0_top1_tensor` | STUB |
 | `ds4_gpu_matmul_quant_decode_mpp_model_view_tensor` | STUB |
 | `ds4_gpu_matmul_quant_kslice_tensor` | STUB |
-| `ds4_gpu_matmul_quant_rows_scalar_tensor` | STUB |
+| `ds4_gpu_matmul_quant_rows_scalar_tensor` | REAL |
 | `ds4_gpu_matmul_quant_tensor` | VERIFIED |
 
 ## mgpu (5 real / 0 stub)
@@ -264,7 +264,7 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_set_model_map_spans` | REAL |
 | `ds4_gpu_set_q8_cache_suppressed` | REAL |
 
-## moe (5 real / 19 stub)
+## moe (6 real / 18 stub)
 
 | function | status |
 |---|---|
@@ -289,7 +289,7 @@ numerically wrong); `STUB` = no-op placeholder from `vulkan/_impl_gen.cpp`
 | `ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor` | STUB |
 | `ds4_gpu_shared_down_hc_expand_q8_0_tensor` | REAL |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor` | STUB |
-| `ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor` | STUB |
+| `ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor` | REAL |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor` | STUB |
 | `ds4_gpu_shared_gate_up_swiglu_q8_0_tensor` | REAL |
 | `ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor` | STUB |

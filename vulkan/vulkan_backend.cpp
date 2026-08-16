@@ -8672,11 +8672,11 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
 /* ---- AUTO-GENERATED CPU IMPLEMENTATIONS ---- */
 
 /* Opt-in batch entry points for the indexed prefill graph.  The graph calls
- * these hooks before falling back to one-token GEMVs.  Keep the implementation
+ * these hooks before its established one-token path.  Keep the implementation
  * on the same packed Q8_0 primitive used by decode: pair() quantizes the
  * contiguous token tile once, and the prequant matmul consumes that packed
- * tile for both projections.  This is deliberately gated while the artifact
- * is being qualified; an unset variable preserves the existing fallback. */
+ * tile for both projections.  The gate is temporary qualification scaffolding
+ * and must be enabled explicitly on every participating process. */
 extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t weight_type, uint64_t in_dim,
@@ -8702,6 +8702,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         const ds4_gpu_tensor *x, uint64_t n_tok, float clamp) {
     if (getenv("DS4_VULKAN_Q8_ROWS_SCALAR") == nullptr ||
         !gate || !up || !mid || !x || n_tok == 0 || out_dim == 0 ||
+        !std::isfinite(clamp) || clamp < 0.0f ||
         n_tok > UINT64_MAX / out_dim || n_tok * out_dim > UINT32_MAX)
         return 0;
     if (getenv("DS4_VULKAN_TRACE_KERNELS"))

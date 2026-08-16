@@ -7582,8 +7582,9 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
 #ifdef DS4_VULKAN_BUILD
+    const char *worker_slice_env = getenv("DS4_VULKAN_WORKER_SLICE_BATCH");
     const bool worker_slice_optin =
-        getenv("DS4_VULKAN_WORKER_SLICE_BATCH") != NULL &&
+        (!worker_slice_env || strcmp(worker_slice_env, "0") != 0) &&
         work.n_tokens == 1u && work.pos0 > 0u &&
         work.layer_end >= work.layer_start &&
         work.layer_end - work.layer_start + 1u == 4u &&

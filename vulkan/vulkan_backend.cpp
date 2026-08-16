@@ -883,7 +883,8 @@ static void worker_hazard_barrier(VulkanCommandCtx &ctx, const char *name,
                                   uint32_t count);
 
 static bool worker_resource_hazards_enabled(void) {
-    return getenv("DS4_VULKAN_WORKER_RESOURCE_HAZARDS") != nullptr;
+    const char *env = getenv("DS4_VULKAN_WORKER_RESOURCE_HAZARDS");
+    return !env || strcmp(env, "0") != 0;
 }
 
 static bool worker_slice_trace_enabled(void) {
@@ -2064,10 +2065,11 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
 extern "C" int ds4_gpu_worker_slice_begin(uint32_t layer_start,
                                             uint32_t layer_end) {
     auto &ctx = get_cmd_ctx();
+    const char *worker_slice_env = getenv("DS4_VULKAN_WORKER_SLICE_BATCH");
     if (ctx.worker_slice_active || ctx.layer_batch_active ||
         layer_end < layer_start ||
         layer_end - layer_start + 1u != 4u ||
-        getenv("DS4_VULKAN_WORKER_SLICE_BATCH") == nullptr ||
+        (worker_slice_env && strcmp(worker_slice_env, "0") == 0) ||
         getenv("DS4_DIST_DECODE_PROFILE") != nullptr ||
         getenv("DS4_VULKAN_TIMELINE") != nullptr ||
         getenv("DS4_VULKAN_TIMELINE_LAYER") != nullptr ||
@@ -3446,12 +3448,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(rows8_env && strcmp(rows8_env, "0") == 0) &&
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
-    /* Qualification-only prefill shape: two output rows reuse their packed
-     * weight rows across four tokens.  Decode remains on its established
-     * one-token kernels, and exact mode retains the exact fallback. */
+    /* Appliance prefill shape: two output rows reuse their packed weight rows
+     * across four tokens. Decode remains on its established one-token kernels;
+     * exact mode and an explicit 0 retain the established fallback. */
     bool use_token_tiled = use_aligned &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
-        token_tiled_env && strcmp(token_tiled_env, "0") != 0 &&
+        !(token_tiled_env && strcmp(token_tiled_env, "0") == 0) &&
         n_tok > 1 && in_dim == 4096 && blocks == 128;
     const char *shader_name = use_wave64
         ? "matmul_q8_0_wave64_bfe"
@@ -9065,18 +9067,18 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
 
 /* ---- AUTO-GENERATED CPU IMPLEMENTATIONS ---- */
 
-/* Opt-in batch entry points for the indexed prefill graph.  The graph calls
- * these hooks before its established one-token path.  Keep the implementation
+/* Batch entry points for the indexed prefill graph. The graph calls these
+ * hooks before its established one-token path. Keep the implementation
  * on the same packed Q8_0 primitive used by decode: pair() quantizes the
  * contiguous token tile once, and the prequant matmul consumes that packed
- * tile for both projections.  The gate is temporary qualification scaffolding
- * and must be enabled explicitly on every participating process. */
+ * tile for both projections. An explicit 0 retains the generic fallback. */
 extern "C" int ds4_gpu_matmul_quant_rows_scalar_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t weight_type, uint64_t in_dim,
         uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
-    if (getenv("DS4_VULKAN_Q8_ROWS_SCALAR") == nullptr ||
-        weight_type != 8u) return 0;
+    const char *rows_env = getenv("DS4_VULKAN_Q8_ROWS_SCALAR");
+    if ((rows_env && strcmp(rows_env, "0") == 0) || weight_type != 8u)
+        return 0;
     if (in_dim == 0 || out_dim == 0 || n_tok == 0 || n_tok > 65535u ||
         n_tok > UINT64_MAX / out_dim ||
         n_tok * out_dim > UINT32_MAX) return 0;
@@ -9094,7 +9096,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         const void *model_map, uint64_t model_size, uint64_t gate_offset,
         uint64_t up_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok, float clamp) {
-    if (getenv("DS4_VULKAN_Q8_ROWS_SCALAR") == nullptr ||
+    const char *rows_env = getenv("DS4_VULKAN_Q8_ROWS_SCALAR");
+    if ((rows_env && strcmp(rows_env, "0") == 0) ||
         !gate || !up || !mid || !x || n_tok == 0 || out_dim == 0 ||
         !std::isfinite(clamp) || clamp < 0.0f ||
         n_tok > UINT64_MAX / out_dim || n_tok * out_dim > UINT32_MAX)

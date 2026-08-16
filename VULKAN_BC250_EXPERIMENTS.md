@@ -6,12 +6,14 @@
 
 ## Current qualified deployment
 
-Qualified integrated successor: `86a0bcd`, publishing to `origin/pr-557-merge`.
-The previous published record was `4d46c92` (`f85a909` code plus docs).
+Published baseline: `4d46c92` (`f85a909` code plus docs) on
+`origin/pr-557-merge`. The `c36933b..a073023` integration remains off-main.
 
 - previous baseline approximately 5.4-5.5 generation tokens/s;
 - worker-graph candidate 5.27/5.27 generation tokens/s versus same-binary
   fallback 5.37/5.43; graph and hazard tracker are default-off;
+- governor-on published `4d46c92` control: 5.65 generation tokens/s on the
+  second warm prompt; this is the current promotion floor;
 - approximately 3.25 ms representative Layer 4 GPU time;
 - 86/86 complete GFX1013 Vulkan tests;
 - same-configuration control/candidate 16-step artifact: 35,108 bytes, SHA-256
@@ -32,7 +34,7 @@ clock; pre-governor TPS figures are retained as history, not clock-matched A/Bs.
 |---|---|
 | `74a22cd..c519309` | Current BC-250 decode baseline: GPU-resident layer scopes/routing, command ring, pooled scratch, Q8 grouping/tiling, activation reuse, routed mid/down fusion, HC/inverse-RoPE fusion, and Wave64 routed arithmetic. |
 | indexed Wave64 publication | Register-resident indexed attention plus fused inverse-RoPE. Byte-exact focused gate; `0.864 -> 0.824 ms` (~4.6%) on the production-shaped indexed path. Long-context scope only. |
-| `c36933b..86a0bcd` | Integrated prefill and graph infrastructure: batched/token-tiled Q8 prefill; opt-in four-layer worker command chain, persistent slice descriptors/scratch, and exact resource hazards; mapped-staging flush correctness; single-blade slice tooling. Exact artifact; 86/86 suite. Worker graph is default-off after a ~3% same-binary regression. |
+| `c36933b..a073023` | Held integration: batched/token-tiled Q8 prefill; opt-in four-layer worker command chain, persistent slice descriptors/scratch, and exact resource hazards; mapped-staging flush correctness; two-phase slice tooling. Exact artifact; 86/86 suite. Not published because it did not clear the guarded decode baseline. |
 
 The indexed path is enabled by default only for the qualified BC-250/subgroup64
 predicate. Disable it with:

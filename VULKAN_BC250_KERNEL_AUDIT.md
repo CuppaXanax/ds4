@@ -4,17 +4,18 @@
 > qualification snapshot for the 24-CU BC-250 appliance. Historical bootstrap
 > notes remain in `vulkan/RESUME.md`.
 
-## Qualified baseline and integrated successor
+## Published baseline and held integration
 
-The previously published baseline is `origin/pr-557-merge` at `4d46c92`
-(`f85a909` code plus its qualification record). The integrated successor is
-`86a0bcd`; it is exact and has passed the complete Vulkan suite, and is being
-published to `pr-557-merge` as the new engineering baseline.
+The published baseline is `origin/pr-557-merge` at `4d46c92` (`f85a909` code
+plus its qualification record). The `c36933b..a073023` integration is exact
+and passes the complete Vulkan suite, but is held off-main because it did not
+clear the guarded decode baseline.
 
 | Item | Qualified result |
 |---|---:|
 | Previous distributed generation | approximately 5.4-5.5 tokens/s |
-| Worker-graph candidate | 5.27/5.27 tokens/s versus same-binary fallback 5.37/5.43; default-off |
+| Pre-governor worker-graph candidate | 5.27/5.27 tokens/s versus same-binary fallback 5.37/5.43; default-off |
+| Governor-on published baseline | 5.65 tokens/s on the second warm prompt |
 | Representative Layer 4 GPU time | approximately 3.25 ms |
 | Attention/projection group | approximately 1.77 ms/layer |
 | Routed/shared MoE group | approximately 1.31 ms/layer |
@@ -38,6 +39,8 @@ idle power/temperature changed from 55.2 W/57 C to 43.2 W/53 C; all blades
 subsequently reported 1000 MHz idle, roughly 43-47 W, and 53-58 C. Decode
 benchmarks recorded before this rollout are not valid governor-on comparisons;
 future performance records must include observed load clock and temperature.
+The first governor-on control of published `4d46c92` reached 5.65 tokens/s on
+the second warm prompt; that value is the current no-regression floor.
 
 ## What the current production path contains
 

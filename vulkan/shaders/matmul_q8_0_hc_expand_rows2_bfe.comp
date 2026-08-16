@@ -1,0 +1,112 @@
+#version 460 core
+/*
+ * BC-250 appliance path: Q8_0 output projection directly into HC streams.
+ *
+ * The production attention-output-B shape is 4096 input values (128 Q8
+ * blocks) -> 4096 output values, followed immediately by HC post expansion
+ * into four streams.  The old path wrote block_out and launched hc_expand,
+ * rereading those 4096 values.  Here one workgroup owns two output rows:
+ * 128 lanes compute each row's Q8 block products, lane 0/128 reproduce the
+ * established ascending FP32 block sum, write block_out, and immediately
+ * apply the established HC post/comb accumulation order.
+ *
+ * This is deliberately shape-gated by the host.  The fallback remains the
+ * ordinary matmul followed by hc_expand for every other model shape.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) readonly buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer BlockOutBuf         { float block_out[]; };
+layout(set = 0, binding = 4) buffer HcOutBuf            { float out_hc[]; };
+layout(set = 0, binding = 5) readonly buffer ResidualBuf { float residual[]; };
+layout(set = 0, binding = 6) readonly buffer SplitBuf    { float split[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_hc;
+    uint blocks_per_row;
+} pc;
+
+shared uint x_q8_shared[1152]; /* 128 Q8 blocks x 9 words */
+shared float block_scale_products[256];
+shared int block_dots[256];
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(payload_buf[word]), int(byte_index * 8u), 8);
+}
+
+int x_i8(uint word, uint byte_index) {
+    return bitfieldExtract(int(x_q8_shared[word]), int(byte_index * 8u), 8);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint row_slot = lid >> 7u;
+    uint block = lid & 127u;
+    uint row = gl_WorkGroupID.x * 2u + row_slot;
+
+    /* Keep all lanes reaching the barrier even if a stale/mismatched shader
+     * bundle invokes this pipeline.  The host only admits the exact shape. */
+    if (pc.in_dim != 4096u || pc.out_dim == 0u || pc.n_hc == 0u ||
+        pc.blocks_per_row != 128u || row >= pc.out_dim) {
+        /* Invalid rows still participate in the shared staging protocol. */
+        for (uint i = lid; i < 128u * 9u; i += 256u)
+            x_q8_shared[i] = 0u;
+        barrier();
+        barrier();
+        return;
+    }
+
+    for (uint i = lid; i < pc.blocks_per_row * 9u; i += 256u)
+        x_q8_shared[i] = x_q8_buf[i];
+    barrier();
+
+    uint record = row * pc.blocks_per_row + block;
+    uint scale_word = scale_buf[record >> 1u];
+    uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+    uint x_off = block * 9u;
+    int block_dot = 0;
+    for (uint i = 0u; i < 32u; i++)
+        block_dot += i8_at(record * 8u + (i >> 2u), i & 3u) *
+                     x_i8(x_off + 1u + (i >> 2u), i & 3u);
+    block_scale_products[row_slot * 128u + block] =
+        f16tof32(scale_bits) * uintBitsToFloat(x_q8_shared[x_off]);
+    block_dots[row_slot * 128u + block] = block_dot;
+    barrier();
+
+    /* These two lanes own the exact serial reduction for the two rows. */
+    if ((lid & 127u) == 0u) {
+        uint base = row_slot * 128u;
+        float block_value = 0.0;
+        for (uint b = 0u; b < pc.blocks_per_row; ++b)
+            block_value += block_scale_products[base + b] *
+                           float(block_dots[base + b]);
+        block_out[row] = block_value;
+
+        /* split = [pre | post | comb].  The pre half is not consumed here;
+         * this is the same order as hc_expand's split_layout path. */
+        for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+            float acc = block_value * split[pc.n_hc + dst];
+            uint comb_base = 2u * pc.n_hc;
+            uint residual_base = dst * pc.out_dim + row;
+            for (uint src = 0u; src < pc.n_hc; ++src)
+                acc += split[comb_base + dst + src * pc.n_hc] *
+                       residual[src * pc.out_dim + row];
+            out_hc[dst * pc.out_dim + row] = acc;
+        }
+    }
+}

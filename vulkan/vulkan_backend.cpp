@@ -492,6 +492,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
+        {"matmul_q8_0_hc_expand_rows2_bfe", 16, 7},
         {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_group_rows_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
@@ -509,6 +510,7 @@ static int load_all_shaders(void) {
         {"attention_prefill_raw", 16, 4},
         {"attention_decode_mixed", 32, 6},
         {"attention_decode_mixed_wave64", 32, 6},
+        {"attention_decode_mixed_rope", 76, 6},
         {"attention_mixed_online", 64, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
@@ -4166,6 +4168,54 @@ int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_t
                                 1, 1, resume_recording);
 }
 
+/* Vulkan can keep the inverse RoPE tail inside the head-owned mixed-attention
+ * workgroup.  ds4.c arms this narrowly for the ordinary (non-indexed)
+ * decode path and checks the consumed flag before skipping its standalone
+ * rope dispatch. */
+struct VulkanDecodeAttnRopeFuse {
+    bool armed = false;
+    bool used = false;
+    uint32_t n_rot = 0;
+    uint32_t pos0 = 0;
+    uint32_t n_ctx_orig = 0;
+    bool inverse = false;
+    float freq_base = 0.0f;
+    float freq_scale = 0.0f;
+    float ext_factor = 0.0f;
+    float attn_factor = 1.0f;
+    float beta_fast = 0.0f;
+    float beta_slow = 0.0f;
+};
+static thread_local VulkanDecodeAttnRopeFuse g_decode_attn_rope_fuse;
+
+extern "C" int ds4_gpu_decode_attn_rope_fuse_available(void) {
+    return g_vk.shader_map.find("attention_decode_mixed_rope") != g_vk.shader_map.end();
+}
+
+extern "C" int ds4_gpu_decode_attn_rope_fuse_used(void) {
+    return g_decode_attn_rope_fuse.used ? 1 : 0;
+}
+
+extern "C" void ds4_gpu_set_decode_attn_rope_fuse(
+        uint32_t n_head_dim, uint32_t n_rot, uint32_t pos0,
+        uint32_t n_ctx_orig, bool inverse, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow) {
+    (void)n_head_dim;
+    g_decode_attn_rope_fuse.armed = true;
+    g_decode_attn_rope_fuse.used = false;
+    g_decode_attn_rope_fuse.n_rot = n_rot;
+    g_decode_attn_rope_fuse.pos0 = pos0;
+    g_decode_attn_rope_fuse.n_ctx_orig = n_ctx_orig;
+    g_decode_attn_rope_fuse.inverse = inverse;
+    g_decode_attn_rope_fuse.freq_base = freq_base;
+    g_decode_attn_rope_fuse.freq_scale = freq_scale;
+    g_decode_attn_rope_fuse.ext_factor = ext_factor;
+    g_decode_attn_rope_fuse.attn_factor = attn_factor;
+    g_decode_attn_rope_fuse.beta_fast = beta_fast;
+    g_decode_attn_rope_fuse.beta_slow = beta_slow;
+}
+
 /* ---- ds4_gpu_attention_decode_heads_tensor ----
  *
  * Single-token causal decode attention over the raw ring cache plus the
@@ -4243,24 +4293,53 @@ int ds4_gpu_attention_decode_heads_tensor(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
+    const bool use_fused_rope =
+        g_decode_attn_rope_fuse.armed &&
+        g_decode_attn_rope_fuse.n_rot != 0 &&
+        g_decode_attn_rope_fuse.n_rot <= head_dim &&
+        (g_decode_attn_rope_fuse.n_rot & 1u) == 0 &&
+        ds4_gpu_decode_attn_rope_fuse_available() != 0;
     VkDescriptorBufferInfo bufs[6] = {
         {obuf, ooff, (VkDeviceSize)heads->bytes}, {qbuf, qoff, (VkDeviceSize)q->bytes},
         {rbuf, roff, (VkDeviceSize)raw_kv->bytes},
         {cbuf, coff, n_comp ? (VkDeviceSize)comp_kv->bytes : 4},
         {mbuf, moff, use_mask ? (VkDeviceSize)comp_mask->bytes : 4}, {sbuf, soff, ssize}
     };
-    struct { uint32_t n_raw, raw_cap, raw_start, n_comp, comp_f16, use_mask, n_head, head_dim; }
-        pc = {n_raw, raw_cap, raw_start, n_comp, comp_kv_f16, use_mask, n_head, head_dim};
+    struct Push {
+        uint32_t n_raw, raw_cap, raw_start, n_comp, comp_f16, use_mask, n_head, head_dim;
+        uint32_t rope_enable, n_rot, pos0, n_ctx_orig;
+        int32_t inverse;
+        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    } pc = {n_raw, raw_cap, raw_start, n_comp, comp_kv_f16, use_mask, n_head, head_dim,
+            use_fused_rope ? 1u : 0u,
+            use_fused_rope ? g_decode_attn_rope_fuse.n_rot : 0u,
+            use_fused_rope ? g_decode_attn_rope_fuse.pos0 : 0u,
+            use_fused_rope ? g_decode_attn_rope_fuse.n_ctx_orig : 0u,
+            use_fused_rope && g_decode_attn_rope_fuse.inverse ? 1 : 0,
+            use_fused_rope ? g_decode_attn_rope_fuse.freq_base : 0.0f,
+            use_fused_rope ? g_decode_attn_rope_fuse.freq_scale : 1.0f,
+            use_fused_rope ? g_decode_attn_rope_fuse.ext_factor : 0.0f,
+            use_fused_rope ? g_decode_attn_rope_fuse.attn_factor : 1.0f,
+            use_fused_rope ? g_decode_attn_rope_fuse.beta_fast : 0.0f,
+            use_fused_rope ? g_decode_attn_rope_fuse.beta_slow : 0.0f};
     const char *wave64_env = getenv("DS4_VULKAN_ATTN_WAVE64");
     const bool use_wave64 = g_vk.caps.subgroup_size == 64u &&
         !(wave64_env && strcmp(wave64_env, "0") == 0) &&
         g_vk.shader_map.find("attention_decode_mixed_wave64") !=
             g_vk.shader_map.end();
-    const char *shader_name = use_wave64 ?
-        "attention_decode_mixed_wave64" : "attention_decode_mixed";
+    const char *shader_name = use_fused_rope ?
+        "attention_decode_mixed_rope" :
+        (use_wave64 ? "attention_decode_mixed_wave64" :
+                      "attention_decode_mixed");
     DS4_VK_TRACE_KERNEL(shader_name);
-    return record_simple_shader(shader_name, &pc, sizeof(pc), bufs, 6,
-                                n_head, 1, 1, resume_recording);
+    int ok = record_simple_shader(shader_name, &pc,
+                                  use_fused_rope ? sizeof(pc) : 32u,
+                                  bufs, 6, n_head, 1, 1, resume_recording);
+    if (use_fused_rope && ok) {
+        g_decode_attn_rope_fuse.armed = false;
+        g_decode_attn_rope_fuse.used = true;
+    }
+    return ok;
 }
 
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
@@ -5265,6 +5344,89 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         hc_bytes > residual_hc->bytes ||
         hc_bytes > out_hc->bytes ||
         mix_hc * sizeof(float) > split->bytes) return 0;
+
+    /* The production Flash attention-output-B projection is 4096 -> 4096
+     * with four HC streams and 128 Q8 blocks per row.  In that shape the
+     * composed implementation below does two full dispatches and writes /
+     * rereads a 16 KiB block_out tensor.  Keep the old path as the exact
+     * fallback, but let the appliance kernel compute each two-row projection
+     * and immediately apply HC post/comb in the same workgroup. */
+    const bool fuse_rows2 =
+        in_dim == 4096u && out_dim == 4096u && n_embd == 4096u &&
+        n_hc == 4u && blocks == 128u &&
+        getenv("DS4_VULKAN_DISABLE_Q8_HC_EXPAND_FUSE") == nullptr;
+    if (fuse_rows2) {
+        auto shader_it = g_vk.shader_map.find("matmul_q8_0_hc_expand_rows2_bfe");
+        decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+        const bool aligned_ok = shader_it != g_vk.shader_map.end() &&
+            ensure_aligned_weight(model_map, model_size, weight_offset,
+                                  in_dim, out_dim, aligned) && aligned;
+        const uint64_t q_bytes = blocks * 36u;
+        const uint64_t records = out_dim * blocks;
+        const uint64_t scale_bytes = (records * 2u + 3u) & ~3ull;
+        const uint64_t payload_bytes = records * 32u;
+        if (aligned_ok && q_bytes <= UINT32_MAX &&
+            scale_bytes <= aligned->scale_bytes &&
+            payload_bytes <= aligned->payload_bytes &&
+            (!g_vk.caps.max_storage_buffer_range ||
+             (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
+              payload_bytes <= g_vk.caps.max_storage_buffer_range))) {
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(q_bytes);
+            if (q) {
+                auto &ctx = get_cmd_ctx();
+                const bool resume_recording = ctx.recording;
+                int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, 1);
+                VkBuffer xbuf, bbuf, hbuf, rbuf, sbuf;
+                VkDeviceSize xoff, boff, hoff, roff, soff;
+                if (ok && find_tensor_buffer(q, xbuf, xoff) &&
+                    find_tensor_buffer(block_out, bbuf, boff) &&
+                    find_tensor_buffer(out_hc, hbuf, hoff) &&
+                    find_tensor_buffer(residual_hc, rbuf, roff) &&
+                    find_tensor_buffer(split, sbuf, soff)) {
+                    const VkDeviceSize align =
+                        g_vk.caps.min_storage_buffer_offset_alignment;
+                    if (align && ((xoff | boff | hoff | roff | soff) % align) != 0) {
+                        ok = 0;
+                    } else {
+                        VkDescriptorBufferInfo buffers[7] = {
+                            {xbuf, xoff, (VkDeviceSize)q_bytes},
+                            {aligned->gpu.buffer, 0, (VkDeviceSize)scale_bytes},
+                            {aligned->gpu.buffer, (VkDeviceSize)aligned->payload_offset,
+                             (VkDeviceSize)payload_bytes},
+                            {bbuf, boff, (VkDeviceSize)embd_bytes},
+                            {hbuf, hoff, (VkDeviceSize)hc_bytes},
+                            {rbuf, roff, (VkDeviceSize)hc_bytes},
+                            {sbuf, soff, (VkDeviceSize)(mix_hc * sizeof(float))},
+                        };
+                        struct { uint32_t in_dim, out_dim, n_hc, blocks; } pc = {
+                            (uint32_t)in_dim, (uint32_t)out_dim, n_hc,
+                            (uint32_t)blocks};
+                        ok = record_simple_shader(
+                            "matmul_q8_0_hc_expand_rows2_bfe", &pc, sizeof(pc),
+                            buffers, 7, (uint32_t)((out_dim + 1u) / 2u), 1, 1,
+                            resume_recording);
+                    }
+                } else {
+                    ok = 0;
+                }
+                /* The quantization and fused dispatch both reference q.  A
+                 * non-batched call must retire before releasing it; layer
+                 * batching defers the release through the normal tensor
+                 * lifetime path. */
+                if (ctx.layer_batch_active) {
+                    ds4_gpu_tensor_free(q);
+                } else {
+                    if (ok) ok = submit_and_wait();
+                    else if (ctx.recording && ctx.command_count != 0)
+                        (void)submit_and_wait();
+                    ds4_gpu_tensor_free(q);
+                }
+                if (ok) return 1;
+                /* A missing/incompatible candidate must not break the
+                 * production path: fall through to the established pair. */
+            }
+        }
+    }
 
     if (ds4_gpu_matmul_q8_0_tensor(block_out, model_map, model_size,
                                    weight_offset, in_dim, out_dim, x, 1) == 0)

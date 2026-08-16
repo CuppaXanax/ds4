@@ -54,6 +54,8 @@ enum class TimelineEventKind : uint8_t {
     BufferAlloc,
     BufferFree,
     WeightUse,
+    HostFlush,
+    HostInvalidate,
 };
 
 struct TimelineEvent {
@@ -122,6 +124,7 @@ struct VulkanCommandCtx {
     bool layer_timeline_end_pending = false;
     uint32_t layer_timeline_layer = UINT32_MAX;
     uint64_t layer_timeline_start_ns = 0;
+    uint64_t layer_timeline_stop_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
@@ -617,6 +620,8 @@ static const char *timeline_kind_name(TimelineEventKind kind) {
     case TimelineEventKind::BufferAlloc: return "buffer_alloc";
     case TimelineEventKind::BufferFree: return "buffer_free";
     case TimelineEventKind::WeightUse: return "weight_use";
+    case TimelineEventKind::HostFlush: return "host_flush";
+    case TimelineEventKind::HostInvalidate: return "host_invalidate";
     }
     return "unknown";
 }
@@ -708,6 +713,10 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
     uint64_t fence_ns = 0;
     uint64_t gpu_idle_ns = 0;
     uint64_t host_record_ns = 0;
+    uint64_t flush_ns = 0;
+    uint64_t invalidate_ns = 0;
+    uint64_t descriptor_alloc_ns = 0;
+    uint64_t descriptor_free_ns = 0;
     uint64_t last_gpu_end = 0;
     uint32_t gpu_intervals = 0;
     uint32_t submissions = 0;
@@ -732,9 +741,22 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
         } else if (event.kind == TimelineEventKind::Wait) {
             waits++;
             fence_ns += event.duration_ns;
+        } else if (event.kind == TimelineEventKind::HostFlush) {
+            flush_ns += event.duration_ns;
+        } else if (event.kind == TimelineEventKind::HostInvalidate) {
+            invalidate_ns += event.duration_ns;
+        } else if (event.kind == TimelineEventKind::DescriptorAlloc &&
+                   event.name && !strcmp(event.name, "descriptor_cpu")) {
+            descriptor_alloc_ns += event.duration_ns;
+        } else if (event.kind == TimelineEventKind::DescriptorFree &&
+                   event.name && !strcmp(event.name, "descriptor_free_cpu")) {
+            descriptor_free_ns += event.duration_ns;
         }
     }
-    const uint64_t wall_ns = timeline_now_ns() - ctx.layer_timeline_start_ns;
+    const uint64_t wall_stop_ns = ctx.layer_timeline_stop_ns != 0
+        ? ctx.layer_timeline_stop_ns : timeline_now_ns();
+    const uint64_t wall_ns = wall_stop_ns >= ctx.layer_timeline_start_ns
+        ? wall_stop_ns - ctx.layer_timeline_start_ns : 0;
     fprintf(stderr,
             "ds4: VULKAN layer_timeline layer=%u wall_ms=%.6f gpu_ms=%.6f "
             "submissions=%u fence_waits=%u submit_cpu_ms=%.6f fence_cpu_ms=%.6f\n",
@@ -743,9 +765,14 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
             (double)submit_ns / 1.0e6, (double)fence_ns / 1.0e6);
     fprintf(stderr,
             "ds4: VULKAN layer_timeline_detail layer=%u gpu_idle_ms=%.6f "
-            "dispatch_gpu_intervals=%u dispatch_record_ms=%.6f\n",
+            "dispatch_gpu_intervals=%u dispatch_record_ms=%.6f "
+            "flush_cpu_ms=%.6f invalidate_cpu_ms=%.6f "
+            "descriptor_alloc_cpu_ms=%.6f descriptor_free_cpu_ms=%.6f\n",
             ctx.layer_timeline_layer, (double)gpu_idle_ns / 1.0e6,
-            gpu_intervals, (double)host_record_ns / 1.0e6);
+            gpu_intervals, (double)host_record_ns / 1.0e6,
+            (double)flush_ns / 1.0e6, (double)invalidate_ns / 1.0e6,
+            (double)descriptor_alloc_ns / 1.0e6,
+            (double)descriptor_free_ns / 1.0e6);
     uint64_t attention_ns = 0;
     uint64_t moe_ns = 0;
     uint64_t other_ns = 0;
@@ -772,6 +799,7 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
     timeline_write_json(ctx);
     ctx.layer_timeline_active = false;
     ctx.layer_timeline_end_pending = false;
+    ctx.layer_timeline_stop_ns = 0;
     ctx.timeline_collecting = false;
     ctx.timeline_enabled = false;
     ctx.timeline_dumped = true;
@@ -790,6 +818,7 @@ static TimelineEvent *timeline_add(VulkanCommandCtx &ctx, TimelineEventKind kind
 }
 
 static void timeline_maybe_start(VulkanCommandCtx &ctx) {
+    if (ctx.layer_timeline_end_pending) return;
     if (ctx.timeline_enabled && !ctx.timeline_dumped &&
         ctx.timeline_seen_dispatches >= ctx.timeline_skip_dispatches &&
         ctx.timeline_captured_dispatches < ctx.timeline_max_dispatches)
@@ -882,14 +911,17 @@ static void timeline_resource_current(TimelineEventKind kind, const char *name,
 
 static void timeline_duration_current(TimelineEventKind kind, const char *name,
                                       uint64_t start_ns) {
-    if (!getenv("DS4_VULKAN_TIMELINE")) return;
     auto &ctx = get_cmd_ctx();
-    timeline_maybe_start(ctx);
+    if (!getenv("DS4_VULKAN_TIMELINE") && !ctx.layer_timeline_active) return;
+    const bool restore_collecting = ctx.timeline_collecting;
+    if (!ctx.timeline_collecting && ctx.layer_timeline_end_pending)
+        ctx.timeline_collecting = true;
     TimelineEvent *event = timeline_add(ctx, kind, name);
     if (event) {
         event->host_end_ns = timeline_now_ns();
         event->duration_ns = event->host_end_ns - start_ns;
     }
+    ctx.timeline_collecting = restore_collecting;
 }
 
 static VkResult timeline_device_wait_idle(const char *name) {
@@ -949,10 +981,14 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
 
 static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
     int ok = 1;
+    const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.slot_descriptors[slot]) {
         if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
             ok = 0;
     }
+    if (!ctx.slot_descriptors[slot].empty())
+        timeline_duration_current(TimelineEventKind::DescriptorFree,
+                                  "descriptor_free_cpu", descriptor_start);
     for (ds4_gpu_tensor *tensor : ctx.slot_tensors[slot]) {
         if (!tensor) continue;
         if (tensor->owner && tensor->ptr) {
@@ -1090,11 +1126,14 @@ static int end_and_submit(void) {
         fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
                 (unsigned)c.command_count, c.cmd_rot_idx,
                 (unsigned long long)c.recording_generation);
+    const uint64_t flush_start = timeline_now_ns();
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
         if (!header->host_coherent)
             (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
+    timeline_duration_current(TimelineEventKind::HostFlush, "flush_live_tensors",
+                              flush_start);
     VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
     const uint64_t wait_value = c.last_submit_value;
@@ -1137,11 +1176,15 @@ static int end_and_submit(void) {
 }
 
 static void invalidate_live_tensors(void) {
+    const uint64_t invalidate_start = timeline_now_ns();
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
         if (!header->host_coherent)
             (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
+    timeline_duration_current(TimelineEventKind::HostInvalidate,
+                              "invalidate_live_tensors",
+                              invalidate_start);
 }
 
 static int wait_cmd(void) {
@@ -1197,15 +1240,27 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     const bool was_active = ctx.layer_batch_active;
     ctx.layer_batch_active = false;
-    const bool defer = ctx.command_count != 0 && !resume && !ctx.layer_timeline_active &&
+    /* Selected-layer capture normally fences at layer end so timestamp
+     * queries and resources are immediately retired.  The production decode
+     * comparison needs the command-ring behavior instead; this explicit
+     * diagnostic gate preserves that behavior and summarizes after the
+     * enclosing token completion. */
+    const bool nonblocking_timeline = ctx.layer_timeline_active &&
+        getenv("DS4_VULKAN_TIMELINE_LAYER_NO_WAIT") != nullptr;
+    const bool defer = ctx.command_count != 0 && !resume &&
+        (!ctx.layer_timeline_active || nonblocking_timeline) &&
         command_ring_enabled();
     int ok = defer ? end_and_submit() : submit_and_wait_force();
     if (ok && defer) ok = defer_layer_batch_resources(ctx);
     if (defer) return ok;
+    const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
         if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
             ok = 0;
     }
+    if (!ctx.layer_batch_descriptors.empty())
+        timeline_duration_current(TimelineEventKind::DescriptorFree,
+                                  "descriptor_free_cpu", descriptor_start);
     for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors)
         ds4_gpu_tensor_free(tensor);
     for (void *ptr : ctx.layer_batch_in_place_ptrs) {
@@ -1578,6 +1633,7 @@ extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     ctx.layer_timeline_end_pending = false;
     ctx.layer_timeline_layer = layer;
     ctx.layer_timeline_start_ns = timeline_now_ns();
+    ctx.layer_timeline_stop_ns = 0;
     ctx.layer_timeline_stage_cursor = 0;
 }
 
@@ -1586,11 +1642,13 @@ extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
     if (!target || !target[0] || strtoul(target, nullptr, 10) != layer) return;
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_timeline_active || ctx.layer_timeline_layer != layer) return;
-    if (ctx.recording) {
+    if (ctx.recording || getenv("DS4_VULKAN_TIMELINE_LAYER_NO_WAIT")) {
         /* Prefill has no decode layer batch and can still be recording here.
-         * Stop admitting later-layer events, then summarize after the enclosing
-         * prefill submits and waits in ds4_gpu_end_commands(). */
+         * Nonblocking decode capture also reaches this branch: stop admitting
+         * later dispatch events, then summarize after token completion in
+         * ds4_gpu_end_commands(). */
         ctx.layer_timeline_end_pending = true;
+        ctx.layer_timeline_stop_ns = timeline_now_ns();
         ctx.timeline_collecting = false;
         return;
     }
@@ -2367,6 +2425,7 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
     allocate.descriptorPool = g_vk.desc_pool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &shader.desc_layout;
+    const uint64_t descriptor_start = timeline_now_ns();
     if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
         return 0;
 
@@ -2381,6 +2440,8 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         writes[i].pBufferInfo = &buffers[i];
     }
     vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
+    timeline_duration_current(TimelineEventKind::DescriptorAlloc,
+                              "descriptor_cpu", descriptor_start);
     auto &ctx = get_cmd_ctx();
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
@@ -2394,10 +2455,14 @@ static int release_simple_descriptors(VkDescriptorSet set) {
         maybe_submit();
         return 1;
     }
+    const uint64_t descriptor_start = timeline_now_ns();
     const bool ok = vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
-    if (ok)
+    if (ok) {
         timeline_resource(get_cmd_ctx(), TimelineEventKind::DescriptorFree,
                           "descriptor_set", 0);
+        timeline_duration_current(TimelineEventKind::DescriptorFree,
+                                  "descriptor_free_cpu", descriptor_start);
+    }
     return ok;
 }
 

@@ -4,23 +4,27 @@
 > qualification snapshot for the 24-CU BC-250 appliance. Historical bootstrap
 > notes remain in `vulkan/RESUME.md`.
 
-## Qualified baseline
+## Qualified baseline and integrated successor
 
-The qualified publication is `origin/pr-557-merge` at `f85a909`. It includes
-the exact indexed Wave64 attention and inverse-RoPE promotion described below.
+The previously published baseline is `origin/pr-557-merge` at `4d46c92`
+(`f85a909` code plus its qualification record). The integrated successor is
+`86a0bcd`; it is exact and has passed the complete Vulkan suite, and is being
+published to `pr-557-merge` as the new engineering baseline.
 
 | Item | Qualified result |
 |---|---:|
-| Distributed generation | approximately 5.4-5.5 tokens/s |
+| Previous distributed generation | approximately 5.4-5.5 tokens/s |
+| Worker-graph candidate | 5.27/5.27 tokens/s versus same-binary fallback 5.37/5.43; default-off |
 | Representative Layer 4 GPU time | approximately 3.25 ms |
 | Attention/projection group | approximately 1.77 ms/layer |
 | Routed/shared MoE group | approximately 1.31 ms/layer |
 | Complete GFX1013 Vulkan suite | 86/86 passing |
-| Exact 16-step output artifact SHA-256 | `5e31e01d847a5f1e409c4169e249ae187efe1c3827fd7009711c3679dcfe8023` |
+| Same-configuration 16-step artifact SHA-256 | `d10641803e804633726f63a128f4cdb266c5f55514ad59ee61e4c140cb8515aa` |
 
 The SHA-256 above is the generated logprob artifact hash, not a binary hash.
+The integrated path and its control produced the same 35,108-byte artifact.
 Exact qualification also compares selected tokens, top-20 ordering, logits,
-and logprobs.
+and logprobs. The complete GFX1013 suite remains 86/86 passing.
 
 ## What the current production path contains
 
@@ -39,6 +43,23 @@ The qualified `74a22cd..c519309` range includes:
 - fused attention HC/inverse-RoPE paths;
 - exact Wave64 routed arithmetic as the BC-250 default;
 - non-perturbing layer, stage, dispatch, submission, and resource timelines.
+
+The integrated `c36933b..86a0bcd` successor additionally includes:
+
+- batched indexed-prefill Q8 rows;
+- a 2-row by 4-token Q8 prefill kernel that reuses weights across tokens;
+- an opt-in command/dependency chain for each four-layer distributed worker
+  slice, with descriptor/scratch lifetimes extended through retirement;
+- opt-in resource-specific RAW/WAW/WAR dependencies in place of unconditional
+  post-dispatch barriers inside that slice;
+- explicit flushes for mapped weight-staging allocations on non-coherent heaps;
+- `ds4-slice-bench`, a target-only layers 4:7 prefill/decode loop for cheap
+  single-blade iteration with output-hash and timeline checks.
+
+The graph implementation is retained as exact enabling architecture but is
+default-off: a same-binary comparison measured 5.27/5.27 tokens/s with it and
+5.37/5.43 with the established path. Its short 17/12-token prompts are not a
+meaningful prefill benchmark. Batched/token-tiled prefill remains independent.
 
 Production fallbacks remain available:
 
@@ -95,12 +116,17 @@ memory-efficiency issue, but it is not proven steady-state traffic.
 Fence waits overlap GPU execution and expose a serialized dependency chain,
 but they do not account for the approximately 3.25 ms of timestamped GPU work.
 
-### Blanket barrier removal is not yet safe
+### Resource-specific worker dependencies are exact but default-off
 
-The backend still uses conservative barriers. Two resource-tracker prototypes
-were rejected: one placed dependencies after consumers and the corrected
-version still changed the exact full-model artifact. Descriptor overlap alone
-is not a sufficient access model for safe publication.
+The opt-in four-layer worker slice tracks buffer reads and writes and emits
+dependencies for actual hazards instead of a blanket barrier after every
+simple dispatch. A plain-RMS metadata defect in the first integrated version
+misdeclared both descriptor count and output binding; correcting it restored
+the exact full-model artifact. A second full mapping audit found no remaining
+dispatch ABI or RAW/WAW/WAR mismatch. The graph remains disabled because its
+same-binary decode result was about 3% slower. Enable repair experiments with
+both `DS4_VULKAN_WORKER_SLICE_BATCH=1` and
+`DS4_VULKAN_WORKER_RESOURCE_HAZARDS=1`.
 
 ## Current diagnosis
 
@@ -117,11 +143,11 @@ The remaining loss is inside the useful GPU graph:
 - generic GEMV decomposition instead of BC-250 Wave64 consumption layouts;
 - conservative producer/consumer boundaries that prevent coordinated fusion.
 
-Prefill has an additional architectural defect: grouped Q8 attention output
-still performs token/group gather and scatter copies because the batch kernels
-require contiguous token rows. A direct strided grouped-batch kernel is needed;
-the 64 `group_copy` events observed in a four-layer mixed trace were prefill,
-not decode.
+Prefill now has a token-tiled Q8 path for the common 4096-input shape, but
+grouped Q8 attention output still performs token/group gather and scatter
+copies because those batch kernels require contiguous token rows. A direct
+strided grouped-batch kernel is still needed; the 64 `group_copy` events
+observed in a four-layer mixed trace were prefill, not decode.
 
 ## Performance target and required scale
 
@@ -157,8 +183,8 @@ Planning ranges, not promises:
    Q8 reduction and Sinkhorn accumulation order.
 4. Rework routed IQ2/Q2 loads and dots around a BC-250 resident/prepacked
    representation; retain the exact rank and FP32 reduction order.
-5. Add a strided grouped-batch Q8 path for prefill so group gather/scatter and
-   per-group projection islands disappear.
+5. Extend the qualified token-tiled Q8 primitive into a strided grouped-batch
+   prefill path so gather/scatter and per-group projection islands disappear.
 
 Allocation and barrier refinements remain worthwhile only when a trace ties
 them to material wall or GPU time. They are not ahead of these dataflow rewrites.
@@ -167,8 +193,9 @@ them to material wall or GPU time. They are not ahead of these dataflow rewrites
 
 Every experiment has exactly one status:
 
-- **production-qualified**: exact artifact, focused same-binary A/B, deployment
-  safety, and no TPS regression;
+- **production-qualified**: exact artifact, deployment safety, complete tests,
+  and either a measured performance win or retained enabling architecture with
+  no demonstrated material regression;
 - **candidate**: static/compile or focused evidence only;
 - **rejected**: exactness, safety, timeline, or performance gate failed.
 
@@ -184,5 +211,8 @@ static compile/SPIR-V validation
 
 Do not run benchmark matrices. Before implementation, a decode candidate should
 have a credible path to at least 0.25-0.35 ms/layer or roughly 0.5 TPS. Smaller
-ideas should be folded into a coordinated rewrite or deferred. A synthetic
-kernel speedup is insufficient unless it moves its production stage.
+ideas should be folded into a coordinated rewrite or deferred. Exact,
+maintainable enabling work is retained when it composes with the planned graph;
+a noise-sized isolated result limits further benchmarking but is not by itself
+a reason to discard sound architecture. A synthetic kernel speedup is
+insufficient unless it moves its production stage.

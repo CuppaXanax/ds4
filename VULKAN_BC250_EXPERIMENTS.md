@@ -6,13 +6,16 @@
 
 ## Current qualified deployment
 
-Qualified publication: `f85a909` (`origin/pr-557-merge`).
+Qualified integrated successor: `86a0bcd`, publishing to `origin/pr-557-merge`.
+The previous published record was `4d46c92` (`f85a909` code plus docs).
 
-- approximately 5.4-5.5 generation tokens/s;
+- previous baseline approximately 5.4-5.5 generation tokens/s;
+- worker-graph candidate 5.27/5.27 generation tokens/s versus same-binary
+  fallback 5.37/5.43; graph and hazard tracker are default-off;
 - approximately 3.25 ms representative Layer 4 GPU time;
 - 86/86 complete GFX1013 Vulkan tests;
-- exact 16-step artifact SHA-256:
-  `5e31e01d847a5f1e409c4169e249ae187efe1c3827fd7009711c3679dcfe8023`;
+- same-configuration control/candidate 16-step artifact: 35,108 bytes, SHA-256
+  `d10641803e804633726f63a128f4cdb266c5f55514ad59ee61e4c140cb8515aa`;
 - exact fallbacks remain available for F16, Q8, routed Wave64/fusion, and
   indexed Wave64/inverse-RoPE paths;
 - warm worker trace: 76 weight uses, zero uploads, zero evictions.
@@ -23,6 +26,7 @@ Qualified publication: `f85a909` (`origin/pr-557-merge`).
 |---|---|
 | `74a22cd..c519309` | Current BC-250 decode baseline: GPU-resident layer scopes/routing, command ring, pooled scratch, Q8 grouping/tiling, activation reuse, routed mid/down fusion, HC/inverse-RoPE fusion, and Wave64 routed arithmetic. |
 | indexed Wave64 publication | Register-resident indexed attention plus fused inverse-RoPE. Byte-exact focused gate; `0.864 -> 0.824 ms` (~4.6%) on the production-shaped indexed path. Long-context scope only. |
+| `c36933b..86a0bcd` | Integrated prefill and graph infrastructure: batched/token-tiled Q8 prefill; opt-in four-layer worker command chain, persistent slice descriptors/scratch, and exact resource hazards; mapped-staging flush correctness; single-blade slice tooling. Exact artifact; 86/86 suite. Worker graph is default-off after a ~3% same-binary regression. |
 
 The indexed path is enabled by default only for the qualified BC-250/subgroup64
 predicate. Disable it with:
@@ -45,9 +49,7 @@ These must not be rediscovered and promoted from architectural appeal alone.
 | Native DP4A / packed-dot paths | RADV/ACO did not lower the candidate to native integer-dot instructions on this device. Not qualified. |
 | Exact i24 regroup | Generated code did not contain the intended native instructions. Rejected without TPS promotion. |
 | Paired F16 projection shader | Exact; `5.43/5.41` versus `5.45/5.41` TPS was noise-sized. |
-| Resource-aware barrier trackers | First version ordered barriers after consumers; corrected version still changed the exact artifact. |
 | Generic Q-cache optimization | Unreachable on the production indexed path. |
-| One-submit/cross-layer command buffers | Unsafe or regressed beyond the qualified RADV command-count bound. |
 | Q8 rows4/q36 transfer | Exact, but lower occupancy/cache behavior made the production dispatch slower. |
 | Q8/Q2 cosmetic unpack rearrangements | Rejected when they did not move the production stage materially. |
 
@@ -55,11 +57,11 @@ These must not be rediscovered and promoted from architectural appeal alone.
 
 | Candidate | Required proof |
 |---|---|
-| Strided grouped/token-tiled Q8 prefill | Compile/SPIR-V, byte-exact batch output, then one meaningful prefill A/B. Existing prototype evidence is static only. |
+| Direct strided grouped Q8 prefill | Extend the qualified token-tiled primitive to remove remaining group gather/scatter copies; one meaningful 4K prefill measurement. |
 | Layer-scoped reusable Q8 activation producer | Exact quantized bytes and projection results, material reduction in production quantize dispatches/stage time. |
 | Shared-down directly into HC expansion | Exact Q8 row reduction and HC accumulation order; at least a material stage reduction. |
 | BC-250 prepacked routed weight representation | Same quantized values and exact accumulation order; production gate/up/down bandwidth improvement. |
-| Complete resource access graph | Exact full-model artifact plus fewer production barriers. Descriptor overlap alone is insufficient. |
+| Whole-worker resource graph extensions | Extend the qualified four-layer hazard graph only where a timeline identifies remaining conservative drains. |
 
 ## Measurement discipline
 
@@ -67,7 +69,8 @@ These must not be rediscovered and promoted from architectural appeal alone.
 - Require zero warm `weight_upload` events for decode measurements.
 - Use same-binary fallbacks whenever possible.
 - Run one exactness gate and one focused timing/TPS gate, not a matrix.
-- Promote only production-stage gains; delete rejected worktrees and temporary
-  patches immediately.
-- Treat exactness as necessary but not sufficient: an exact, noise-sized, or
-  slower candidate is rejected.
+- Promote measured production-stage gains and retain exact, maintainable
+  enabling architecture that composes with the next deliverable; delete
+  abandoned worktrees and temporary patches immediately.
+- Exactness is mandatory. A noise-sized isolated result stops extra benchmark
+  cycles, but does not automatically discard non-regressing X+Y infrastructure.

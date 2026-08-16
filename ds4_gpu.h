@@ -114,6 +114,9 @@ void ds4_gpu_timeline_layer_begin(uint32_t layer);
 void ds4_gpu_timeline_layer_end(uint32_t layer);
 void ds4_gpu_timeline_stage_end(const char *stage);
 int ds4_gpu_batch_layer_begin(uint32_t layer);
+/* Attach a prefill layer lifetime scope without submitting or waiting on
+ * preceding work already recorded in the command stream. */
+int ds4_gpu_batch_prefill_layer_begin(uint32_t layer);
 int ds4_gpu_batch_layer_end(uint32_t layer);
 #endif
 

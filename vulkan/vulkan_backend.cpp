@@ -1064,6 +1064,12 @@ static int submit_and_wait(void) {
 }
 
 static int defer_layer_batch_resources(VulkanCommandCtx &ctx) {
+    /* A long prefill layer may cross command-ring submissions through
+     * maybe_submit(). Associate the entire scope with the final submission:
+     * every later submission waits on the preceding timeline value, so the
+     * final slot cannot complete before any earlier slot that referenced
+     * these resources. Retaining them slightly longer is intentional and
+     * avoids a per-submission ownership list. */
     uint32_t slot = DS4_VK_COMMAND_RING_SIZE;
     for (uint32_t candidate = 0;
          candidate < DS4_VK_COMMAND_RING_SIZE; candidate++) {
@@ -1494,6 +1500,25 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())
         return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    ctx.layer_batch_descriptors.reserve(128);
+    ctx.layer_batch_tensors.reserve(32);
+    ctx.layer_batch_in_place_ptrs.reserve(16);
+    ctx.layer_batch_active = true;
+    return 1;
+}
+
+extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
+    (void)layer;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.layer_batch_active) return 0;
+    /* Prefill already owns an ordered layer-major stream.  Attaching the
+     * lifetime scope must not submit/wait on the preceding layer; the next
+     * submission carries the existing timeline wait, and Vulkan's in-command
+     * hazards preserve ordering. */
     if (!ctx.recording && !begin_cmd()) return 0;
     ctx.layer_batch_descriptors.clear();
     ctx.layer_batch_tensors.clear();

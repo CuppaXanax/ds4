@@ -30715,9 +30715,23 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
+#ifdef DS4_VULKAN_BUILD
+    /* The normal decode helper deliberately waits before opening a layer
+     * scope. Prefill already owns a layer-major stream, so use the no-wait
+     * scope only for ordinary single-GPU production work. */
+    const bool use_prefill_scope =
+        !metal_graph_layer_stage_profile_enabled(il) &&
+        !g->ssd_streaming && !g->quality && !g->placement && g->tp_world < 2 &&
+        !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
+    if (use_prefill_scope &&
+        ds4_gpu_batch_prefill_layer_begin(il) == 0) return false;
+#endif
     if (g->placement) {
         const int this_tier = g->placement[il + 1u];
         if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) {
+#ifdef DS4_VULKAN_BUILD
+            if (use_prefill_scope) (void)ds4_gpu_batch_layer_end(il);
+#endif
             return false;
         }
     }
@@ -30740,6 +30754,9 @@ static bool metal_graph_encode_layer_batch(
         g->batch_cur_hc_by_tier[g->active_tier] = metal_graph_batch_next_hc(g);
         g->batch_next_hc_by_tier[g->active_tier] = tmp;
     }
+#ifdef DS4_VULKAN_BUILD
+    if (use_prefill_scope && ds4_gpu_batch_layer_end(il) == 0) ok = false;
+#endif
     return ok;
 }
 

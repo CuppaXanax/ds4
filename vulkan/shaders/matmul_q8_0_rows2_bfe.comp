@@ -1,0 +1,96 @@
+#version 460 core
+/* Exact-preserving tiled Q8_0 projection for Flash attention-output groups.
+ *
+ * The common Flash out_a shape is 4096 -> 1024 (128 Q8 blocks).  The old
+ * one-row workgroup launches 256 lanes for 128 useful block lanes.  This
+ * variant assigns two output rows to one 256-lane workgroup, caches the
+ * activation blocks once, and retains the established per-row serial block
+ * accumulation order.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks_per_row;
+    uint y_scale;
+} pc;
+
+shared uint x_q8_shared[1152];
+shared float block_scale_products[256];
+shared int block_dots[256];
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(payload_buf[word]), int(byte_index * 8u), 8);
+}
+
+int x_i8(uint word, uint byte_index) {
+    return bitfieldExtract(int(x_q8_shared[word]), int(byte_index * 8u), 8);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint row_slot = lid >> 7u;
+    uint block = lid & 127u;
+    uint row = gl_WorkGroupID.x * 2u + row_slot;
+    uint token = gl_WorkGroupID.z;
+
+    if (pc.blocks_per_row != 128u || pc.y_scale != 2u ||
+        pc.n_tok == 0u || token >= pc.n_tok) {
+        barrier();
+        return;
+    }
+
+    /* The caller uses n_tok == 1 for this decode-only path.  Keeping the
+     * token coordinate in the address makes the fallback safe if the shader
+     * is inspected or reused for a batched shape later. */
+    for (uint i = lid; i < pc.blocks_per_row * 9u; i += 256u)
+        x_q8_shared[i] = x_q8_buf[token * pc.blocks_per_row * 9u + i];
+    barrier();
+
+    float weight_scale = 0.0;
+    float activation_scale = 0.0;
+    int block_dot = 0;
+    if (block < pc.blocks_per_row && row < pc.out_dim) {
+        uint record = row * pc.blocks_per_row + block;
+        uint scale_word = scale_buf[record >> 1u];
+        uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+        uint x_off = block * 9u;
+        uint count = min(32u, pc.in_dim - block * 32u);
+        for (uint i = 0u; i < count; i++)
+            block_dot += i8_at(record * 8u + (i >> 2u), i & 3u) *
+                         x_i8(x_off + 1u + (i >> 2u), i & 3u);
+        weight_scale = f16tof32(scale_bits);
+        activation_scale = uintBitsToFloat(x_q8_shared[x_off]);
+    }
+
+    uint partial = row_slot * 128u + block;
+    block_scale_products[partial] = weight_scale * activation_scale;
+    block_dots[partial] = block_dot;
+    barrier();
+
+    if (lid < 256u && (lid & 127u) == 0u && row < pc.out_dim) {
+        float sum = 0.0;
+        uint base = row_slot * 128u;
+        for (uint b = 0u; b < pc.blocks_per_row; b++)
+            sum += block_scale_products[base + b] * float(block_dots[base + b]);
+        out_buf[token * pc.out_dim + row] = sum;
+    }
+}

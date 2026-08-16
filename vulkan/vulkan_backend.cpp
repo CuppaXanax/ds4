@@ -472,6 +472,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_aligned_bfe", 20, 4},
+        {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
@@ -2896,18 +2897,34 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         use_aligned = false;
     const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
     const char *rows8_env = getenv("DS4_VULKAN_Q8_ROWS8");
+    const char *rows2_env = getenv("DS4_VULKAN_Q8_ROWS2");
+    bool use_rows2 = use_aligned &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
+        !(rows2_env && strcmp(rows2_env, "0") == 0) &&
+        n_tok == 1 && in_dim == 4096 && blocks == 128 && out_dim == 1024;
     const bool use_rows8 = use_aligned &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
         !(rows8_env && strcmp(rows8_env, "0") == 0) &&
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
-    const char *shader_name = use_rows8
+    const char *shader_name = use_rows2
+        ? "matmul_q8_0_rows2_bfe"
+        : (use_rows8
         ? "matmul_q8_0_rows8_bfe"
         : (use_aligned
             ? (q8_mode && strcmp(q8_mode, "exact") == 0
                 ? "matmul_q8_0_aligned" : "matmul_q8_0_aligned_bfe")
-            : "matmul_q8_0_prequant");
+            : "matmul_q8_0_prequant"));
     auto si = g_vk.shader_map.find(shader_name);
+    if (si == g_vk.shader_map.end() && use_rows2) {
+        /* A stale shader bundle must fall back to the matching one-row
+         * dispatch geometry, never run the aligned shader with rows2's grid. */
+        use_rows2 = false;
+        shader_name = use_rows8
+            ? "matmul_q8_0_rows8_bfe"
+            : "matmul_q8_0_aligned_bfe";
+        si = g_vk.shader_map.find(shader_name);
+    }
     if (si == g_vk.shader_map.end() && use_rows8) {
         shader_name = "matmul_q8_0_aligned_bfe";
         si = g_vk.shader_map.find(shader_name);
@@ -2941,12 +2958,13 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     }
     buffers[descriptor_count++] = {obuf, ooff,
         (VkDeviceSize)(n_tok * out_dim * sizeof(float))};
-    const uint32_t dispatch_x = use_rows8
-        ? (uint32_t)((out_dim + 7u) / 8u) : y_scale;
-    const uint32_t dispatch_y = use_rows8 ? 1u : (uint32_t)y_count64;
+    const uint32_t dispatch_x = use_rows2
+        ? (uint32_t)((out_dim + 1u) / 2u)
+        : (use_rows8 ? (uint32_t)((out_dim + 7u) / 8u) : y_scale);
+    const uint32_t dispatch_y = (use_rows2 || use_rows8) ? 1u : (uint32_t)y_count64;
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks,
-        use_rows8 ? 8u : y_scale};
+        use_rows2 ? 2u : (use_rows8 ? 8u : y_scale)};
     if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader(shader_name, &pc, sizeof(pc),

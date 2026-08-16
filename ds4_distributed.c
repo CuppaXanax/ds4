@@ -15,6 +15,9 @@
 
 #include "ds4_distributed.h"
 #include "ds4_dist_prefill.h"
+#ifdef DS4_VULKAN_BUILD
+#include "ds4_gpu.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -7578,6 +7581,25 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
+#ifdef DS4_VULKAN_BUILD
+    const bool worker_slice_optin =
+        getenv("DS4_VULKAN_WORKER_SLICE_BATCH") != NULL &&
+        work.n_tokens == 1u && work.pos0 > 0u &&
+        work.layer_end >= work.layer_start &&
+        work.layer_end - work.layer_start + 1u == 4u &&
+        !getenv("DS4_DIST_DECODE_PROFILE") &&
+        !getenv("DS4_VULKAN_TIMELINE") &&
+        !getenv("DS4_VULKAN_TIMELINE_LAYER") &&
+        !getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") &&
+        !getenv("DS4_METAL_LAYER_STAGE_PROFILE") &&
+        !getenv("DS4_METAL_GRAPH_DUMP_PREFIX");
+    const bool worker_slice_active = worker_slice_optin &&
+        ds4_gpu_worker_slice_begin(work.layer_start, work.layer_end) != 0;
+    (void)worker_slice_active;
+#else
+    const bool worker_slice_optin = false;
+    const bool worker_slice_active = false;
+#endif
     const double eval_t0 = dist_now_sec();
     int eval_rc = ds4_session_eval_layer_slice(session->session,
                                                tokens,
@@ -7592,6 +7614,16 @@ static int dist_worker_process_work_payload(
                                                err,
                                                sizeof(err));
     const double eval_t1 = dist_now_sec();
+#ifdef DS4_VULKAN_BUILD
+    if (worker_slice_active) {
+        const int worker_end_rc =
+            ds4_gpu_worker_slice_end(work.layer_start, work.layer_end);
+        if (worker_end_rc == 0 && eval_rc == 0) {
+            snprintf(err, sizeof(err), "Vulkan worker slice retirement failed");
+            eval_rc = 1;
+        }
+    }
+#endif
     if (eval_rc == 0) {
         session->token_hash = work_result_hash;
         session->token_hash_valid = true;

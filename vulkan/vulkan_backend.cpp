@@ -28,6 +28,7 @@
 #include <string>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <thread>
 #include <algorithm>
@@ -81,6 +82,22 @@ static constexpr uint32_t DS4_VK_TIMELINE_QUERY_COUNT = 2048;
 static constexpr uint64_t DS4_VK_TIMELINE_MAX_DISPATCHES =
     DS4_VK_TIMELINE_QUERY_COUNT / 2u;
 
+/* A descriptor set cannot be updated while an earlier dispatch that binds it
+ * is in flight. Worker slices consume one persistent set per dispatch from a
+ * per-layout arena; cursors reset only after submit+wait handoff. */
+struct WorkerDescriptorArena {
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> sets;
+    size_t cursor = 0;
+};
+
+struct WorkerResourceUse {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize begin = 0;
+    VkDeviceSize end = 0;
+    VkAccessFlags access = 0;
+};
+
 struct VulkanCommandCtx {
     VkCommandPool   pool     = VK_NULL_HANDLE;
     VkCommandBuffer cmd      = VK_NULL_HANDLE;
@@ -127,9 +144,18 @@ struct VulkanCommandCtx {
     uint64_t layer_timeline_stop_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
+    bool worker_slice_active = false;
+    uint32_t worker_slice_start = UINT32_MAX;
+    uint32_t worker_slice_end = UINT32_MAX;
+    uint64_t worker_dispatch_count = 0;
+    uint64_t worker_hazard_count = 0;
+    uint64_t worker_submit_count = 0;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
+    std::vector<WorkerDescriptorArena> worker_descriptor_arenas;
+    std::unordered_set<VkDescriptorSet> worker_descriptor_sets;
+    std::vector<WorkerResourceUse> worker_resource_uses;
 };
 
 struct ShaderEntry {
@@ -852,9 +878,22 @@ static void timeline_barrier(VulkanCommandCtx &ctx, const char *name) {
     (void)timeline_add(ctx, TimelineEventKind::Barrier, name);
 }
 
+static void worker_hazard_barrier(VulkanCommandCtx &ctx, const char *name,
+                                  VkDescriptorBufferInfo *buffers,
+                                  uint32_t count);
+
+static bool worker_resource_hazards_enabled(void) {
+    return getenv("DS4_VULKAN_WORKER_RESOURCE_HAZARDS") != nullptr;
+}
+
+static bool worker_slice_trace_enabled(void) {
+    return getenv("DS4_VULKAN_WORKER_SLICE_TRACE") != nullptr;
+}
+
 static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
                               VkDescriptorBufferInfo *buffers, uint32_t count,
                               uint32_t x, uint32_t y, uint32_t z) {
+    if (ctx.worker_slice_active) ctx.worker_dispatch_count++;
     const uint64_t dispatch_index = ctx.timeline_seen_dispatches++;
     const bool capture = ctx.timeline_enabled &&
         dispatch_index >= ctx.timeline_skip_dispatches &&
@@ -863,6 +902,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
         if (ctx.timeline_collecting && !ctx.timeline_queries_pending &&
             ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
             timeline_dump(ctx);
+        worker_hazard_barrier(ctx, name, buffers, count);
         vkCmdDispatch(ctx.cmd, x, y, z);
         return;
     }
@@ -883,6 +923,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
                                 ctx.timestamp_pool, event->first_query);
         }
     }
+    worker_hazard_barrier(ctx, name, buffers, count);
     vkCmdDispatch(ctx.cmd, x, y, z);
     if (event) event->host_end_ns = timeline_now_ns();
     if (event && event->first_query != UINT32_MAX)
@@ -904,6 +945,200 @@ static void timeline_descriptors(VulkanCommandCtx &ctx, const char *name,
     for (uint32_t i = 0; i < count; i++)
         if (buffers[i].range <= UINT64_MAX - event->bytes)
             event->bytes += buffers[i].range;
+}
+
+/* Every descriptor is read by default. This table supplies the actual write
+ * bindings for the production shader ABIs. Unknown names fail closed: an
+ * over-barrier is safe, while a missed write would be a correctness bug. */
+static uint32_t worker_write_mask(const char *name, uint32_t count) {
+    const uint32_t all = count >= 32u ? UINT32_MAX :
+        (count == 0 ? 0u : ((1u << count) - 1u));
+    if (!name) return all;
+    uint32_t mask = 0;
+    auto add = [&](uint32_t binding) {
+        if (binding < count) mask |= 1u << binding;
+    };
+
+    /* Routed stages pass a stage label rather than shader name. */
+    if (count >= 6 &&
+        (!strcmp(name, "validate_selected") ||
+         !strcmp(name, "quantize_input") || !strcmp(name, "gate") ||
+         !strcmp(name, "gate_iq2_words") || !strcmp(name, "up") ||
+         !strcmp(name, "up_iq2_words") || !strcmp(name, "swiglu") ||
+         !strcmp(name, "requantization") || !strcmp(name, "down") ||
+         !strcmp(name, "down_words") || !strcmp(name, "down_raw") ||
+         !strcmp(name, "reduction"))) {
+        add(4);
+        return mask;
+    }
+    if (!strcmp(name, "down_reduce_q2")) {
+        add(3);
+        return mask;
+    }
+    if (!strcmp(name, "gate_up_swiglu_iq2")) {
+        add(4); add(5); add(6);
+        return mask;
+    }
+    if (!strcmp(name, "gate_up_swiglu_iq2_q8")) {
+        add(4);
+        return mask;
+    }
+
+    if (!strcmp(name, "fill_f32") || !strcmp(name, "fp8_kv_quantize") ||
+        !strcmp(name, "head_rms_norm") ||
+        !strcmp(name, "head_rms_norm_rope_tail") ||
+        !strcmp(name, "rope_tail") || !strcmp(name, "indexer_qat") ||
+        !strcmp(name, "attention_prefill_raw") ||
+        !strcmp(name, "attention_decode_mixed") ||
+        !strcmp(name, "attention_decode_mixed_wave64") ||
+        !strcmp(name, "attention_decode_mixed_rope") ||
+        !strcmp(name, "attention_mixed_online") ||
+        !strcmp(name, "attention_indexed_online_wave64") ||
+        !strcmp(name, "attention_decode_raw_batch") ||
+        !strcmp(name, "indexer_scores") || !strcmp(name, "indexer_topk") ||
+        !strcmp(name, "topk_mask") || !strcmp(name, "output_hc_weights") ||
+        !strcmp(name, "store_raw_kv_f16") || !strcmp(name, "hc_weighted_sum") ||
+        !strcmp(name, "hc_expand")) add(0);
+    else if (!strcmp(name, "rms_norm")) add(1);
+    else if (!strcmp(name, "rms_norm_weight") ||
+             !strcmp(name, "rms_norm_weight_rows") ||
+             !strcmp(name, "add_f32") || !strcmp(name, "swiglu") ||
+             !strcmp(name, "matmul_f32") || !strcmp(name, "matmul_f16") ||
+             !strcmp(name, "matmul_f16_fast") ||
+             !strcmp(name, "matmul_q8_0") ||
+             !strcmp(name, "matmul_q8_0_simple") ||
+             !strcmp(name, "matmul_q8_0_prequant")) add(2);
+    else if (!strcmp(name, "matmul_q8_0_aligned") ||
+             !strcmp(name, "matmul_q8_0_aligned_bfe") ||
+             !strcmp(name, "matmul_q8_0_wave64_bfe") ||
+             !strcmp(name, "matmul_q8_0_rows2_bfe") ||
+             !strcmp(name, "matmul_q8_0_rows8_bfe") ||
+             !strcmp(name, "matmul_q8_0_group_bfe") ||
+             !strcmp(name, "matmul_q8_0_group_rows_bfe")) add(3);
+    else if (!strcmp(name, "matmul_q8_0_hc_expand_rows2_bfe")) {
+        add(3); add(4);
+    } else if (!strcmp(name, "quantize_q8_0_prequant")) add(1);
+    else if (!strcmp(name, "group_copy")) add(1);
+    else if (!strcmp(name, "hc_split_weighted_sum")) {
+        add(0); add(1); add(2);
+    } else if (!strcmp(name, "router_select")) {
+        add(0); add(1); add(2);
+    } else if (!strcmp(name, "compressor_clear") ||
+               !strcmp(name, "compressor_shift_ratio4")) {
+        add(0); add(1);
+    } else if (!strcmp(name, "compressor_pool_state") ||
+               !strcmp(name, "compressor_pool") ||
+               !strcmp(name, "compressor_rope_stride")) {
+        add(0);
+    } else if (!strcmp(name, "compressor_set_rows") ||
+               !strcmp(name, "compressor_store")) {
+        add(0); add(1);
+    } else if (!strcmp(name, "routed_moe") ||
+               !strcmp(name, "routed_moe_fused") ||
+               !strcmp(name, "routed_moe_fused_mid") ||
+               !strcmp(name, "routed_moe_down_reduce_q2")) {
+        /* These are shader names, not stage labels; use their canonical ABI. */
+        if (!strcmp(name, "routed_moe_down_reduce_q2")) add(3);
+        else { add(4); if (!strcmp(name, "routed_moe_fused")) { add(5); add(6); } }
+    } else if (!strcmp(name, "matmul_quant_k")) {
+        /* Legacy generated name; no current production shader has this ABI. */
+        return all;
+    } else {
+        return all;
+    }
+    return mask;
+}
+
+static void worker_hazard_barrier(VulkanCommandCtx &ctx, const char *name,
+                                  VkDescriptorBufferInfo *buffers,
+                                  uint32_t count) {
+    if (!worker_resource_hazards_enabled() || !ctx.worker_slice_active ||
+        !ctx.recording || !buffers || count == 0)
+        return;
+    const uint32_t write_mask = worker_write_mask(name, count);
+    bool hazard = false;
+    std::vector<WorkerResourceUse> current;
+    current.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (buffers[i].buffer == VK_NULL_HANDLE || buffers[i].range == 0 ||
+            buffers[i].range > UINT64_MAX - buffers[i].offset)
+            continue;
+        WorkerResourceUse use;
+        use.buffer = buffers[i].buffer;
+        use.begin = buffers[i].offset;
+        use.end = buffers[i].offset + buffers[i].range;
+        use.access = (i < 32u && (write_mask & (1u << i)))
+            ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+            : VK_ACCESS_SHADER_READ_BIT;
+        current.push_back(use);
+        for (const WorkerResourceUse &old : ctx.worker_resource_uses) {
+            if (old.buffer != use.buffer || old.end <= use.begin ||
+                use.end <= old.begin)
+                continue;
+            const bool old_write = (old.access & VK_ACCESS_SHADER_WRITE_BIT) != 0;
+            const bool new_write = (use.access & VK_ACCESS_SHADER_WRITE_BIT) != 0;
+            if (old_write || new_write) { hazard = true; break; }
+        }
+    }
+    if (hazard) {
+        ctx.worker_hazard_count++;
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = barrier.srcAccessMask;
+        timeline_barrier(ctx, "worker_resource_hazard");
+        vkCmdPipelineBarrier(ctx.cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+        /* The barrier retires every prior tracked access. Keeping it would
+         * repeatedly rediscover the same old write and over-serialize the
+         * remainder of the slice. */
+        ctx.worker_resource_uses.clear();
+    }
+    ctx.worker_resource_uses.insert(ctx.worker_resource_uses.end(),
+                                    current.begin(), current.end());
+}
+
+static bool worker_descriptor_set(VulkanCommandCtx &ctx,
+                                  VkDescriptorSetLayout layout,
+                                  VkDescriptorSet &set) {
+    if (!ctx.worker_slice_active || layout == VK_NULL_HANDLE) return false;
+    WorkerDescriptorArena *arena = nullptr;
+    for (WorkerDescriptorArena &candidate : ctx.worker_descriptor_arenas) {
+        if (candidate.layout == layout) { arena = &candidate; break; }
+    }
+    if (!arena) {
+        ctx.worker_descriptor_arenas.push_back({});
+        arena = &ctx.worker_descriptor_arenas.back();
+        arena->layout = layout;
+    }
+    if (arena->cursor == arena->sets.size()) {
+        constexpr uint32_t grow = 64;
+        std::vector<VkDescriptorSetLayout> layouts(grow, layout);
+        std::vector<VkDescriptorSet> sets(grow, VK_NULL_HANDLE);
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = g_vk.desc_pool;
+        ai.descriptorSetCount = grow;
+        ai.pSetLayouts = layouts.data();
+        if (vkAllocateDescriptorSets(g_vk.device, &ai, sets.data()) != VK_SUCCESS)
+            return false;
+        arena->sets.insert(arena->sets.end(), sets.begin(), sets.end());
+        for (VkDescriptorSet allocated : sets)
+            ctx.worker_descriptor_sets.insert(allocated);
+    }
+    set = arena->sets[arena->cursor++];
+    return true;
+}
+
+static void worker_reset_descriptor_cursors(VulkanCommandCtx &ctx) {
+    for (WorkerDescriptorArena &arena : ctx.worker_descriptor_arenas)
+        arena.cursor = 0;
+    ctx.worker_resource_uses.clear();
 }
 
 static void timeline_resource(VulkanCommandCtx &ctx, TimelineEventKind kind,
@@ -1260,6 +1495,7 @@ static int defer_layer_batch_resources(VulkanCommandCtx &ctx) {
 static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     const bool was_active = ctx.layer_batch_active;
+    const bool worker_scope = ctx.worker_slice_active;
     ctx.layer_batch_active = false;
     /* Selected-layer capture normally fences at layer end so timestamp
      * queries and resources are immediately retired.  The production decode
@@ -1268,11 +1504,19 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
      * enclosing token completion. */
     const bool nonblocking_timeline = ctx.layer_timeline_active &&
         getenv("DS4_VULKAN_TIMELINE_LAYER_NO_WAIT") != nullptr;
-    const bool defer = ctx.command_count != 0 && !resume &&
+    const bool defer = !worker_scope && ctx.command_count != 0 && !resume &&
         (!ctx.layer_timeline_active || nonblocking_timeline) &&
         command_ring_enabled();
     int ok = defer ? end_and_submit() : submit_and_wait_force();
     if (ok && defer) ok = defer_layer_batch_resources(ctx);
+    if (!ok) {
+        /* A failed submit/wait must leave the scope live. In particular, the
+         * persistent worker descriptor cursor may not be reused until the
+         * completed scope has released its in-flight command buffer. */
+        ctx.layer_batch_active = was_active;
+        return 0;
+    }
+    if (worker_scope) ctx.worker_submit_count++;
     if (defer) return ok;
     const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
@@ -1295,6 +1539,7 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     ctx.layer_batch_in_place_ptrs.clear();
     if (ok && resume && !ctx.recording) ok = begin_cmd();
     ctx.layer_batch_active = was_active && resume && ok;
+    if (!ok && was_active) ctx.layer_batch_active = true;
     return ok;
 }
 
@@ -1335,14 +1580,17 @@ static int dispatch_shader(const char *name,
 
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e.pipeline);
 
-    /* Allocate + update descriptor set */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &e.desc_layout;
+    /* Allocate + update descriptor set. Worker slices use a persistent
+     * per-layout arena; all other paths retain one-shot allocation. */
     VkDescriptorSet ds;
-    VK_CHECK_RAW(vkAllocateDescriptorSets(g_vk.device, &dai, &ds));
+    if (!worker_descriptor_set(c, e.desc_layout, ds)) {
+        VkDescriptorSetAllocateInfo dai{};
+        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dai.descriptorPool = g_vk.desc_pool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &e.desc_layout;
+        VK_CHECK_RAW(vkAllocateDescriptorSets(g_vk.device, &dai, &ds));
+    }
 
     std::vector<VkWriteDescriptorSet> writes(n_bufs);
     for (uint32_t i = 0; i < n_bufs; i++) {
@@ -1414,6 +1662,12 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, c] : g_vk.cmd_ctxs) {
         (void)retire_completed_slots(c, c.last_submit_value);
         timeline_dump(c);
+        for (WorkerDescriptorArena &arena : c.worker_descriptor_arenas) {
+            for (VkDescriptorSet set : arena.sets)
+                (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+        }
+        c.worker_descriptor_arenas.clear();
+        c.worker_descriptor_sets.clear();
         for (VkQueryPool pool : c.timestamp_pools)
             if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
@@ -1687,8 +1941,31 @@ int ds4_gpu_flush_commands(void) {
     return ok;
 }
 int ds4_gpu_end_commands(void) {
-    int ok = submit_and_wait();
     auto &ctx = get_cmd_ctx();
+    int ok;
+    if (ctx.worker_slice_active) {
+        const bool had_batch = ctx.layer_batch_active;
+        ok = had_batch
+            ? retire_layer_batch_span(ctx, false)
+            : submit_and_wait_force();
+        if (ok && !had_batch) ctx.worker_submit_count++;
+        if (ok) {
+            if (worker_slice_trace_enabled())
+                fprintf(stderr,
+                        "ds4: VULKAN worker_slice end layers=%u:%u "
+                        "dispatches=%llu hazards=%llu submits=%llu waits=1\n",
+                        ctx.worker_slice_start, ctx.worker_slice_end,
+                        (unsigned long long)ctx.worker_dispatch_count,
+                        (unsigned long long)ctx.worker_hazard_count,
+                        (unsigned long long)ctx.worker_submit_count);
+            ctx.worker_resource_uses.clear();
+            ctx.worker_slice_active = false;
+            ctx.worker_slice_start = UINT32_MAX;
+            ctx.worker_slice_end = UINT32_MAX;
+        }
+    } else {
+        ok = submit_and_wait();
+    }
     if (ok && ctx.layer_timeline_end_pending)
         timeline_layer_summary(ctx);
     if (ok && ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
@@ -1756,8 +2033,12 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
 }
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.worker_slice_active) {
+        if (layer < ctx.worker_slice_start || layer > ctx.worker_slice_end)
+            return 0;
+        if (ctx.layer_batch_active) return 1;
+    }
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0) {
         /* Decode records token embedding before opening the first layer
@@ -1780,6 +2061,67 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
     return 1;
 }
 
+extern "C" int ds4_gpu_worker_slice_begin(uint32_t layer_start,
+                                            uint32_t layer_end) {
+    auto &ctx = get_cmd_ctx();
+    if (ctx.worker_slice_active || ctx.layer_batch_active ||
+        layer_end < layer_start ||
+        layer_end - layer_start + 1u != 4u ||
+        getenv("DS4_VULKAN_WORKER_SLICE_BATCH") == nullptr ||
+        getenv("DS4_DIST_DECODE_PROFILE") != nullptr ||
+        getenv("DS4_VULKAN_TIMELINE") != nullptr ||
+        getenv("DS4_VULKAN_TIMELINE_LAYER") != nullptr ||
+        getenv("DS4_VULKAN_PROFILE_ROUTED_MOE") != nullptr ||
+        getenv("DS4_VULKAN_DEBUG") != nullptr ||
+        getenv("DS4_METAL_LAYER_STAGE_PROFILE") != nullptr ||
+        getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != nullptr)
+        return 0;
+    ctx.worker_slice_active = true;
+    ctx.worker_slice_start = layer_start;
+    ctx.worker_slice_end = layer_end;
+    ctx.worker_dispatch_count = 0;
+    ctx.worker_hazard_count = 0;
+    ctx.worker_submit_count = 0;
+    if (worker_slice_trace_enabled())
+        fprintf(stderr, "ds4: VULKAN worker_slice begin layers=%u:%u\n",
+                layer_start, layer_end);
+    worker_reset_descriptor_cursors(ctx);
+    return 1;
+}
+
+extern "C" int ds4_gpu_worker_slice_active(void) {
+    return get_cmd_ctx().worker_slice_active ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_worker_slice_end(uint32_t layer_start,
+                                          uint32_t layer_end) {
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.worker_slice_active) return 1;
+    if (ctx.worker_slice_start != layer_start ||
+        ctx.worker_slice_end != layer_end) return 0;
+    const bool had_batch = ctx.layer_batch_active;
+    int ok = had_batch
+        ? retire_layer_batch_span(ctx, false)
+        : submit_and_wait_force();
+    if (ok && !had_batch) ctx.worker_submit_count++;
+    if (ok) {
+        if (worker_slice_trace_enabled())
+            fprintf(stderr,
+                    "ds4: VULKAN worker_slice end layers=%u:%u "
+                    "dispatches=%llu hazards=%llu submits=%llu waits=%u\n",
+                    ctx.worker_slice_start, ctx.worker_slice_end,
+                    (unsigned long long)ctx.worker_dispatch_count,
+                    (unsigned long long)ctx.worker_hazard_count,
+                    (unsigned long long)ctx.worker_submit_count,
+                    ctx.layer_batch_active ? 0u : 1u);
+        ctx.worker_resource_uses.clear();
+        ctx.worker_slice_active = false;
+        ctx.worker_slice_start = UINT32_MAX;
+        ctx.worker_slice_end = UINT32_MAX;
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
@@ -1800,8 +2142,13 @@ extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
 }
 
 extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.worker_slice_active) {
+        if (!ctx.layer_batch_active || layer < ctx.worker_slice_start ||
+            layer > ctx.worker_slice_end)
+            return 0;
+        return 1;
+    }
     if (!ctx.layer_batch_active) return 1;
     return retire_layer_batch_span(ctx, false);
 }
@@ -2480,6 +2827,10 @@ extern "C" void ds4_gpu_router_overlap_hint(int active) {
 
 static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording,
                                   bool allow_router_defer = false) {
+    if (ctx.worker_slice_active && worker_resource_hazards_enabled()) {
+        ctx.command_count++;
+        return 1;
+    }
     const bool defer_router_dependency =
         allow_router_defer && g_router_overlap_hint && ctx.layer_batch_active;
     if (!defer_router_dependency) {
@@ -2509,14 +2860,17 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         for (uint32_t i = 0; i < count; i++)
             if (buffers[i].offset % alignment != 0) return 0;
     }
-    VkDescriptorSetAllocateInfo allocate{};
-    allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocate.descriptorPool = g_vk.desc_pool;
-    allocate.descriptorSetCount = 1;
-    allocate.pSetLayouts = &shader.desc_layout;
     const uint64_t descriptor_start = timeline_now_ns();
-    if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
-        return 0;
+    auto &ctx = get_cmd_ctx();
+    if (!worker_descriptor_set(ctx, shader.desc_layout, set)) {
+        VkDescriptorSetAllocateInfo allocate{};
+        allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocate.descriptorPool = g_vk.desc_pool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &shader.desc_layout;
+        if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
+            return 0;
+    }
 
     std::vector<VkWriteDescriptorSet> writes(count);
     for (uint32_t i = 0; i < count; i++) {
@@ -2531,7 +2885,6 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
     vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
     timeline_duration_current(TimelineEventKind::DescriptorAlloc,
                               "descriptor_cpu", descriptor_start);
-    auto &ctx = get_cmd_ctx();
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
     return 1;
@@ -2539,6 +2892,8 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
 
 static int release_simple_descriptors(VkDescriptorSet set) {
     auto &ctx = get_cmd_ctx();
+    if (ctx.worker_slice_active && ctx.worker_descriptor_sets.count(set) != 0)
+        return 1;
     if (ctx.layer_batch_active) {
         ctx.layer_batch_descriptors.push_back(set);
         maybe_submit();
@@ -2557,6 +2912,8 @@ static int release_simple_descriptors(VkDescriptorSet set) {
 
 static int release_or_defer_simple_descriptors(VulkanCommandCtx &ctx,
                                                VkDescriptorSet set) {
+    if (ctx.worker_slice_active && ctx.worker_descriptor_sets.count(set) != 0)
+        return 1;
     if (ctx.attention_output_batch) {
         ctx.attention_output_descriptors.push_back(set);
         maybe_submit();
@@ -2910,12 +3267,15 @@ int ds4_gpu_matmul_q8_0_tensor(
             (uint64_t)tile_n * out_dim > UINT32_MAX) return 0;
         if (c.recording && c.command_count != 0 && !submit_and_wait()) return 0;
         if (!c.recording && !begin_cmd()) return 0;
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &sh.desc_layout;
         VkDescriptorSet ds;
-        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
+        if (!worker_descriptor_set(c, sh.desc_layout, ds)) {
+            VkDescriptorSetAllocateInfo dai{};
+            dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
+            dai.pSetLayouts = &sh.desc_layout;
+            if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS)
+                return 0;
+        }
         const VkDeviceSize x_size = (VkDeviceSize)tile_n * in_dim * sizeof(float);
         const VkDeviceSize o_size = (VkDeviceSize)tile_n * out_dim * sizeof(float);
         const VkDeviceSize tile_x_off =
@@ -2951,14 +3311,16 @@ int ds4_gpu_matmul_q8_0_tensor(
         vkCmdPushConstants(c.cmd, sh.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         timeline_dispatch(c, "matmul_q8_0", bufs, 3, y_scale, y_cnt, tile_n);
         c.command_count++;
-        VkMemoryBarrier mb{};
-        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        timeline_barrier(c, "matmul_q8_0_compute_dependency");
-        vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
-                             0, nullptr, 0, nullptr);
+        if (!(c.worker_slice_active && worker_resource_hazards_enabled())) {
+            VkMemoryBarrier mb{};
+            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            timeline_barrier(c, "matmul_q8_0_compute_dependency");
+            vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                                 0, nullptr, 0, nullptr);
+        }
         if (!submit_and_wait()) return 0;
         if (!release_simple_descriptors(ds)) return 0;
         timeline_resource(c, TimelineEventKind::DescriptorFree,
@@ -6851,6 +7213,7 @@ static bool ds4gk_routed_down_reduce_appliance(
 static void ds4gk_routed_output_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         VkDescriptorBufferInfo *buffers, uint32_t buffer_count) {
+    if (ctx.worker_slice_active && worker_resource_hazards_enabled()) return;
     VkBufferMemoryBarrier barriers[3] = {};
     uint32_t count = 0;
     auto add = [&](uint32_t binding) {
@@ -6890,6 +7253,7 @@ static void ds4gk_routed_input_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
         uint32_t buffer_count) {
+    if (ctx.worker_slice_active && worker_resource_hazards_enabled()) return;
     VkBufferMemoryBarrier barriers[2] = {};
     uint32_t count = 0;
     auto add = [&](uint32_t binding) {

@@ -118,6 +118,11 @@ int ds4_gpu_batch_layer_begin(uint32_t layer);
  * preceding work already recorded in the command stream. */
 int ds4_gpu_batch_prefill_layer_begin(uint32_t layer);
 int ds4_gpu_batch_layer_end(uint32_t layer);
+/* Opt-in scope for a contiguous distributed Vulkan worker decode slice.  The
+ * backend retains per-layer descriptors/scratch until output handoff. */
+int ds4_gpu_worker_slice_begin(uint32_t layer_start, uint32_t layer_end);
+int ds4_gpu_worker_slice_active(void);
+int ds4_gpu_worker_slice_end(uint32_t layer_start, uint32_t layer_end);
 #endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

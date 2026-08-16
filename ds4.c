@@ -59833,6 +59833,14 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
+#ifdef DS4_VULKAN_BUILD
+        const bool worker_slice_batch =
+            !g->ssd_streaming && layer_end >= layer_start &&
+            layer_end - layer_start + 1u == 4u &&
+            ds4_gpu_worker_slice_active() != 0;
+#else
+        const bool worker_slice_batch = false;
+#endif
         if (g->ssd_streaming) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
@@ -59882,7 +59890,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok &&
                     split_after_layers != 0 &&
                     encoded_layers == split_after_layers &&
-                    il < layer_end)
+                    il < layer_end && !worker_slice_batch)
                 {
                     ok = ds4_gpu_flush_commands() != 0;
                 }

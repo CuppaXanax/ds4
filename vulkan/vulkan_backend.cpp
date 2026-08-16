@@ -512,6 +512,7 @@ static int load_all_shaders(void) {
         {"attention_decode_mixed_wave64", 32, 6},
         {"attention_decode_mixed_rope", 76, 6},
         {"attention_mixed_online", 64, 8},
+        {"attention_indexed_online_wave64", 108, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
         {"indexer_qat", 4, 1},
@@ -4688,6 +4689,48 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
     return 0;
 }
 
+static thread_local bool g_indexed_wave64_used = false;
+static thread_local bool g_indexed_wave64_inv_rope_used = false;
+
+/* BC-250 exposes the GFX1013/Radeon 890M identity through RADV.  Keep the
+ * tuned indexed path opt-in on every other device, while allowing explicit
+ * 1/0 overrides for bring-up and rollback. */
+static bool indexed_wave64_bc250_default(void) {
+    if (g_vk.caps.subgroup_size != 64u || !g_vk.caps.has_subgroup_shuffle)
+        return false;
+    const char *name = ds4_vulkan_gpu_name;
+    return name != nullptr &&
+        (strstr(name, "890M") != nullptr ||
+         strstr(name, "BC-250") != nullptr ||
+         strstr(name, "BC250") != nullptr);
+}
+
+static bool indexed_wave64_enabled(void) {
+    const char *env = getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+    return env != nullptr ? strcmp(env, "0") != 0
+                          : indexed_wave64_bc250_default();
+}
+
+static bool indexed_wave64_inv_rope_enabled(void) {
+    const char *env = getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE");
+    return env != nullptr ? strcmp(env, "0") != 0
+                          : indexed_wave64_bc250_default();
+}
+
+extern "C" int ds4_gpu_attention_indexed_wave64_used(void) {
+    return g_indexed_wave64_used ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_available(void) {
+    return indexed_wave64_enabled() && indexed_wave64_inv_rope_enabled() &&
+        g_vk.shader_map.find("attention_indexed_online_wave64") !=
+            g_vk.shader_map.end();
+}
+
+extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_used(void) {
+    return g_indexed_wave64_inv_rope_used ? 1 : 0;
+}
+
 static int dispatch_attention_mixed_online(
         ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
         uint64_t sinks_offset, const ds4_gpu_tensor *q,
@@ -4698,6 +4741,10 @@ static int dispatch_attention_mixed_online(
         uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t top_k, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim, uint32_t mode) {
+    if (mode == 1u) {
+        g_indexed_wave64_used = false;
+        g_indexed_wave64_inv_rope_used = false;
+    }
     uint64_t head_count, head_bytes, q_bytes, raw_bytes, comp_values;
     uint64_t comp_bytes, mask_bytes, topk_values, topk_bytes, sink_bytes;
     const uint64_t position_end = (uint64_t)pos0 + q_row0 + n_q;
@@ -4763,7 +4810,6 @@ static int dispatch_attention_mixed_online(
     const bool resume_recording = ctx.recording;
     if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
     if (!ctx.recording && !begin_cmd()) return 0;
-    DS4_VK_TRACE_KERNEL("attention_mixed_online");
     constexpr uint32_t max_query_tokens_per_dispatch = 256u;
     const uint64_t row_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t topk_row_bytes = (uint64_t)top_k * sizeof(uint32_t);
@@ -4802,10 +4848,71 @@ static int dispatch_attention_mixed_online(
             comp_kv_f16, use_mask, mode};
         const uint64_t tile_head_count = (uint64_t)tile_rows * n_head;
         const bool more_tiles = local_row0 + tile_rows < n_q;
+        /* Indexed 128K decode is the only path admitted to the register
+         * accumulator candidate.  It preserves the canonical online order,
+         * but requires one full wave and exactly two head values per lane. */
+        const bool use_indexed_wave64 = mode == 1u && head_dim == 128u &&
+            indexed_wave64_enabled() &&
+            g_vk.shader_map.find("attention_indexed_online_wave64") !=
+                g_vk.shader_map.end();
+        const bool use_indexed_wave64_inv_rope = use_indexed_wave64 &&
+            n_tokens == 1u && n_q == 1u &&
+            g_decode_attn_rope_fuse.armed &&
+            g_decode_attn_rope_fuse.n_rot == 64u &&
+            g_decode_attn_rope_fuse.inverse &&
+            indexed_wave64_inv_rope_enabled();
+        struct RopePC {
+            uint32_t n_tokens, pos0, q_row0, n_q, n_raw, raw_cap, raw_start, n_comp,
+                top_k, window, ratio, n_head, head_dim, comp_f16, use_mask, mode;
+            uint32_t rope_enable, n_rot, rope_pos0, n_ctx_orig;
+            int32_t inverse;
+            float freq_base, freq_scale, ext_factor, attn_factor,
+                  beta_fast, beta_slow;
+        } rope_pc = {
+            pc.n_tokens, pc.pos0, pc.q_row0, pc.n_q, pc.n_raw, pc.raw_cap,
+            pc.raw_start, pc.n_comp, pc.top_k, pc.window, pc.ratio, pc.n_head,
+            pc.head_dim, pc.comp_f16, pc.use_mask, pc.mode,
+            1u, g_decode_attn_rope_fuse.n_rot,
+            g_decode_attn_rope_fuse.pos0 + local_row0,
+            g_decode_attn_rope_fuse.n_ctx_orig,
+            g_decode_attn_rope_fuse.inverse ? 1 : 0,
+            g_decode_attn_rope_fuse.freq_base, g_decode_attn_rope_fuse.freq_scale,
+            g_decode_attn_rope_fuse.ext_factor, g_decode_attn_rope_fuse.attn_factor,
+            g_decode_attn_rope_fuse.beta_fast, g_decode_attn_rope_fuse.beta_slow};
+        /* The indexed Wave64 shader always has the extended push-constant
+         * layout, even when inverse RoPE is not fused.  Do not leave the
+         * trailing bytes stale: push constants persist across dispatches in a
+         * command buffer, so a prior fused dispatch could otherwise make a
+         * later ordinary indexed dispatch rotate its output accidentally. */
+        if (!use_indexed_wave64_inv_rope) {
+            rope_pc.rope_enable = 0u;
+            rope_pc.n_rot = 0u;
+            rope_pc.rope_pos0 = 0u;
+            rope_pc.n_ctx_orig = 0u;
+            rope_pc.inverse = 0;
+            rope_pc.freq_base = 0.0f;
+            rope_pc.freq_scale = 1.0f;
+            rope_pc.ext_factor = 0.0f;
+            rope_pc.attn_factor = 1.0f;
+            rope_pc.beta_fast = 0.0f;
+            rope_pc.beta_slow = 0.0f;
+        }
+        const char *shader_name = use_indexed_wave64
+            ? "attention_indexed_online_wave64" : "attention_mixed_online";
+        if (use_indexed_wave64) g_indexed_wave64_used = true;
+        DS4_VK_TRACE_KERNEL(shader_name);
         if (tile_head_count > g_vk.caps.max_compute_work_group_count[0] ||
-            !record_simple_shader("attention_mixed_online", &pc, sizeof(pc),
-                                  bufs, 8, (uint32_t)tile_head_count, 1, 1,
-                                  more_tiles || resume_recording)) return 0;
+            !record_simple_shader(
+                shader_name,
+                use_indexed_wave64 ? (const void *)&rope_pc : (const void *)&pc,
+                use_indexed_wave64 ? sizeof(rope_pc) : sizeof(pc),
+                bufs, 8, (uint32_t)tile_head_count, 1, 1,
+                more_tiles || resume_recording)) return 0;
+        if (use_indexed_wave64_inv_rope) {
+            g_indexed_wave64_inv_rope_used = true;
+            g_decode_attn_rope_fuse.armed = false;
+            g_decode_attn_rope_fuse.used = true;
+        }
         local_row0 += tile_rows;
     }
     return 1;

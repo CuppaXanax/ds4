@@ -1,0 +1,189 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/* Exact indexed mixed attention for one BC-250 wave64 per token/head.
+ *
+ * This keeps the canonical online softmax order from attention_mixed_online:
+ * each raw row is consumed before each selected compressed row, and the
+ * 32..1 reduction tree is unchanged.  The indexed decode shape is fixed at
+ * head_dim=128 by the host predicate, so each lane owns two values.  Values
+ * stay in registers across the score reduction and output update; the
+ * canonical path writes/reads the output buffer and executes workgroup
+ * barriers for every visible row.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer OutBuf { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q_val[]; };
+layout(set = 0, binding = 2) readonly buffer RawBuf { float raw_val[]; };
+layout(set = 0, binding = 3) readonly buffer CompBuf { uint comp_bits[]; };
+layout(set = 0, binding = 4) readonly buffer TopKBuf { uint topk_val[]; };
+layout(set = 0, binding = 5) readonly buffer MaskBuf { float mask_val[]; };
+layout(set = 0, binding = 6) readonly buffer SinkBuf { float sink_val[]; };
+layout(set = 0, binding = 7) readonly buffer UnusedBuf { uint unused_val[]; };
+layout(push_constant) uniform PC {
+    uint n_tokens; uint pos0; uint q_row0; uint n_q;
+    uint n_raw; uint raw_cap; uint raw_start; uint n_comp;
+    uint top_k; uint window; uint ratio; uint n_head;
+    uint head_dim; uint comp_f16; uint use_mask; uint mode;
+    uint rope_enable; uint n_rot; uint rope_pos0; uint n_ctx_orig;
+    int inverse;
+    float freq_base; float freq_scale; float ext_factor; float attn_factor;
+    float beta_fast; float beta_slow;
+} pc;
+
+float comp_at(uint index) {
+    if (pc.comp_f16 == 0u) return uintBitsToFloat(comp_bits[index]);
+    vec2 halves = unpackHalf2x16(comp_bits[index >> 1u]);
+    return (index & 1u) == 0u ? halves.x : halves.y;
+}
+
+float wave_sum_exact(float value, uint lane) {
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        float other = subgroupShuffle(value, lane + stride);
+        if (lane < stride) value += other;
+    }
+    return value;
+}
+
+float rope_ramp(float low, float high, uint i0) {
+    float y = (float(i0 / 2u) - low) / max(0.001, high - low);
+    return 1.0 - clamp(y, 0.0, 1.0);
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint work = gl_WorkGroupID.x;
+    const uint token = work / pc.n_head;
+    const uint head = work - token * pc.n_head;
+    if (token >= pc.n_q || head >= pc.n_head || pc.head_dim != 128u ||
+        pc.mode != 1u) return;
+
+    const uint dim = 128u;
+    const uint qbase = token * pc.n_head * dim + head * dim;
+    const float scale = inversesqrt(float(dim));
+    const float q0 = q_val[qbase + lane];
+    const float q1 = q_val[qbase + 64u + lane];
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float online_max = sink_val[head];
+    float online_denom = 1.0;
+
+    uint raw_count = 0u;
+    uint raw_first = 0u;
+    if (pc.n_raw != 0u &&
+        (pc.pos0 + pc.n_tokens - pc.n_raw) <= pc.pos0 + pc.q_row0 + token) {
+        const uint first_raw_pos = pc.pos0 + pc.n_tokens - pc.n_raw;
+        raw_first = first_raw_pos;
+        const uint qpos = pc.pos0 + pc.q_row0 + token;
+        if (pc.window != 0u && qpos + 1u > pc.window)
+            raw_first = max(raw_first, qpos + 1u - pc.window);
+        const uint last = min(qpos, first_raw_pos + pc.n_raw - 1u);
+        if (last >= raw_first)
+            raw_count = min(last - raw_first + 1u, pc.n_raw);
+    }
+
+    for (uint r = 0u; r < raw_count; r++) {
+        const uint row = (pc.raw_start + raw_first -
+            (pc.pos0 + pc.n_tokens - pc.n_raw) + r) % pc.raw_cap;
+        const uint base = row * dim;
+        const float v0 = raw_val[base + lane];
+        const float v1 = raw_val[base + 64u + lane];
+        float dot = 0.0;
+        dot += q0 * v0;
+        dot += q1 * v1;
+        dot = wave_sum_exact(dot, lane);
+
+        float factor = 1.0;
+        float weight = 0.0;
+        if (lane == 0u) {
+            const float score = dot * scale;
+            factor = score > online_max ? exp(online_max - score) : 1.0;
+            if (score > online_max) online_max = score;
+            weight = exp(score - online_max);
+            online_denom = online_denom * factor + weight;
+        }
+        factor = subgroupShuffle(factor, 0u);
+        weight = subgroupShuffle(weight, 0u);
+        acc0 = acc0 * factor + weight * v0;
+        acc1 = acc1 * factor + weight * v1;
+    }
+
+    const uint qpos = pc.pos0 + pc.q_row0 + token;
+    const uint visible = pc.ratio == 0u ? 0u :
+        min((qpos + 1u) / pc.ratio, pc.n_comp);
+    const uint comp_rows = min(pc.top_k, 512u);
+    for (uint c = 0u; c < comp_rows; c++) {
+        const uint row = topk_val[token * pc.top_k + c];
+        if (row >= visible) continue;
+        const float bias = pc.use_mask != 0u ? mask_val[row] : 0.0;
+        const uint base = row * dim;
+        const float v0 = comp_at(base + lane);
+        const float v1 = comp_at(base + 64u + lane);
+        float dot = 0.0;
+        if (bias > -1.0e20) {
+            dot += q0 * v0;
+            dot += q1 * v1;
+        }
+        dot = wave_sum_exact(dot, lane);
+
+        float factor = 1.0;
+        float weight = 0.0;
+        if (lane == 0u) {
+            const float score = bias <= -1.0e20 ? -1.0e30 : dot * scale + bias;
+            factor = score > online_max ? exp(online_max - score) : 1.0;
+            if (score > online_max) online_max = score;
+            weight = score <= -1.0e20 ? 0.0 : exp(score - online_max);
+            online_denom = online_denom * factor + weight;
+        }
+        factor = subgroupShuffle(factor, 0u);
+        weight = subgroupShuffle(weight, 0u);
+        if (bias > -1.0e20) {
+            acc0 = acc0 * factor + weight * v0;
+            acc1 = acc1 * factor + weight * v1;
+        }
+    }
+
+    const float denom = subgroupShuffle(online_denom, 0u);
+    acc0 /= denom;
+    acc1 /= denom;
+
+    /* The production 128-wide head has a 64-wide RoPE tail. Each lane's
+     * second register is one tail value; pair lanes exchange those registers
+     * and write the rotated values directly, with no shared-memory output or
+     * standalone rope dispatch. */
+    /* All lanes must execute the shuffles in uniform control flow.  The
+     * source lanes for the 32 pair writers are mirrored for lanes 32..63 so
+     * every invocation uses valid source IDs while the writes remain owned by
+     * lanes 0..31. */
+    const uint rope_i = (lane & 31u) * 2u;
+    const float rope_v0 = subgroupShuffle(acc1, rope_i);
+    const float rope_v1 = subgroupShuffle(acc1, rope_i + 1u);
+    if (pc.rope_enable != 0u && pc.n_rot == 64u && lane < 32u) {
+        const uint i = rope_i;
+        float theta_extrap = float(pc.rope_pos0) *
+            pow(pc.freq_base, -float(i) / float(pc.n_rot));
+        const float theta_interp = pc.freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = pc.attn_factor;
+        if (pc.ext_factor != 0.0) {
+            const float denom2 = 2.0 * log(pc.freq_base);
+            const float corr0 = max(0.0, floor(float(pc.n_rot) *
+                log(float(pc.n_ctx_orig) / (pc.beta_fast * 2.0 * 3.141592653589793)) / denom2));
+            const float corr1 = min(float(pc.n_rot - 1u), ceil(float(pc.n_rot) *
+                log(float(pc.n_ctx_orig) / (pc.beta_slow * 2.0 * 3.141592653589793)) / denom2));
+            const float mix = rope_ramp(corr0, corr1, i) * pc.ext_factor;
+            theta = theta_interp * (1.0 - mix) + theta_extrap * mix;
+            mscale *= 1.0 + 0.1 * log(1.0 / pc.freq_scale);
+        }
+        const float two_pi = 6.283185307179586;
+        theta -= round(theta / two_pi) * two_pi;
+        const float c = cos(theta) * mscale;
+        const float s = (pc.inverse != 0 ? -1.0 : 1.0) * sin(theta) * mscale;
+        out_val[qbase + 64u + i] = rope_v0 * c - rope_v1 * s;
+        out_val[qbase + 64u + i + 1u] = rope_v0 * s + rope_v1 * c;
+    }
+    out_val[qbase + lane] = acc0;
+    if (pc.rope_enable == 0u || pc.n_rot != 64u)
+        out_val[qbase + 64u + lane] = acc1;
+}

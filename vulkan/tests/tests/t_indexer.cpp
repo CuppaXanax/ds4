@@ -26,8 +26,11 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <string>
+#include <chrono>
 
 /* Per-row score used by both host fallbacks and the test reference. */
 static float ref_row_score(const float *qh, const float *w,
@@ -49,7 +52,7 @@ static float ref_row_score(const float *qh, const float *w,
 /* ------------------------------------------------------------------ */
 static int test_indexer_score_one(void) {
     const uint32_t n_head = 4, head_dim = 8, n_comp = 6;
-    const float scale = 1.0f / std::sqrtf((float)(n_head * head_dim));
+    const float scale = 1.0f / std::sqrt((float)(n_head * head_dim));
 
     /* q[h][d]: deterministic pattern with mixed signs so ReLU matters. */
     std::vector<float> q(n_head * head_dim);
@@ -98,7 +101,7 @@ static int test_indexer_score_one(void) {
     }
     rc = 0;
     for (uint32_t c = 0; c < n_comp; c++) {
-        if (!(std::fabsf(got[c] - ref[c]) <= 1e-3f)) {
+        if (!(std::fabs(got[c] - ref[c]) <= 1e-3f)) {
             fprintf(stderr, "indexer_score_one: c=%u got %.6f want %.6f\n",
                     c, got[c], ref[c]);
             rc = 1;
@@ -195,7 +198,7 @@ static int test_indexer_scores_decode_batch(void) {
             if (std::isinf(r) && r < 0.0f)
                 ok = std::isinf(g) && g < 0.0f;   /* masked row: -INFINITY */
             else
-                ok = std::fabsf(g - r) <= 1e-3f;
+                ok = std::fabs(g - r) <= 1e-3f;
             if (!ok) {
                 fprintf(stderr,
                         "indexer_scores_decode_batch: t=%u c=%u got %.6f want %.6f\n",
@@ -484,3 +487,486 @@ done:
     return rc;
 }
 REGISTER_TEST(indexed_attention_causal_filler, test_indexed_attention_causal_filler);
+
+/* Same-binary gate for the opt-in BC-250 indexed wave64 accumulator.  The
+ * shape mirrors the long-context production path: 128-wide heads, all 512
+ * selected compressed rows visible, and a non-empty raw ring suffix. */
+extern "C" int ds4_gpu_attention_indexed_wave64_used(void);
+extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_used(void);
+extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_available(void);
+extern "C" void ds4_gpu_set_decode_attn_rope_fuse(
+    uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig,
+    bool inverse, float freq_base, float freq_scale, float ext_factor,
+    float attn_factor, float beta_fast, float beta_slow);
+
+static void set_indexed_wave64_env(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DS4_VULKAN_ATTN_INDEXED_WAVE64", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_ATTN_INDEXED_WAVE64", value, 1);
+    else unsetenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+#endif
+}
+
+static void set_indexed_wave64_inv_rope_env(const char *value) {
+#if defined(_WIN32)
+    _putenv_s("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE", value, 1);
+    else unsetenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE");
+#endif
+}
+
+static int test_indexed_attention_wave64_exact_ab(void) {
+    const uint32_t n_tokens = 1, n_head = 2, head_dim = 128;
+    const uint32_t n_comp = 512, top_k = 512, raw_cap = 8, n_raw = 4;
+    const uint32_t pos0 = 4096, raw_start = 3, ratio = 4;
+    const uint32_t q_bytes = n_tokens * n_head * head_dim * sizeof(float);
+    const uint32_t raw_bytes = raw_cap * head_dim * sizeof(float);
+    const uint32_t comp_bytes = n_comp * head_dim * sizeof(float);
+    const uint32_t out_bytes = n_tokens * n_head * head_dim * sizeof(float);
+
+    std::vector<float> q(n_tokens * n_head * head_dim);
+    std::vector<float> raw(raw_cap * head_dim);
+    std::vector<float> comp(n_comp * head_dim);
+    std::vector<uint32_t> topk(top_k);
+    std::vector<float> plain(n_tokens * n_head * head_dim);
+    std::vector<float> base(n_tokens * n_head * head_dim);
+    std::vector<float> opt(n_tokens * n_head * head_dim);
+    std::vector<float> ordinary(n_tokens * n_head * head_dim);
+    std::vector<float> ref(n_tokens * n_head * head_dim);
+    for (uint32_t i = 0; i < q.size(); i++)
+        q[i] = 0.03125f * (float)((i * 17u) % 29u) - 0.4f;
+    for (uint32_t i = 0; i < raw.size(); i++)
+        raw[i] = 0.015625f * (float)((i * 11u) % 23u) - 0.2f;
+    for (uint32_t i = 0; i < comp.size(); i++)
+        comp[i] = 0.0078125f * (float)((i * 7u) % 41u) - 0.15f;
+    for (uint32_t c = 0; c < top_k; c++) topk[c] = c;
+
+    const float sinks[n_head] = {0.125f, -0.25f};
+    unsigned char model[16 + sizeof(sinks)] = {};
+    std::memcpy(model + 16, sinks, sizeof(sinks));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *rt = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *ct = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *tt = ds4_gpu_tensor_alloc(topk.size() * sizeof(uint32_t));
+    ds4_gpu_tensor *ordinary_out = ds4_gpu_tensor_alloc(out_bytes);
+    const char *saved = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+    const char *saved_rope = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE");
+    const bool had_saved = saved != nullptr;
+    const bool had_saved_rope = saved_rope != nullptr;
+    const std::string saved_value = saved ? saved : "";
+    const std::string saved_rope_value = saved_rope ? saved_rope : "";
+    const float rope_base = 10000.0f;
+    bool batch_active = false;
+    bool fused_used = false;
+    int rc = 1;
+    if (!out || !qt || !rt || !ct || !tt || !ordinary_out ||
+        !ds4_gpu_set_model_map(model, sizeof(model)) ||
+        !ds4_gpu_tensor_write(qt, 0, q.data(), q_bytes) ||
+        !ds4_gpu_tensor_write(rt, 0, raw.data(), raw_bytes) ||
+        !ds4_gpu_tensor_write(ct, 0, comp.data(), comp_bytes) ||
+        !ds4_gpu_tensor_write(tt, 0, topk.data(), topk.size() * sizeof(uint32_t)))
+        goto done;
+
+    /* Explicit kill switches establish the canonical fallback regardless of
+     * whether this test is running on the BC-250 default device. */
+    set_indexed_wave64_env("0");
+    set_indexed_wave64_inv_rope_env("0");
+    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            out, model, sizeof(model), 16, qt, rt, ct, 0, tt, n_tokens, pos0,
+            n_raw, raw_cap, raw_start, n_comp, top_k, 0, ratio, n_head, head_dim) ||
+        ds4_gpu_attention_indexed_wave64_used() != 0 ||
+        !ds4_gpu_tensor_read(out, 0, plain.data(), out_bytes) ||
+        !ds4_gpu_rope_tail_tensor(out, n_tokens, n_head, head_dim, 64u, pos0,
+                                  0u, true, rope_base, 1.0f, 0.0f, 1.0f,
+                                  0.0f, 0.0f) ||
+        !ds4_gpu_tensor_read(out, 0, base.data(), out_bytes))
+        goto done;
+
+    /* Empty overrides exercise the promoted BC-250 default. */
+    set_indexed_wave64_env(nullptr);
+    set_indexed_wave64_inv_rope_env(nullptr);
+    if (ds4_gpu_attention_indexed_wave64_inv_rope_available() == 0) {
+        fprintf(stderr, "indexed_attention_wave64_exact_ab: skipped (BC-250 Wave64 unavailable)\n");
+        rc = (std::getenv("DS4_TEST_REQUIRE_INDEXED_WAVE64") != nullptr) ? 1 : 0;
+        goto done;
+    }
+    ds4_gpu_set_decode_attn_rope_fuse(head_dim, 64u, pos0, 0u, true,
+                                      rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    /* Keep fused and ordinary indexed dispatches in one command-buffer
+     * lifetime. The second dispatch deliberately disables fusion; it must
+     * not inherit the fused RoPE fields from the first dispatch. */
+    if (!ds4_gpu_batch_layer_begin(0))
+        goto done;
+    batch_active = true;
+    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            out, model, sizeof(model), 16, qt, rt, ct, 0, tt, n_tokens, pos0,
+            n_raw, raw_cap, raw_start, n_comp, top_k, 0, ratio, n_head, head_dim) ||
+        ds4_gpu_attention_indexed_wave64_used() != 1)
+        goto done;
+    fused_used = ds4_gpu_attention_indexed_wave64_inv_rope_used() == 1;
+    set_indexed_wave64_inv_rope_env("0");
+    if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            ordinary_out, model, sizeof(model), 16, qt, rt, ct, 0, tt, n_tokens, pos0,
+            n_raw, raw_cap, raw_start, n_comp, top_k, 0, ratio, n_head, head_dim) ||
+        !ds4_gpu_batch_layer_end(0))
+        goto done;
+    batch_active = false;
+    /* Command-ring layer retirement is intentionally nonblocking; tensor
+     * reads expose mapped memory and do not fence the submitted work. */
+    if (!ds4_gpu_synchronize())
+        goto done;
+    if (!ds4_gpu_tensor_read(out, 0, opt.data(), out_bytes) ||
+        !ds4_gpu_tensor_read(ordinary_out, 0, ordinary.data(), out_bytes))
+        goto done;
+    /* Each mode-1 API call resets the per-call activation markers, so retain
+     * the fused result before the deliberate ordinary follow-up dispatch. */
+    if (ds4_gpu_attention_indexed_wave64_used() != 1 || !fused_used) {
+        fprintf(stderr, "indexed_attention_wave64_exact_ab: skipped (wave64 unavailable)\n");
+        rc = (std::getenv("DS4_TEST_REQUIRE_INDEXED_WAVE64") != nullptr) ? 1 : 0;
+        goto done;
+    }
+
+    if (std::memcmp(plain.data(), ordinary.data(), out_bytes) != 0) {
+        for (uint32_t i = 0; i < plain.size(); i++) {
+            if (plain[i] != ordinary[i]) {
+                fprintf(stderr, "indexed_attention_wave64_exact_ab: ordinary push mismatch i=%u "
+                        "plain=%a ordinary=%a\n", i, plain[i], ordinary[i]);
+                break;
+            }
+        }
+        goto done;
+    }
+
+    if (std::memcmp(base.data(), opt.data(), out_bytes) != 0) {
+        for (uint32_t i = 0; i < base.size(); i++) {
+            if (base[i] != opt[i]) {
+                fprintf(stderr, "indexed_attention_wave64_exact_ab: byte mismatch i=%u "
+                        "base=%a opt=%a\n", i, base[i], opt[i]);
+                break;
+            }
+        }
+        goto done;
+    }
+
+    /* Reference the same online order, retaining the canonical raw-then-topk
+     * sequence and float accumulator operations. */
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q.data() + h * head_dim;
+        float *oh = ref.data() + h * head_dim;
+        float max_score = sinks[h], denom = 1.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const float *v = raw.data() + ((raw_start + r) % raw_cap) * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * v[d];
+            const float score = dot * (1.0f / std::sqrt((float)head_dim));
+            const float factor = score > max_score ? std::exp(max_score - score) : 1.0f;
+            if (score > max_score) max_score = score;
+            const float weight = std::exp(score - max_score);
+            denom = denom * factor + weight;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] = oh[d] * factor + weight * v[d];
+        }
+        for (uint32_t c = 0; c < top_k; c++) {
+            const float *v = comp.data() + topk[c] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * v[d];
+            const float score = dot * (1.0f / std::sqrt((float)head_dim));
+            const float factor = score > max_score ? std::exp(max_score - score) : 1.0f;
+            if (score > max_score) max_score = score;
+            const float weight = std::exp(score - max_score);
+            denom = denom * factor + weight;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] = oh[d] * factor + weight * v[d];
+        }
+        for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        for (uint32_t pair = 0; pair < 32u; pair++) {
+            const uint32_t i = pair * 2u;
+            const float theta = float(pos0) *
+                std::pow(rope_base, -float(i) / 64.0f);
+            const float c = std::cos(theta);
+            const float s = -std::sin(theta);
+            const uint32_t tail = head_dim - 64u;
+            const float v0 = oh[tail + i];
+            const float v1 = oh[tail + i + 1u];
+            oh[tail + i] = v0 * c - v1 * s;
+            oh[tail + i + 1u] = v0 * s + v1 * c;
+        }
+    }
+    for (uint32_t i = 0; i < ref.size(); i++) {
+        if (std::fabs(base[i] - ref[i]) > 1e-3f ||
+            std::fabs(opt[i] - ref[i]) > 1e-3f) {
+            fprintf(stderr, "indexed_attention_wave64_exact_ab: reference mismatch i=%u "
+                    "base=%a opt=%a ref=%a\n", i, base[i], opt[i], ref[i]);
+            goto done;
+        }
+    }
+    rc = 0;
+done:
+    if (batch_active) (void)ds4_gpu_batch_layer_end(0);
+    if (had_saved) set_indexed_wave64_env(saved_value.c_str());
+    else set_indexed_wave64_env(nullptr);
+    if (had_saved_rope) set_indexed_wave64_inv_rope_env(saved_rope_value.c_str());
+    else set_indexed_wave64_inv_rope_env(nullptr);
+    if (tt) ds4_gpu_tensor_free(tt);
+    if (ordinary_out) ds4_gpu_tensor_free(ordinary_out);
+    if (ct) ds4_gpu_tensor_free(ct);
+    if (rt) ds4_gpu_tensor_free(rt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (out) ds4_gpu_tensor_free(out);
+    return rc;
+}
+REGISTER_TEST(indexed_attention_wave64_exact_ab, test_indexed_attention_wave64_exact_ab);
+
+/* Optional wall-time probe.  It is deliberately a separate test so normal
+ * kernel-test runs do not pay for 64 synchronous dispatches.  Set
+ * DS4_TEST_BENCH_INDEXED_WAVE64=1 on BC-250; set
+ * DS4_TEST_REQUIRE_INDEXED_WAVE64=1 as well to turn an unavailable candidate
+ * into a hard failure instead of a skip. */
+static int test_indexed_attention_wave64_bench(void) {
+    if (!std::getenv("DS4_TEST_BENCH_INDEXED_WAVE64")) return 0;
+    const uint32_t n_tokens = 1, n_head = 2, head_dim = 128;
+    const uint32_t n_comp = 512, top_k = 512, raw_cap = 128, n_raw = 128;
+    const uint32_t pos0 = 4096, raw_start = 0, ratio = 4, rounds = 32;
+    const uint32_t q_bytes = n_tokens * n_head * head_dim * sizeof(float);
+    const uint32_t raw_bytes = raw_cap * head_dim * sizeof(float);
+    const uint32_t comp_bytes = n_comp * head_dim * sizeof(float);
+    const uint32_t out_bytes = n_tokens * n_head * head_dim * sizeof(float);
+    std::vector<float> q(n_tokens * n_head * head_dim);
+    std::vector<float> raw(raw_cap * head_dim);
+    std::vector<float> comp(n_comp * head_dim);
+    std::vector<uint32_t> topk(top_k);
+    std::vector<float> sink_out(n_tokens * n_head * head_dim);
+    for (uint32_t i = 0; i < q.size(); i++)
+        q[i] = 0.03125f * (float)((i * 17u) % 29u) - 0.4f;
+    for (uint32_t i = 0; i < raw.size(); i++)
+        raw[i] = 0.015625f * (float)((i * 11u) % 23u) - 0.2f;
+    for (uint32_t i = 0; i < comp.size(); i++)
+        comp[i] = 0.0078125f * (float)((i * 7u) % 41u) - 0.15f;
+    for (uint32_t c = 0; c < top_k; c++) topk[c] = c;
+
+    const float sinks[n_head] = {0.125f, -0.25f};
+    unsigned char model[16 + sizeof(sinks)] = {};
+    std::memcpy(model + 16, sinks, sizeof(sinks));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *rt = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *ct = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *tt = ds4_gpu_tensor_alloc(topk.size() * sizeof(uint32_t));
+    const char *saved = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+    const bool had_saved = saved != nullptr;
+    const std::string saved_value = saved ? saved : "";
+    std::chrono::steady_clock::time_point fallback_begin, fallback_end;
+    std::chrono::steady_clock::time_point candidate_begin, candidate_end;
+    auto dispatch_and_read = [&]() -> bool {
+        if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                out, model, sizeof(model), 16, qt, rt, ct, 0, tt, n_tokens, pos0,
+                n_raw, raw_cap, raw_start, n_comp, top_k, 0, ratio,
+                n_head, head_dim)) return false;
+        return ds4_gpu_tensor_read(out, 0, sink_out.data(), out_bytes) != 0;
+    };
+    int rc = 1;
+    if (!out || !qt || !rt || !ct || !tt ||
+        !ds4_gpu_set_model_map(model, sizeof(model)) ||
+        !ds4_gpu_tensor_write(qt, 0, q.data(), q_bytes) ||
+        !ds4_gpu_tensor_write(rt, 0, raw.data(), raw_bytes) ||
+        !ds4_gpu_tensor_write(ct, 0, comp.data(), comp_bytes) ||
+        !ds4_gpu_tensor_write(tt, 0, topk.data(), topk.size() * sizeof(uint32_t)))
+        goto done;
+
+    set_indexed_wave64_env("0");
+    if (!dispatch_and_read()) goto done;
+    fallback_begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < rounds; i++)
+        if (!dispatch_and_read()) goto done;
+    fallback_end = std::chrono::steady_clock::now();
+
+    set_indexed_wave64_env("1");
+    if (!dispatch_and_read()) goto done;
+    if (ds4_gpu_attention_indexed_wave64_used() != 1) {
+        fprintf(stderr, "indexed_attention_wave64_bench: skipped (wave64 unavailable)\n");
+        rc = (std::getenv("DS4_TEST_REQUIRE_INDEXED_WAVE64") != nullptr) ? 1 : 0;
+        goto done;
+    }
+    candidate_begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < rounds; i++)
+        if (!dispatch_and_read()) goto done;
+    candidate_end = std::chrono::steady_clock::now();
+
+    {
+        const double fallback_ms = std::chrono::duration<double, std::milli>(
+            fallback_end - fallback_begin).count();
+        const double candidate_ms = std::chrono::duration<double, std::milli>(
+            candidate_end - candidate_begin).count();
+        fprintf(stderr,
+                "indexed_attention_wave64_bench: rounds=%u "
+                "fallback_total_ms=%.3f fallback_per_dispatch_ms=%.3f "
+                "candidate_total_ms=%.3f candidate_per_dispatch_ms=%.3f\n",
+                rounds, fallback_ms, fallback_ms / rounds,
+                candidate_ms, candidate_ms / rounds);
+    }
+    rc = 0;
+done:
+    if (had_saved) set_indexed_wave64_env(saved_value.c_str());
+    else set_indexed_wave64_env(nullptr);
+    if (tt) ds4_gpu_tensor_free(tt);
+    if (ct) ds4_gpu_tensor_free(ct);
+    if (rt) ds4_gpu_tensor_free(rt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (out) ds4_gpu_tensor_free(out);
+    return rc;
+}
+REGISTER_TEST(indexed_attention_wave64_bench, test_indexed_attention_wave64_bench);
+
+/* Focused production-shaped comparison for the opt-in indexed inverse-RoPE
+ * fusion.  The fallback performs indexed attention followed by standalone
+ * rope_tail; the candidate performs the same indexed attention with the
+ * inverse tail fused into its wave64 accumulator.  This is intentionally
+ * separate from the older Wave64-only probe so its timing covers the exact
+ * dispatch pair being considered for promotion.
+ *
+ * Set DS4_TEST_BENCH_INDEXED_WAVE64_INV_ROPE=1 on BC-250.  Set
+ * DS4_TEST_REQUIRE_INDEXED_WAVE64=1 to turn an unavailable Wave64 path into a
+ * hard failure. */
+static int test_indexed_attention_wave64_inv_rope_bench(void) {
+    if (!std::getenv("DS4_TEST_BENCH_INDEXED_WAVE64_INV_ROPE")) return 0;
+    const uint32_t n_tokens = 1, n_head = 32, head_dim = 128;
+    const uint32_t n_comp = 4096, top_k = 512, raw_cap = 1024, n_raw = 256;
+    const uint32_t pos0 = 16384, raw_start = 0, ratio = 4;
+    const uint32_t warmups = 2, rounds = 8;
+    const uint32_t q_bytes = n_tokens * n_head * head_dim * sizeof(float);
+    const uint32_t raw_bytes = raw_cap * head_dim * sizeof(float);
+    const uint32_t comp_bytes = n_comp * head_dim * sizeof(float);
+    const uint32_t out_bytes = n_tokens * n_head * head_dim * sizeof(float);
+    std::vector<float> q(n_tokens * n_head * head_dim);
+    std::vector<float> raw(raw_cap * head_dim);
+    std::vector<float> comp(n_comp * head_dim);
+    std::vector<uint32_t> topk(top_k);
+    std::vector<float> reference(n_tokens * n_head * head_dim);
+    std::vector<float> candidate(n_tokens * n_head * head_dim);
+    std::vector<float> sink_out(n_tokens * n_head * head_dim);
+    for (uint32_t i = 0; i < q.size(); i++)
+        q[i] = 0.03125f * (float)((i * 17u) % 29u) - 0.4f;
+    for (uint32_t i = 0; i < raw.size(); i++)
+        raw[i] = 0.015625f * (float)((i * 11u) % 23u) - 0.2f;
+    for (uint32_t i = 0; i < comp.size(); i++)
+        comp[i] = 0.0078125f * (float)((i * 7u) % 41u) - 0.15f;
+    for (uint32_t c = 0; c < top_k; c++) topk[c] = c;
+
+    std::vector<float> sinks(n_head);
+    for (uint32_t h = 0; h < n_head; h++)
+        sinks[h] = 0.125f - 0.03125f * (float)(h % 11u);
+    std::vector<unsigned char> model(16 + n_head * sizeof(float));
+    std::memcpy(model.data() + 16, sinks.data(), n_head * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *rt = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *ct = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *tt = ds4_gpu_tensor_alloc(topk.size() * sizeof(uint32_t));
+    const char *saved_wave64 = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+    const char *saved_inv = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE");
+    const bool had_saved_wave64 = saved_wave64 != nullptr;
+    const bool had_saved_inv = saved_inv != nullptr;
+    const std::string saved_wave64_value = saved_wave64 ? saved_wave64 : "";
+    const std::string saved_inv_value = saved_inv ? saved_inv : "";
+    const float rope_base = 10000.0f;
+    int rc = 1;
+
+    auto run_fallback = [&](std::vector<float> *capture) -> bool {
+        set_indexed_wave64_inv_rope_env("0");
+        if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                out, model.data(), model.size(), 16, qt, rt, ct, 0, tt,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim) ||
+            !ds4_gpu_rope_tail_tensor(out, n_tokens, n_head, head_dim, 64u,
+                                      pos0, 0u, true, rope_base, 1.0f, 0.0f,
+                                      1.0f, 0.0f, 0.0f) ||
+            !ds4_gpu_tensor_read(out, 0, sink_out.data(), out_bytes))
+            return false;
+        if (capture) *capture = sink_out;
+        return true;
+    };
+    auto run_candidate = [&](std::vector<float> *capture) -> bool {
+        set_indexed_wave64_inv_rope_env("1");
+        ds4_gpu_set_decode_attn_rope_fuse(
+            head_dim, 64u, pos0, 0u, true, rope_base, 1.0f, 0.0f, 1.0f,
+            0.0f, 0.0f);
+        if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                out, model.data(), model.size(), 16, qt, rt, ct, 0, tt,
+                n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                0, ratio, n_head, head_dim) ||
+            ds4_gpu_attention_indexed_wave64_used() != 1 ||
+            ds4_gpu_attention_indexed_wave64_inv_rope_used() != 1 ||
+            !ds4_gpu_tensor_read(out, 0, sink_out.data(), out_bytes))
+            return false;
+        if (capture) *capture = sink_out;
+        return true;
+    };
+    std::chrono::steady_clock::time_point fallback_begin, fallback_end;
+    std::chrono::steady_clock::time_point candidate_begin, candidate_end;
+
+    if (!out || !qt || !rt || !ct || !tt ||
+        !ds4_gpu_set_model_map(model.data(), model.size()) ||
+        !ds4_gpu_tensor_write(qt, 0, q.data(), q_bytes) ||
+        !ds4_gpu_tensor_write(rt, 0, raw.data(), raw_bytes) ||
+        !ds4_gpu_tensor_write(ct, 0, comp.data(), comp_bytes) ||
+        !ds4_gpu_tensor_write(tt, 0, topk.data(), topk.size() * sizeof(uint32_t)))
+        goto done;
+
+    set_indexed_wave64_env("1");
+    for (uint32_t i = 0; i < warmups; i++) {
+        if (!run_fallback(nullptr) || !run_candidate(nullptr)) goto done;
+    }
+    if (!run_fallback(&reference)) goto done;
+    if (ds4_gpu_attention_indexed_wave64_used() != 1) goto done;
+    fallback_begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < rounds; i++)
+        if (!run_fallback(nullptr)) goto done;
+    fallback_end = std::chrono::steady_clock::now();
+
+    if (!run_candidate(&candidate)) goto done;
+    candidate_begin = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < rounds; i++)
+        if (!run_candidate(nullptr)) goto done;
+    candidate_end = std::chrono::steady_clock::now();
+
+    if (std::memcmp(reference.data(), candidate.data(), out_bytes) != 0) {
+        for (uint32_t i = 0; i < reference.size(); i++) {
+            if (reference[i] != candidate[i]) {
+                fprintf(stderr, "indexed_attention_wave64_inv_rope_bench: byte mismatch "
+                        "i=%u reference=%a candidate=%a\n",
+                        i, reference[i], candidate[i]);
+                break;
+            }
+        }
+        goto done;
+    }
+    {
+        const double fallback_ms = std::chrono::duration<double, std::milli>(
+            fallback_end - fallback_begin).count();
+        const double candidate_ms = std::chrono::duration<double, std::milli>(
+            candidate_end - candidate_begin).count();
+        fprintf(stderr,
+                "indexed_attention_wave64_inv_rope_bench: heads=%u raw=%u "
+                "comp=%u topk=%u warmups=%u rounds=%u "
+                "fallback_total_ms=%.3f fallback_per_iter_ms=%.3f "
+                "candidate_total_ms=%.3f candidate_per_iter_ms=%.3f\n",
+                n_head, n_raw, n_comp, top_k, warmups, rounds,
+                fallback_ms, fallback_ms / rounds,
+                candidate_ms, candidate_ms / rounds);
+    }
+    rc = 0;
+done:
+    if (had_saved_wave64) set_indexed_wave64_env(saved_wave64_value.c_str());
+    else set_indexed_wave64_env(nullptr);
+    if (had_saved_inv) set_indexed_wave64_inv_rope_env(saved_inv_value.c_str());
+    else set_indexed_wave64_inv_rope_env(nullptr);
+    if (tt) ds4_gpu_tensor_free(tt);
+    if (ct) ds4_gpu_tensor_free(ct);
+    if (rt) ds4_gpu_tensor_free(rt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (out) ds4_gpu_tensor_free(out);
+    return rc;
+}
+REGISTER_TEST(indexed_attention_wave64_inv_rope_bench,
+              test_indexed_attention_wave64_inv_rope_bench);

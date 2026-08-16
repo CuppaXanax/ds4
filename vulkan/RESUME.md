@@ -1,5 +1,12 @@
 # DS4 Vulkan backend — RESUME (ripresa sessione)
 
+> **Documento storico.** Queste note descrivono la fase bootstrap Vulkan del
+> 2026-08-01 e non sono più la fonte di verità operativa. Per lo stato attuale
+> BC-250, i risultati qualificati, gli esperimenti accettati/rifiutati e i
+> prossimi obiettivi vedere
+> [`../VULKAN_BC250_KERNEL_AUDIT.md`](../VULKAN_BC250_KERNEL_AUDIT.md) e
+> [`../VULKAN_BC250_EXPERIMENTS.md`](../VULKAN_BC250_EXPERIMENTS.md).
+
 > Ultimo aggiornamento: 2026-08-01 (fine sessione lunga, compatto in ECA).
 > Questo file è la fonte di verità per riprendere il lavoro: riassume tutto lo
 > stato, i contratti, i bug già risolti, i risultati dei test e i prossimi passi.

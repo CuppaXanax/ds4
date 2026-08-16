@@ -1,29 +1,16 @@
-# DS4 Vulkan backend — status & kernel roadmap
+# DS4 Vulkan backend — kernel inventory
 
-> Last updated: 2026-07-31 · Regenerate the kernel table with
-> `python3 vulkan/kernel_status.py`.
+> Updated 2026-08-16. This file retains the generated API/kernel inventory.
+> The current BC-250 production baseline, qualification results, performance
+> diagnosis, accepted/rejected experiments, and next targets are documented in
+> [`../VULKAN_BC250_KERNEL_AUDIT.md`](../VULKAN_BC250_KERNEL_AUDIT.md) and
+> [`../VULKAN_BC250_EXPERIMENTS.md`](../VULKAN_BC250_EXPERIMENTS.md).
+>
+> Sections below that describe the original stub/bootstrap phase are historical
+> and must not be used as the current deployment status. Regenerate the kernel
+> table with `python3 vulkan/kernel_status.py` when API implementations change.
 
-## What works (2026-07-31)
-
-- **Build**: `make vulkan` compiles all five binaries (`ds4`, `ds4-server`,
-  `ds4-bench`, `ds4-eval`, `ds4-agent`) on Linux with the Vulkan backend
-  (C++17 + vendored headers/volk + VMA).
-- **GPU init**: instance/device creation, GPU info printed
-  (`ds4: VULKAN device: ...`), 12 compute shaders loaded, pipelines created.
-- **Full pipeline on GPU, Vulkan only (no CPU fallback)**: an 81 GiB DeepSeek
-  V4 Flash model runs end-to-end (prefill + decode), streamed through a
-  ~47 GiB iGPU heap:
-  `prefill: 2.18 t/s, generation: 50.71 t/s`.
-- **Weight streaming**: `cache_model_range` records metadata only; kernels
-  upload weights lazily from the model mmap (`ensure_weight`) with LRU
-  eviction (`DS4_VULKAN_WEIGHT_BUDGET_GB`, default 40 GiB).
-- **RADV crash fixed** (`radv_amdgpu_cs_finalize` on decode after large
-  prefill): the engine calls `ds4_gpu_commit_and_wait_selected_readback`
-  mid-decode and keeps recording kernels without `begin_commands`.
-  `commit_and_wait` / `flush_commands` now re-begin a fresh command buffer
-  after submit (Metal encoder semantics).
-
-## Why the output is only `<｜begin▁of▁sentence｜>`
+## Historical bootstrap snapshot: why output was only `<｜begin▁of▁sentence｜>`
 
 Of the 261 `ds4_gpu_*` contract functions, **157 are no-op stubs**
 (`vulkan/_impl_gen.cpp`) that return 1 (success) **without writing their

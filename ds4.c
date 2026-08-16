@@ -20018,6 +20018,9 @@ static bool metal_graph_check_hc_norm_fusion(
 extern int ds4_gpu_kv_rope_fp8_fuse_available(void);
 extern int ds4_gpu_decode_attn_rope_fuse_available(void);
 extern int ds4_gpu_decode_attn_rope_fuse_used(void);
+#ifdef DS4_VULKAN_BUILD
+extern int ds4_gpu_attention_indexed_wave64_inv_rope_available(void);
+#endif
 extern void ds4_gpu_set_decode_attn_rope_fuse(
         uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig,
         bool inverse, float freq_base, float freq_scale, float ext_factor,
@@ -23298,6 +23301,17 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                 &decode_index_stage_t0);
             }
         } else if (ok && indexed_attention) {
+#ifdef DS4_VULKAN_BUILD
+            if (!decode_index_stage_profile &&
+                ds4_gpu_attention_indexed_wave64_inv_rope_available() != 0) {
+                ds4_gpu_set_decode_attn_rope_fuse(
+                    DS4_N_HEAD_DIM, DS4_N_ROT, pos,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    true, freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW);
+                attn_inv_rope_fuse_armed = true;
+            }
+#endif
             ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     metal_graph_heads(g),
                     model->map,

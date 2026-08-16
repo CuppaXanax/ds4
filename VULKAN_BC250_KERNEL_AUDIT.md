@@ -1,267 +1,189 @@
-# Vulkan BC-250 Kernel Audit and Night Plan
-
-Hydrated from the final kernel/backend audit in the ChatGPT conversation
-`DS4 BC-250 Optimization` on 2026-08-12, then checked against the current
-workspace at `pr-557-merge` commit `bbe1ed9`.
-
-## Baseline verification
-
-The checkout is the recorded 3.48 TPS baseline:
-
-- branch: `pr-557-merge`
-- `HEAD`: `bbe1ed9`
-- remote: `origin/pr-557-merge`
-- working tree at hydration time: clean
-- recorded distributed result: 287.224 ms/token, 3.482 TPS
-- deterministic artifact: 2,178 bytes
-- deterministic SHA-256: `3fbf53f82bb25e37502ff64e11d660104d32618880fe07e06f021142b969b9e4`
-- Vulkan suite at the recorded baseline: 79/79 passing
-
-The 3.482 TPS result is specifically the **all-layer-batched** result. At the
-hydrated baseline it was still gated by `DS4_VULKAN_BATCH_LAYER=1`; the manual
-command that produced roughly 1.5--1.7 generation TPS did not set it. The gate
-has now been removed so the qualified path is the Vulkan default.
-
-The other variables in that manual command have different status:
-
-| Variable | Current status at `bbe1ed9` |
-|---|---|
-| `DS4_VULKAN_Q8_PREQUANT=1` | Obsolete/no-op. Qualified prequantization was promoted to the automatic path in `34b5297`. |
-| `DS4_VULKAN_Q8_ALIGNED=1` | Obsolete/no-op. The aligned artifact is selected automatically when eligible, with fallback. |
-| `DS4_VULKAN_Q2_WORDS=1` | Obsolete/no-op. Q2 direct-word down decode is automatic for the eligible type. |
-| `DS4_VULKAN_WEIGHT_BUDGET_GB=11` | Active and required for the intended resident-weight budget. |
-| `DS4_VULKAN_BATCH_LAYER=1` | Removed. All-layer batching is now unconditional. |
-
-No fleet launch flag is now required for layer batching.
-
-## Interpreting the cold first prompt
-
-The observed first/second prefill rates were 0.53 and 3.19 tokens/s. That is
-consistent with a cold first-use penalty but is not yet a useful kernel
-benchmark: the samples contain only 10 and 7 suffix tokens, so fixed first-use
-cost dominates the first rate.
-
-Plausible first-use costs include mapped-weight page residency, first-touch
-temporary/KV allocation, and driver/cache warming. The second turn also reuses
-the existing conversation KV and processes only its new suffix. This behavior
-does not explain the steady generation regression; missing all-layer batching
-does.
-
-Before changing prefill code, measure at least three identical fresh-session
-prompts with a meaningful token count, discard one explicit warm-up run, and
-check the Vulkan timeline for steady-state `weight_upload` events. Any
-`weight_upload` during warm generation is a stop-the-line finding.
-
-## Hydrated audit
-
-### 1. Aligned Q8 finishes with a serial lane-0 reduction
-
-`vulkan/shaders/matmul_q8_0_aligned.comp` launches 256 lanes for an output row.
-The lanes compute block dots in parallel, write shared memory, and then lane 0
-serially sums as many as 256 block results while the other lanes wait.
-
-A targeted Wave64 experiment should keep parallel block-dot calculation and use
-a hierarchical final reduction: subgroup totals for four 64-lane waves, then a
-small final reduction. Changing floating-point reduction order can change low
-bits, so exact deterministic validation and full-model token validation are
-mandatory.
-
-This is not a repeat of rejected experiment `q8-wave64` (`ea13a81`). That branch
-transposed aligned payload records; it did not replace this serial reduction.
-
-### 2. Router selection is a one-invocation GPU program
-
-`vulkan/shaders/router_select.comp` uses `layout(local_size_x = 1) in`. One GPU
-invocation evaluates all 256 experts, performs the serial top-6 insertion, and
-normalizes the result. The audited router stage was about 0.471 ms.
-
-A later experiment can distribute probability evaluation and top-k selection
-over Wave64 lanes. A sub-0.1 ms router stage is a reasonable experiment target,
-not a qualification promise.
-
-### 3. F16 matvec repeats the lane-0 pattern and uses FP64
-
-`vulkan/shaders/matmul_f16.comp` accumulates per-lane work in `double`, stores
-shared `float` partials, then lane 0 serially adds all 256 partials in `double`.
-It also manually converts FP16 weights through branchy math.
-
-Do not immediately reimplement this. Rejected experiment `f16-tree` (`7825a80`)
-already changed F16 reduction behavior without a production gain. First recover
-its precise A/B and determine whether its loss came from reduction structure,
-occupancy, exactness constraints, or the tested production shape.
-
-### 4. Simple dispatches receive universal compute barriers
-
-`finish_simple_dispatch()` emits an all-shader-write to all-shader-read compute
-memory barrier after every simple dispatch. It is safe but orders independent
-work and may inhibit overlap.
-
-This is a resource-hazard problem, not a blanket barrier-removal task. Record
-read/write buffer ranges for consecutive dispatches, retain genuine RAW/WAW
-ordering, narrow barriers to the affected resources, and omit barriers only for
-proven-independent operations.
-
-### 5. Routed MoE contains CPU-shaped GPU work
-
-`vulkan/shaders/routed_moe.comp` includes repeated shared-memory tree barriers,
-manual FP16 conversion, scalar quantized-weight extraction, and lane-0 scanning
-and packing after parallel loads. The backend executes quantize, gate, up,
-SwiGLU, requantize, down, and reduction as distinct operations with dependencies.
-
-Do not restart routed fusion or cooperative routed MoE first. Both prior
-experiments failed qualification. Work inside the known-good architecture and
-measure one reduction/access-pattern change at a time.
-
-#### Layer 4 routed-MoE decode profile
-
-Two warm position-32 captures with `DS4_VULKAN_PROFILE_ROUTED_MOE=1` agreed to
-within 0--1 microseconds per substage. The seven compute substages were:
-
-| `routed_moe` dispatch | GPU ms | Share |
-|---|---:|---:|
-| `gate_iq2_words` | 0.556 | 38.33% |
-| `up_iq2_words` | 0.555 | 38.26% |
-| `down_words` | 0.245 | 16.86% |
-| `quantize_input` | 0.047 | 3.24% |
-| `requantization` | 0.042 | 2.90% |
-| `reduction` | 0.004 | 0.28% |
-| `swiglu` | 0.002 | 0.14% |
-
-The seven-stage total was 1.451 ms. Gate plus up owned 1.111 ms (76.59%);
-input quantization plus requantization owned only 0.089 ms (6.14%). The separate
-`validate_selected` safety dispatch measured 0.002 ms and is excluded from the
-seven-stage total. Layers 5--7 showed the same shape and near-identical times.
-
-This falsifies the mode-0 quantization hypothesis for decode. The first concrete
-shader target is mode 1 in `routed_moe.comp`, specifically the two IQ2 word
-gate/up projections. A paired gate/up dispatch that reuses the quantized input is
-the leading experiment, provided it preserves exact accumulation order and
-record locality. Down-word projection is the second target.
-
-Profiler caveat: routed profiling inserts serialization barriers around timestamp
-boundaries. These numbers rank isolated GPU work; they are not real layer wall
-time and must not be added to or compared directly with the historical 10.703 ms
-instrumented layer wall. The unprofiled position-32 layer wall remains about
-5.8 ms. Both profiled runs preserved the 2,605-byte artifact with SHA-256
-`0ca6c3758d9248c65edc71f0b32ae96489cf8419a9af61bf16d9ea1410be7ca5`.
-
-### 6. Generic tensor memory is over-broadly host visible and coherent
-
-Generic Vulkan tensors request random host access plus persistent mapping. Before
-submission, the backend flushes every live tensor allocation in full; after a
-fence, it invalidates every live allocation in full.
-
-The longer-term correction is explicit allocation classes such as GPU-only,
-host-upload, host-readback, and shared/persistent, with coherency operations only
-for resources that require them.
-
-### Verification landmines
-
-- `ds4_gpu_argmax_tensor()` performs CPU argmax over mapped logits. Time it before
-  deciding whether it matters.
-- `ds4_gpu_matmul_f32_tensor()` is a CPU fallback. Normal decode must never enter
-  it unnoticed.
-- A weight-cache miss synchronously stages, submits, and waits. Warm decode should
-  report zero misses/uploads.
-
-## Sequential optimization ladder
-
-Only one implementation milestone should be active at a time. Each milestone
-gets its own branch/commit, same-binary cache-hot A/B, correctness gate, and an
-explicit keep/revert decision before the next begins.
-
-### Completed: promote qualified all-layer batching
-
-The already-qualified 287.224 ms/token, 3.482 TPS all-layer batching path is now
-the Vulkan default. The environment gate was removed rather than spending a
-fresh fleet cycle proving the same opt-in.
-
-### Completed: four-flight command submission ring
-
-The Vulkan backend now records through four command-buffer slots chained by one
-monotonic timeline semaphore. Submitting work no longer implies a host wait:
-the CPU waits only when it reuses a busy slot or reaches an explicit host-visible
-boundary such as router readback, final command completion, or synchronization.
-Layer-final descriptors and temporary tensors retire with the submission slot
-that owns them.
-
-The implementation also keeps every active command generation that references a
-cached weight, retains explicit pinned-cache semantics, serializes access to the
-single Vulkan queue, uses node-stable per-thread command contexts, and invalidates
-mapped tensors at every host-visible completion boundary. Diagnostic rollback is
-`DS4_VULKAN_COMMAND_RING=0`; `DS4_VULKAN_SUBMIT_COMMANDS` changes the rollover
-threshold for experiments. The qualified default remains 64 command-count units.
-
-Qualification on the BC-250 cluster against base `051b428` before integration:
-
-- focused rollover/order/lifetime test: PASS in ring and serial modes
-- complete GFX1013 Vulkan suite: 83/83 passing
-- same-binary ring/control artifact: 2,605 bytes, exact SHA-256
-  `0ca6c3758d9248c65edc71f0b32ae96489cf8419a9af61bf16d9ea1410be7ca5`
-- focused timeline stress, same 23 submissions: host waits 24 -> 21 and summed
-  host wait time 2.76 -> 2.14 ms (-22.5%)
-- matched warmed 3,812-token prompt plus 16-token decode: serial 17.02 prefill /
-  2.23 generation TPS; ring 17.02 prefill / 2.36 generation TPS
-- decode throughput gain: +5.83%; prefill unchanged
-- rollover sweep: 16 -> 2.35, 32 -> 2.37, 64 -> 2.36, 96 -> 2.36
-  generation TPS; 64 was retained as the conservative RADV bound
-- all eleven worker logs reported zero Vulkan, device-loss, or route errors
-
-GPT-5.6 Luna independently reviewed the synchronization and lifetime diff twice.
-Its findings drove the final active-generation weight tracking, pinned-cache
-repair, queue/context synchronization, host invalidation, empty-batch handling,
-and stronger deferred-temporary coverage before the final suite and fleet A/B.
-
-### Milestone 1: aligned-Q8 hierarchical final reduction
-
-Scope only `matmul_q8_0_aligned.comp` plus its focused tests/instrumentation. Do
-not change payload layout, activation quantization, batching, or other kernels.
-
-Qualification:
-
-- focused production-shape Vulkan Q8 tests
-- exact deterministic artifact/hash
-- complete Vulkan suite
-- cache-hot single-blade kernel/stage A/B
-- cache-hot 12-blade generation A/B
-
-Keep only a repeatable win with exact output. The useful target is movement in
-several Q8-heavy stages together, not merely a faster synthetic kernel.
-
-### Milestone 2: router and F16 reductions
-
-Parallelize the currently single-invocation router over Wave64 and revisit the
-F16 final reduction with the failed `f16-tree` evidence in hand. These are the
-next CPU-shaped decode kernels, not optional candidates selected by rerolling a
-leaderboard.
-
-### Milestone 3: dependency-aware barriers
-
-Replace universal compute barriers with resource-aware RAW/WAW ordering and omit
-barriers between proven-independent dispatches.
-
-### Milestone 4: routed-MoE Wave64 cleanup
-
-Surgically replace shared-memory tree reductions, serial quantization packing,
-and scalar access patterns inside the qualified routed architecture. Do not
-restart the rejected fusion/cooperative designs wholesale.
-
-### Milestone 5: GPU-only allocation classes
-
-Split GPU-only, host-upload, host-readback, and persistent allocations, then stop
-flushing and invalidating every live tensor around every submission.
-
-## Agent operating model
-
-Use one GPT-5.6 Luna subagent as the milestone owner at a time. Its job is to
-inspect, patch, commit, and write the exact remote validation recipe. The primary
-agent controls the fleet A/B, qualification decision, and integration. A second
-subagent may reduce bounded logs or tables, but it must not race an independent
-code patch against the active milestone.
-
-The loop is intentionally:
+# Vulkan BC-250 Decode Audit
+
+> Current as of 2026-08-16. This is the authoritative performance and
+> qualification snapshot for the 24-CU BC-250 appliance. Historical bootstrap
+> notes remain in `vulkan/RESUME.md`.
+
+## Qualified baseline
+
+The publication base is `origin/pr-557-merge` at `c519309`. The accompanying
+publication adds the exact indexed Wave64 attention and inverse-RoPE promotion
+described below.
+
+| Item | Qualified result |
+|---|---:|
+| Distributed generation | approximately 5.4-5.5 tokens/s |
+| Representative Layer 4 GPU time | approximately 3.25 ms |
+| Attention/projection group | approximately 1.77 ms/layer |
+| Routed/shared MoE group | approximately 1.31 ms/layer |
+| Complete GFX1013 Vulkan suite | 83/83 passing |
+| Exact 16-step output artifact SHA-256 | `5e31e01d847a5f1e409c4169e249ae187efe1c3827fd7009711c3679dcfe8023` |
+
+The SHA-256 above is the generated logprob artifact hash, not a binary hash.
+Exact qualification also compares selected tokens, top-20 ordering, logits,
+and logprobs.
+
+## What the current production path contains
+
+The qualified `74a22cd..c519309` range includes:
+
+- GPU-resident prefill layer scopes and decode command batching;
+- a timeline-semaphore command ring with ring-safe descriptor, tensor, scratch,
+  and cached-weight lifetimes;
+- exact fast F16 projections and aligned Q8/BFE projections;
+- reusable Q8 activation quantization for qualified paired projections;
+- grouped and tiled Q8 attention-output paths;
+- GPU-resident router selection;
+- fused routed IQ2 gate/up plus SwiGLU to a Q8_K intermediate;
+- fused Q2 down projection and selected-rank reduction;
+- device-local pooled decode scratch;
+- fused attention HC/inverse-RoPE paths;
+- exact Wave64 routed arithmetic as the BC-250 default;
+- non-perturbing layer, stage, dispatch, submission, and resource timelines.
+
+Production fallbacks remain available:
 
 ```text
-scope -> patch -> commit/push -> fleet pull/build -> focused test -> exactness
-      -> cache-hot A/B -> keep or revert -> next milestone
+DS4_VULKAN_F16_MODE=exact
+DS4_VULKAN_Q8_MODE=exact
+DS4_VULKAN_ROUTED_WAVE64=0
+DS4_VULKAN_ROUTED_MID_ONLY=0
+DS4_VULKAN_ROUTED_DOWN_REDUCE=0
+DS4_VULKAN_ATTN_INDEXED_WAVE64=0
+DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE=0
 ```
+
+## Newly qualified indexed attention path
+
+The indexed long-context path uses one Wave64 per 128-wide head, keeps online
+attention accumulators in registers, and applies the 64-element inverse-RoPE
+tail before writing the final head. It removes the standalone inverse-RoPE
+dispatch and its global output round-trip.
+
+Qualification on a BC-250:
+
+- focused fallback/candidate output: byte-identical;
+- canonical indexed attention plus standalone RoPE: byte-identical to fusion;
+- same-command-buffer push-constant regression: passing;
+- production-shaped focused time: `0.864 -> 0.824 ms` per invocation, about
+  4.6% faster;
+- non-BC devices retain the fallback unless explicitly enabled;
+- explicit `=0` kill switches remain available.
+
+This is a long-context indexed-attention improvement. It is not evidence of an
+immediate short-position generation TPS increase.
+
+## What the evidence rules out
+
+### Warm paging is not the current decode limiter
+
+A production worker trace contained 76 cached-weight uses and zero
+`weight_upload` or `weight_cache_evict` events. Live workers used about 8.24 GiB
+of GTT under the 11 GiB weight-cache budget. Each worker owns roughly four
+layers, so the distributed routed working set fits after warm-up.
+
+Increasing `DS4_VULKAN_WEIGHT_BUDGET_GB` to 14 or 15 GiB cannot improve a path
+that already performs zero warm uploads. Whole-expert-blob residency remains a
+memory-efficiency issue, but it is not proven steady-state traffic.
+
+### Transport and CPU bookkeeping are not rate-setting
+
+- worker-hop transport is approximately 0.1 ms;
+- descriptor CPU and command recording costs are small relative to GPU work;
+- measured GPU idle gaps are about 0.06 ms/layer;
+- production router-selected IDs remain GPU-resident.
+
+Fence waits overlap GPU execution and expose a serialized dependency chain,
+but they do not account for the approximately 3.25 ms of timestamped GPU work.
+
+### Blanket barrier removal is not yet safe
+
+The backend still uses conservative barriers. Two resource-tracker prototypes
+were rejected: one placed dependencies after consumers and the corrected
+version still changed the exact full-model artifact. Descriptor overlap alone
+is not a sufficient access model for safe publication.
+
+## Current diagnosis
+
+The BC-250 same-allocation stream test reached approximately 246.8 GB/s, while
+production decode realizes only about 62-64 GB/s of useful weight traffic.
+Warm paging, transport, and empty GPU gaps are too small to explain the gap.
+
+The remaining loss is inside the useful GPU graph:
+
+- scalar quantized unpack and address work;
+- reductions that leave lanes idle;
+- activation vectors reread across output rows;
+- quantize/project/transform intermediates written and immediately reread;
+- generic GEMV decomposition instead of BC-250 Wave64 consumption layouts;
+- conservative producer/consumer boundaries that prevent coordinated fusion.
+
+Prefill has an additional architectural defect: grouped Q8 attention output
+still performs token/group gather and scatter copies because the batch kernels
+require contiguous token rows. A direct strided grouped-batch kernel is needed;
+the 64 `group_copy` events observed in a four-layer mixed trace were prefill,
+not decode.
+
+## Performance target and required scale
+
+The appliance target remains:
+
+```text
+attention/projections <= 0.60 ms/layer
+routed/shared MoE    <= 0.40 ms/layer
+total layer          approximately 1.0-1.2 ms
+single-session       >= 10 TPS minimum, 20 TPS north star
+```
+
+Moving from about 3.25 ms to 1.1 ms requires removing roughly two-thirds of
+current GPU layer time. No launch-only cleanup or isolated 20-microsecond
+kernel win can close that gap.
+
+Planning ranges, not promises:
+
+| Rewrite family | Current group | Plausible layer saving | Why it matters |
+|---|---:|---:|---|
+| Coordinated attention projection/activation reuse | ~1.77 ms | 0.4-0.7 ms | Multiple projections reread and requantize related activations. |
+| Routed/shared MoE dataflow and packed access | ~1.31 ms | 0.4-0.65 ms | Gate/up/down still spend most time on packed arithmetic and weight access. |
+| Shared-down directly into HC expansion | included above | 0.08-0.20 ms | Removes one global intermediate and dependent dispatch. |
+| Strided grouped/token-tiled Q8 prefill | prefill-only | potentially large prefill win | Removes 16 copies/layer and eight independent group projections. |
+
+## Next implementation order
+
+1. Build a layer-scoped Q8 activation producer consumed by multiple decode
+   projections without re-quantization or premature retirement.
+2. Design attention projection kernels around several output rows per
+   workgroup, activation reuse, and prepacked Wave64 weight consumption.
+3. Fuse shared-down directly into HC expansion while preserving the existing
+   Q8 reduction and Sinkhorn accumulation order.
+4. Rework routed IQ2/Q2 loads and dots around a BC-250 resident/prepacked
+   representation; retain the exact rank and FP32 reduction order.
+5. Add a strided grouped-batch Q8 path for prefill so group gather/scatter and
+   per-group projection islands disappear.
+
+Allocation and barrier refinements remain worthwhile only when a trace ties
+them to material wall or GPU time. They are not ahead of these dataflow rewrites.
+
+## Promotion policy and ROI gate
+
+Every experiment has exactly one status:
+
+- **production-qualified**: exact artifact, focused same-binary A/B, deployment
+  safety, and no TPS regression;
+- **candidate**: static/compile or focused evidence only;
+- **rejected**: exactness, safety, timeline, or performance gate failed.
+
+The normal gate is:
+
+```text
+static compile/SPIR-V validation
+-> one focused exactness test
+-> one 16-step full-model artifact
+-> one same-binary focused timing/TPS smoke test
+-> promote or delete
+```
+
+Do not run benchmark matrices. Before implementation, a decode candidate should
+have a credible path to at least 0.25-0.35 ms/layer or roughly 0.5 TPS. Smaller
+ideas should be folded into a coordinated rewrite or deferred. A synthetic
+kernel speedup is insufficient unless it moves its production stage.

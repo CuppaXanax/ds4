@@ -106,6 +106,15 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+
+#ifdef DS4_VULKAN_BUILD
+#define DS4_VULKAN_TIMELINE_STAGE(name) do { \
+        if (getenv("DS4_VULKAN_TIMELINE_LAYER")) \
+            ds4_gpu_timeline_stage_end((name)); \
+    } while (0)
+#else
+#define DS4_VULKAN_TIMELINE_STAGE(name) ((void)0)
+#endif
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -28327,6 +28336,9 @@ static bool metal_graph_encode_layer_attention_batch(
         if (ok && layer_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("attn", (name), il, pos0, n_tokens, &layer_stage_t0); \
         } \
+        /* Vulkan timeline labels are cheap host annotations and remain off \
+         * unless DS4_VULKAN_TIMELINE_LAYER selects this layer. */ \
+        DS4_VULKAN_TIMELINE_STAGE((name)); \
     } while (0)
 #define DS4_METAL_PROFILE_Q_STAGE(name) do { \
         if (ok && q_stage_profile) { \
@@ -30101,6 +30113,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         if (ok && layer_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("ffn", (name), il, pos0, n_tokens, &layer_stage_t0); \
         } \
+        DS4_VULKAN_TIMELINE_STAGE((name)); \
     } while (0)
 
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
@@ -30725,12 +30738,14 @@ static bool metal_graph_encode_layer_batch(
         !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
     if (use_prefill_scope &&
         ds4_gpu_batch_prefill_layer_begin(il) == 0) return false;
+    ds4_gpu_timeline_layer_begin(il);
 #endif
     if (g->placement) {
         const int this_tier = g->placement[il + 1u];
         if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) {
 #ifdef DS4_VULKAN_BUILD
             if (use_prefill_scope) (void)ds4_gpu_batch_layer_end(il);
+            ds4_gpu_timeline_layer_end(il);
 #endif
             return false;
         }
@@ -30756,6 +30771,7 @@ static bool metal_graph_encode_layer_batch(
     }
 #ifdef DS4_VULKAN_BUILD
     if (use_prefill_scope && ds4_gpu_batch_layer_end(il) == 0) ok = false;
+    ds4_gpu_timeline_layer_end(il);
 #endif
     return ok;
 }

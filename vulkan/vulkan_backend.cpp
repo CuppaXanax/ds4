@@ -61,8 +61,11 @@ struct TimelineEvent {
     const char *name = nullptr;
     const char *stage = nullptr;
     uint64_t host_ns = 0;
+    uint64_t host_end_ns = 0;
     uint64_t duration_ns = 0;
     uint64_t gpu_ns = 0;
+    uint64_t gpu_start_ns = 0;
+    uint64_t gpu_end_ns = 0;
     uint64_t bytes = 0;
     uint64_t offset = 0;
     uint64_t generation = 0;
@@ -72,6 +75,9 @@ struct TimelineEvent {
 };
 
 static constexpr uint32_t DS4_VK_COMMAND_RING_SIZE = 4;
+static constexpr uint32_t DS4_VK_TIMELINE_QUERY_COUNT = 2048;
+static constexpr uint64_t DS4_VK_TIMELINE_MAX_DISPATCHES =
+    DS4_VK_TIMELINE_QUERY_COUNT / 2u;
 
 struct VulkanCommandCtx {
     VkCommandPool   pool     = VK_NULL_HANDLE;
@@ -113,6 +119,7 @@ struct VulkanCommandCtx {
     std::vector<VkDescriptorSet> attention_output_descriptors;
     std::vector<ds4_gpu_tensor *> attention_output_tensors;
     bool layer_timeline_active = false;
+    bool layer_timeline_end_pending = false;
     uint32_t layer_timeline_layer = UINT32_MAX;
     uint64_t layer_timeline_start_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
@@ -555,7 +562,9 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
         ctx.timeline_skip_dispatches = strtoull(skip, nullptr, 10);
     if (const char *count = getenv("DS4_VULKAN_TIMELINE_COUNT")) {
         const uint64_t parsed = strtoull(count, nullptr, 10);
-        if (parsed != 0) ctx.timeline_max_dispatches = parsed;
+        if (parsed != 0)
+            ctx.timeline_max_dispatches = std::min(
+                parsed, DS4_VK_TIMELINE_MAX_DISPATCHES);
     }
     if (ctx.timeline_enabled)
         ctx.timeline_events.reserve((size_t)ctx.timeline_max_dispatches * 16u + 256u);
@@ -567,7 +576,7 @@ static VulkanCommandCtx &get_cmd_ctx(void) {
             VkQueryPoolCreateInfo qpci{};
             qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
             qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qpci.queryCount = 256;
+            qpci.queryCount = DS4_VK_TIMELINE_QUERY_COUNT;
             if (vkCreateQueryPool(g_vk.device, &qpci, nullptr,
                                   &ctx.timestamp_pools[slot]) != VK_SUCCESS) {
                 query_pools_ok = false;
@@ -608,23 +617,82 @@ static const char *timeline_kind_name(TimelineEventKind kind) {
     return "unknown";
 }
 
+static void timeline_json_string(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            if (*p == '\\' || *p == '"') fputc('\\', fp);
+            if (*p == '\n') { fputs("\\n", fp); continue; }
+            if (*p == '\r') { fputs("\\r", fp); continue; }
+            if (*p == '\t') { fputs("\\t", fp); continue; }
+            if (*p == '\b') { fputs("\\b", fp); continue; }
+            if (*p == '\f') { fputs("\\f", fp); continue; }
+            if (*p < 0x20) {
+                fprintf(fp, "\\u%04x", (unsigned)*p);
+                continue;
+            }
+            fputc(*p, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+static void timeline_write_json(const VulkanCommandCtx &ctx) {
+    const char *path = getenv("DS4_VULKAN_TIMELINE_JSON");
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "ds4: VULKAN timeline JSON open failed: %s\n", path);
+        return;
+    }
+    fputs("{\n  \"layer\": ", fp);
+    if (ctx.layer_timeline_layer == UINT32_MAX) fputs("null", fp);
+    else fprintf(fp, "%u", ctx.layer_timeline_layer);
+    fputs(",\n  \"events\": [\n", fp);
+    for (size_t i = 0; i < ctx.timeline_events.size(); i++) {
+        const TimelineEvent &e = ctx.timeline_events[i];
+        fprintf(fp, "    {\"index\":%zu,\"kind\":", i);
+        timeline_json_string(fp, timeline_kind_name(e.kind));
+        fputs(",\"name\":", fp);
+        timeline_json_string(fp, e.name ? e.name : "");
+        fputs(",\"stage\":", fp);
+        timeline_json_string(fp, e.stage ? e.stage : "unassigned");
+        fprintf(fp, ",\"host_ns\":%llu,\"host_end_ns\":%llu,\"duration_ns\":%llu"
+                    ",\"gpu_start_ns\":%llu,\"gpu_end_ns\":%llu,\"gpu_ns\":%llu"
+                    ",\"generation\":%llu,\"bytes\":%llu,\"offset\":%llu"
+                    ",\"x\":%u,\"y\":%u,\"z\":%u,\"count\":%u} %s\n",
+                (unsigned long long)e.host_ns, (unsigned long long)e.host_end_ns,
+                (unsigned long long)e.duration_ns, (unsigned long long)e.gpu_start_ns,
+                (unsigned long long)e.gpu_end_ns, (unsigned long long)e.gpu_ns,
+                (unsigned long long)e.generation, (unsigned long long)e.bytes,
+                (unsigned long long)e.offset, e.x, e.y, e.z, e.count,
+                i + 1 == ctx.timeline_events.size() ? "" : ",");
+    }
+    fputs("  ]\n}\n", fp);
+    fclose(fp);
+}
+
 static void timeline_dump(VulkanCommandCtx &ctx) {
     if (!ctx.timeline_enabled || ctx.timeline_dumped || ctx.timeline_events.empty()) return;
     fprintf(stderr,
-            "ds4: VULKAN timeline columns=event kind name host_ns duration_ns gpu_ns "
-            "generation bytes offset x y z count\n");
+            "ds4: VULKAN timeline columns=event kind name host_ns host_end_ns duration_ns "
+            "gpu_start_ns gpu_end_ns gpu_ns generation bytes offset x y z count\n");
     for (size_t i = 0; i < ctx.timeline_events.size(); i++) {
         const TimelineEvent &event = ctx.timeline_events[i];
-        fprintf(stderr, "ds4: VULKAN timeline %zu %s %s %llu %llu %llu %llu %llu %llu %u %u %u %u\n",
+        fprintf(stderr, "ds4: VULKAN timeline %zu %s %s %llu %llu %llu %llu %llu %llu %llu %llu %llu %u %u %u %u\n",
                 i, timeline_kind_name(event.kind), event.name ? event.name : "-",
                 (unsigned long long)event.host_ns,
+                (unsigned long long)event.host_end_ns,
                 (unsigned long long)event.duration_ns,
+                (unsigned long long)event.gpu_start_ns,
+                (unsigned long long)event.gpu_end_ns,
                 (unsigned long long)event.gpu_ns,
                 (unsigned long long)event.generation,
                 (unsigned long long)event.bytes,
                 (unsigned long long)event.offset,
                 event.x, event.y, event.z, event.count);
     }
+    timeline_write_json(ctx);
     ctx.timeline_dumped = true;
     ctx.timeline_collecting = false;
 }
@@ -634,6 +702,10 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
     uint64_t gpu_ns = 0;
     uint64_t submit_ns = 0;
     uint64_t fence_ns = 0;
+    uint64_t gpu_idle_ns = 0;
+    uint64_t host_record_ns = 0;
+    uint64_t last_gpu_end = 0;
+    uint32_t gpu_intervals = 0;
     uint32_t submissions = 0;
     uint32_t waits = 0;
     std::unordered_map<std::string, uint64_t> stage_gpu_ns;
@@ -641,6 +713,14 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
         if (event.kind == TimelineEventKind::Dispatch) {
             gpu_ns += event.gpu_ns;
             stage_gpu_ns[event.stage ? event.stage : "unassigned"] += event.gpu_ns;
+            if (event.gpu_start_ns != 0 && event.gpu_end_ns >= event.gpu_start_ns) {
+                if (last_gpu_end != 0 && event.gpu_start_ns > last_gpu_end)
+                    gpu_idle_ns += event.gpu_start_ns - last_gpu_end;
+                last_gpu_end = std::max(last_gpu_end, event.gpu_end_ns);
+                gpu_intervals++;
+            }
+            if (event.host_end_ns >= event.host_ns)
+                host_record_ns += event.host_end_ns - event.host_ns;
         }
         else if (event.kind == TimelineEventKind::Submit) {
             submissions++;
@@ -657,6 +737,11 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
             ctx.layer_timeline_layer, (double)wall_ns / 1.0e6,
             (double)gpu_ns / 1.0e6, submissions, waits,
             (double)submit_ns / 1.0e6, (double)fence_ns / 1.0e6);
+    fprintf(stderr,
+            "ds4: VULKAN layer_timeline_detail layer=%u gpu_idle_ms=%.6f "
+            "dispatch_gpu_intervals=%u dispatch_record_ms=%.6f\n",
+            ctx.layer_timeline_layer, (double)gpu_idle_ns / 1.0e6,
+            gpu_intervals, (double)host_record_ns / 1.0e6);
     uint64_t attention_ns = 0;
     uint64_t moe_ns = 0;
     uint64_t other_ns = 0;
@@ -680,7 +765,9 @@ static void timeline_layer_summary(VulkanCommandCtx &ctx) {
             ctx.layer_timeline_layer, (double)attention_ns / 1.0e6,
             (double)moe_ns / 1.0e6, (double)other_ns / 1.0e6,
             (double)gpu_ns / 1.0e6);
+    timeline_write_json(ctx);
     ctx.layer_timeline_active = false;
+    ctx.layer_timeline_end_pending = false;
     ctx.timeline_collecting = false;
     ctx.timeline_enabled = false;
     ctx.timeline_dumped = true;
@@ -732,7 +819,8 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
         for (uint32_t i = 0; i < count; i++)
             if (buffers[i].range <= UINT64_MAX - event->bytes)
                 event->bytes += buffers[i].range;
-        if (ctx.timestamp_pool != VK_NULL_HANDLE && ctx.timestamp_cursor <= 254) {
+        if (ctx.timestamp_pool != VK_NULL_HANDLE &&
+            ctx.timestamp_cursor + 1u < DS4_VK_TIMELINE_QUERY_COUNT) {
             event->first_query = ctx.timestamp_cursor;
             ctx.timestamp_cursor += 2;
             vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -740,6 +828,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
         }
     }
     vkCmdDispatch(ctx.cmd, x, y, z);
+    if (event) event->host_end_ns = timeline_now_ns();
     if (event && event->first_query != UINT32_MAX)
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             ctx.timestamp_pool, event->first_query + 1);
@@ -793,7 +882,10 @@ static void timeline_duration_current(TimelineEventKind kind, const char *name,
     auto &ctx = get_cmd_ctx();
     timeline_maybe_start(ctx);
     TimelineEvent *event = timeline_add(ctx, kind, name);
-    if (event) event->duration_ns = timeline_now_ns() - start_ns;
+    if (event) {
+        event->host_end_ns = timeline_now_ns();
+        event->duration_ns = event->host_end_ns - start_ns;
+    }
 }
 
 static VkResult timeline_device_wait_idle(const char *name) {
@@ -813,10 +905,10 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
     const VkQueryPool pool = ctx.timestamp_pools[slot];
     const uint32_t count = ctx.slot_timestamp_counts[slot];
     if (pool == VK_NULL_HANDLE || count == 0) return;
-    uint64_t ticks[256] = {};
+    std::vector<uint64_t> ticks(count);
     VkResult result = vkGetQueryPoolResults(
         g_vk.device, pool, 0, count,
-        (size_t)count * sizeof(uint64_t), ticks, sizeof(uint64_t),
+        (size_t)count * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) {
         fprintf(stderr, "ds4: VULKAN timestamp read failed: %d\n", result);
@@ -831,6 +923,8 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
             event.first_query == UINT32_MAX) continue;
         const uint64_t begin = ticks[event.first_query] & mask;
         const uint64_t end = ticks[event.first_query + 1] & mask;
+        event.gpu_start_ns = (uint64_t)((double)begin * g_vk.timestamp_period_ns);
+        event.gpu_end_ns = (uint64_t)((double)end * g_vk.timestamp_period_ns);
         event.gpu_ns = (uint64_t)((double)((end - begin) & mask) *
                                   g_vk.timestamp_period_ns);
         event.first_query = UINT32_MAX;
@@ -945,7 +1039,8 @@ static int begin_cmd(void) {
         return 0;
     c.timestamp_pool = c.timestamp_pools[slot];
     if (c.timestamp_pool != VK_NULL_HANDLE) {
-        vkResetQueryPool(g_vk.device, c.timestamp_pool, 0, 256);
+        vkResetQueryPool(g_vk.device, c.timestamp_pool, 0,
+                         DS4_VK_TIMELINE_QUERY_COUNT);
         c.timestamp_cursor = 0;
         c.routed_timestamps.clear();
     }
@@ -1446,6 +1541,8 @@ int ds4_gpu_flush_commands(void) {
 int ds4_gpu_end_commands(void) {
     int ok = submit_and_wait();
     auto &ctx = get_cmd_ctx();
+    if (ok && ctx.layer_timeline_end_pending)
+        timeline_layer_summary(ctx);
     if (ok && ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
         timeline_dump(ctx);
     return ok;
@@ -1471,21 +1568,34 @@ extern "C" void ds4_gpu_timeline_layer_begin(uint32_t layer) {
     ctx.timeline_dumped = false;
     ctx.timeline_seen_dispatches = 0;
     ctx.timeline_skip_dispatches = 0;
-    ctx.timeline_max_dispatches = 1024;
+    ctx.timeline_max_dispatches = DS4_VK_TIMELINE_MAX_DISPATCHES;
     ctx.timeline_captured_dispatches = 0;
     ctx.layer_timeline_active = true;
+    ctx.layer_timeline_end_pending = false;
     ctx.layer_timeline_layer = layer;
     ctx.layer_timeline_start_ns = timeline_now_ns();
     ctx.layer_timeline_stage_cursor = 0;
 }
 
 extern "C" void ds4_gpu_timeline_layer_end(uint32_t layer) {
+    const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
+    if (!target || !target[0] || strtoul(target, nullptr, 10) != layer) return;
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_timeline_active || ctx.layer_timeline_layer != layer) return;
+    if (ctx.recording) {
+        /* Prefill has no decode layer batch and can still be recording here.
+         * Stop admitting later-layer events, then summarize after the enclosing
+         * prefill submits and waits in ds4_gpu_end_commands(). */
+        ctx.layer_timeline_end_pending = true;
+        ctx.timeline_collecting = false;
+        return;
+    }
     timeline_layer_summary(ctx);
 }
 
 extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
+    const char *target = getenv("DS4_VULKAN_TIMELINE_LAYER");
+    if (!target || !target[0]) return;
     auto &ctx = get_cmd_ctx();
     if (!ctx.layer_timeline_active) return;
     for (size_t i = ctx.layer_timeline_stage_cursor;
@@ -1542,20 +1652,32 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
 }
 
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t ev, const char *label) {
-    (void)ev; (void)label;
+    (void)ev;
     /* End + wait + re-begin: the engine reads the selected ids on the CPU and
      * then keeps encoding GPU kernels (routed MoE) without a begin_commands. */
     auto &ctx = get_cmd_ctx();
+    const uint64_t readback_start = timeline_now_ns();
     if (ctx.layer_batch_active)
         return retire_layer_batch_span(ctx, true);
     int ok = end_and_submit();
     if (ok) ok = wait_cmd();
     if (ok) ok = begin_cmd();
+    if (getenv("DS4_VULKAN_TIMELINE"))
+        timeline_duration_current(TimelineEventKind::Wait,
+                                  label && label[0] ? label : "selected_readback",
+                                  readback_start);
     return ok;
 }
 
 int ds4_gpu_wait_selected_readback_ready(uint64_t ev, const char *label) {
-    (void)ev; (void)label; return wait_cmd();
+    (void)ev;
+    const uint64_t start = timeline_now_ns();
+    const int ok = wait_cmd();
+    if (getenv("DS4_VULKAN_TIMELINE"))
+        timeline_duration_current(TimelineEventKind::Wait,
+                                  label && label[0] ? label : "selected_readback_wait",
+                                  start);
+    return ok;
 }
 
 /* ---- Model Loading ---- */
@@ -6007,7 +6129,7 @@ static bool ds4gk_routed_dispatch_shader(
     ds4gk_routed_input_barrier(ctx, shader_name, pc, buffers, buffer_count);
     uint32_t first_query = UINT32_MAX;
     if (ctx.routed_profile_enabled && ctx.timestamp_pool != VK_NULL_HANDLE &&
-        ctx.timestamp_cursor <= 254) {
+        ctx.timestamp_cursor + 1u < DS4_VK_TIMELINE_QUERY_COUNT) {
         first_query = ctx.timestamp_cursor;
         ctx.timestamp_cursor += 2;
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -6051,7 +6173,11 @@ static uint32_t ds4gk_routed_projection_groups(uint32_t rows,
 
 static bool ds4gk_routed_flush(std::vector<VkDescriptorSet> &sets) {
     if (sets.empty()) return true;
+    const uint64_t flush_start = timeline_now_ns();
     bool ok = submit_and_wait() != 0;
+    if (getenv("DS4_VULKAN_TIMELINE"))
+        timeline_duration_current(TimelineEventKind::Wait,
+                                  "routed_tile_flush", flush_start);
     for (VkDescriptorSet set : sets)
         if (!release_simple_descriptors(set)) ok = false;
     sets.clear();

@@ -2416,6 +2416,14 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
         timeline_resource_current(TimelineEventKind::BufferAlloc,
                                   "weight_staging", size, offset);
         memcpy(sai.pMappedData, (const char*)g_vk.model_map + offset, (size_t)size);
+        if (vmaFlushAllocation(g_vk.allocator, salloc, 0, size) != VK_SUCCESS) {
+            fprintf(stderr, "ds4: VULKAN ensure_weight: staging flush failed\n");
+            timeline_resource_current(TimelineEventKind::BufferFree,
+                                      "weight_staging", size, offset);
+            vmaDestroyBuffer(g_vk.allocator, sbuf, salloc);
+            vmaDestroyBuffer(g_vk.allocator, buf, alloc);
+            return 0;
+        }
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = load_pool;
@@ -2598,7 +2606,13 @@ static bool upload_aligned_artifact(const ds4_vulkan_q8_aligned_artifact &artifa
     if (ok)
         timeline_resource_current(TimelineEventKind::BufferAlloc,
                                   "aligned_staging", artifact.bytes);
-    if (ok && sai.pMappedData) memcpy(sai.pMappedData, artifact.data, (size_t)artifact.bytes);
+    if (ok) {
+        ok = sai.pMappedData != nullptr;
+        if (ok) {
+            memcpy(sai.pMappedData, artifact.data, (size_t)artifact.bytes);
+            ok = vmaFlushAllocation(g_vk.allocator, salloc, 0, artifact.bytes) == VK_SUCCESS;
+        }
+    }
     if (ok) {
         VkCommandBufferAllocateInfo cbai{}; cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = load_pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;

@@ -493,6 +493,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_group_bfe", 20, 4},
+        {"matmul_q8_0_group_rows_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
@@ -3186,9 +3187,20 @@ static int ds4_gpu_matmul_q8_0_group_tensor(
     const uint64_t weight_bytes = total_rows * blocks * 34u;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
         return 0;
-    if (out_dim > g_vk.caps.max_compute_work_group_count[0] ||
+    /* Pack as many rows as fit in a 256-lane workgroup.  The appliance
+     * shader keeps one lane per (row, Q8 block), so this is exact whenever
+     * rows_per_workgroup * blocks <= 256.  Keep the old one-row shader as a
+     * clean fallback for stale bundles or unusual devices. */
+    const uint32_t rows_per_workgroup = std::max<uint32_t>(
+        1u, std::min<uint32_t>(256u, 256u / (uint32_t)blocks));
+    const uint64_t packed_dispatch_x =
+        ((uint64_t)out_dim + rows_per_workgroup - 1u) / rows_per_workgroup;
+    if (packed_dispatch_x > g_vk.caps.max_compute_work_group_count[0] ||
         n_groups > g_vk.caps.max_compute_work_group_count[1]) return 0;
-    auto si = g_vk.shader_map.find("matmul_q8_0_group_bfe");
+    auto rows_si = g_vk.shader_map.find("matmul_q8_0_group_rows_bfe");
+    auto one_si = g_vk.shader_map.find("matmul_q8_0_group_bfe");
+    const bool use_packed = rows_si != g_vk.shader_map.end();
+    auto si = use_packed ? rows_si : one_si;
     if (si == g_vk.shader_map.end()) return 0;
 
     decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
@@ -3226,11 +3238,15 @@ static int ds4_gpu_matmul_q8_0_group_tensor(
          (VkDeviceSize)payload_bytes},
         {obuf, ooff, out_bytes},
     };
-    struct { uint32_t in_dim, out_dim, n_groups, blocks_per_row, reserved; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, n_groups, (uint32_t)blocks, 0u};
-    return record_simple_shader("matmul_q8_0_group_bfe", &pc, sizeof(pc),
-                                buffers, 4, (uint32_t)out_dim, n_groups, 1u,
-                                resume_recording);
+    struct { uint32_t in_dim, out_dim, n_groups, blocks_per_row, rows_per_workgroup; } pc = {
+        (uint32_t)in_dim, (uint32_t)out_dim, n_groups, (uint32_t)blocks,
+        use_packed ? rows_per_workgroup : 1u};
+    const char *shader_name = use_packed ?
+        "matmul_q8_0_group_rows_bfe" : "matmul_q8_0_group_bfe";
+    return record_simple_shader(shader_name, &pc, sizeof(pc),
+                                buffers, 4,
+                                use_packed ? (uint32_t)packed_dispatch_x : (uint32_t)out_dim,
+                                n_groups, 1u, resume_recording);
 }
 
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */
@@ -4415,8 +4431,10 @@ static int ds4_vk_attention_output_low_gpu(
              * leaving a partially recorded grouped graph with no fallback. */
             const uint64_t grouped_rows = (uint64_t)n_groups * rank;
             auto grouped_shader = g_vk.shader_map.find("matmul_q8_0_group_bfe");
+            auto grouped_rows_shader = g_vk.shader_map.find("matmul_q8_0_group_rows_bfe");
             decltype(g_vk.aligned_cache)::mapped_type *grouped_aligned = nullptr;
-            grouped_ready = grouped_shader != g_vk.shader_map.end() &&
+            grouped_ready = (grouped_shader != g_vk.shader_map.end() ||
+                             grouped_rows_shader != g_vk.shader_map.end()) &&
                 grouped_rows != 0 &&
                 grouped_rows <= UINT64_MAX / row_a_bytes &&
                 out_a_offset <= model_size &&

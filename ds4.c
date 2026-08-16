@@ -24356,6 +24356,25 @@ static bool metal_graph_encode_decode_layer_phase(
     /* Real TP split slices the shared expert by intermediate lanes, which
      * needs the unfused gate/up/swiglu/down sequence. */
     const bool tp_split_shared = g->tp_world == 2;
+#ifdef DS4_VULKAN_BUILD
+    /* Vulkan's routed shader binds the complete gate/up/down expert tables
+     * and indexes them with the GPU-produced selected tensor.  The inherited
+     * SSD selected-cache branches would instead fence, read those IDs back,
+     * and call cache stubs that Vulkan does not implement.  Keep this narrow:
+     * unsupported quantizers and hash-routed layers retain the generic path. */
+    const bool vulkan_gpu_expert_route =
+        layer && layer->ffn_gate_tid2eid == NULL &&
+        layer->ffn_gate_exps && layer->ffn_up_exps && layer->ffn_down_exps &&
+        (layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 ||
+         layer->ffn_gate_exps->type == DS4_TENSOR_Q2_K ||
+         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS) &&
+        layer->ffn_up_exps->type == layer->ffn_gate_exps->type &&
+        (layer->ffn_down_exps->type == DS4_TENSOR_Q8_0 ||
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+         layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS);
+#else
+    const bool vulkan_gpu_expert_route = false;
+#endif
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap(g) &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -24374,6 +24393,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool overlap_selected_shared =
         ok &&
         g->tp_world < 2 &&
+        !vulkan_gpu_expert_route &&
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
@@ -24392,6 +24412,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool selected_readahead_shared_delay =
         ok &&
         g->tp_world < 2 &&
+        !vulkan_gpu_expert_route &&
         !overlap_selected_shared &&
         !decode_stage_profile &&
         metal_graph_use_iq2_selected_readahead_shared_delay(g) &&
@@ -24403,6 +24424,7 @@ static bool metal_graph_encode_decode_layer_phase(
         ok &&
         !overlap_selected_shared &&
         !selected_readahead_shared_delay &&
+        !vulkan_gpu_expert_route &&
         g->ssd_streaming &&
         metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&

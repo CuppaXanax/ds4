@@ -1,0 +1,118 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/*
+ * Wave64 Q8_0 GEMV for the Flash attention-output B projection
+ * (4096 outputs x 4096 inputs, 256 blocks/row, decode only).
+ *
+ * The aligned shader assigns one lane to a whole 32-value block.  On
+ * GFX1013 that makes the first payload load of a wave stride by eight words:
+ * adjacent lanes consume different 32-byte records.  This kernel instead
+ * assigns four lanes to a block and each lane consumes two adjacent uint
+ * payload words (eight int8 values).  Across the wave, the two load streams
+ * cover the even and odd words of sixteen adjacent blocks, giving the memory
+ * coalescer contiguous 32-bit addresses while retaining the same 256-block
+ * output-row traversal.
+ *
+ * Each four-lane subgroup is reduced with integer subgroup shuffles.  The
+ * original per-block dot is an int32 sum whose maximum magnitude is far below
+ * int32 overflow, so partitioning that exact integer sum across lanes does
+ * not change the result.  The final float accumulation remains sequential in
+ * block order, matching matmul_q8_0_aligned_bfe.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks_per_row;
+    uint y_scale;
+} pc;
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(word), int(byte_index * 8u), 8);
+}
+
+int packed_dot8(uint w0, uint w1, uint x0, uint x1) {
+    int sum = 0;
+    sum += i8_at(w0, 0u) * i8_at(x0, 0u);
+    sum += i8_at(w0, 1u) * i8_at(x0, 1u);
+    sum += i8_at(w0, 2u) * i8_at(x0, 2u);
+    sum += i8_at(w0, 3u) * i8_at(x0, 3u);
+    sum += i8_at(w1, 0u) * i8_at(x1, 0u);
+    sum += i8_at(w1, 1u) * i8_at(x1, 1u);
+    sum += i8_at(w1, 2u) * i8_at(x1, 2u);
+    sum += i8_at(w1, 3u) * i8_at(x1, 3u);
+    return sum;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint row = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.z;
+    uint block_slot = lid >> 2u; /* 16 blocks per wave tile */
+    uint word_slot = lid & 3u;   /* two uint words per lane */
+    uint lane_base = block_slot << 2u;
+    float sum = 0.0;
+
+    if (pc.blocks_per_row != 256u || pc.in_dim != 4096u ||
+        pc.n_tok == 0u || token >= pc.n_tok || row >= pc.out_dim) {
+        return;
+    }
+
+    /* 16 blocks per tile; 16 tiles cover the production 4096-input row. */
+    for (uint tile = 0u; tile < 16u; tile++) {
+        uint block = tile * 16u + block_slot;
+        uint record = row * pc.blocks_per_row + block;
+        uint weight_word = record * 8u + word_slot * 2u;
+        uint x_word = token * pc.blocks_per_row * 9u + block * 9u +
+                      1u + word_slot * 2u;
+        int partial = packed_dot8(payload_buf[weight_word],
+                                  payload_buf[weight_word + 1u],
+                                  x_q8_buf[x_word], x_q8_buf[x_word + 1u]);
+
+        int p0 = subgroupShuffle(partial, lane_base + 0u);
+        int p1 = subgroupShuffle(partial, lane_base + 1u);
+        int p2 = subgroupShuffle(partial, lane_base + 2u);
+        int p3 = subgroupShuffle(partial, lane_base + 3u);
+        float block_value = 0.0;
+        if (word_slot == 0u) {
+            int block_dot = p0 + p1 + p2 + p3;
+            uint scale_word = scale_buf[record >> 1u];
+            uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+            uint x_scale_word = token * pc.blocks_per_row * 9u + block * 9u;
+            float scale_product = f16tof32(scale_bits) *
+                                   uintBitsToFloat(x_q8_buf[x_scale_word]);
+            block_value = scale_product * float(block_dot);
+        }
+
+        /* Leaders are lanes 0,4,...,60.  Lane zero consumes them in block
+         * order, so the FP32 reduction has the same association as aligned. */
+        for (uint slot = 0u; slot < 16u; slot++) {
+            float slot_value = subgroupShuffle(block_value, slot * 4u);
+            if (lid == 0u)
+                sum += slot_value;
+        }
+    }
+
+    if (lid == 0u)
+        out_buf[token * pc.out_dim + row] = sum;
+}

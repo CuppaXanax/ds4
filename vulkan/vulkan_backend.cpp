@@ -472,6 +472,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_aligned_bfe", 20, 4},
+        {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
@@ -2903,7 +2904,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
         !(wave64_env && strcmp(wave64_env, "0") == 0) &&
         g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
-        n_tok == 1 && in_dim == 4096 && blocks == 256 && out_dim == 4096;
+        n_tok == 1 && in_dim == 8192 && blocks == 256 && out_dim == 4096;
     bool use_rows2 = use_aligned &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
         !(rows2_env && strcmp(rows2_env, "0") == 0) &&
@@ -2984,6 +2985,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks,
         use_wave64 ? 1u : (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale))};
+    if (use_wave64 && getenv("DS4_VULKAN_TRACE_KERNELS"))
+        fprintf(stderr,
+                "ds4: [trace] matmul_q8_0_wave64_bfe shape=%ux%u blocks=%u "
+                "dispatch=%ux%ux%u\n",
+                (unsigned)in_dim, (unsigned)out_dim, (unsigned)blocks,
+                (unsigned)dispatch_x, (unsigned)dispatch_y, (unsigned)n_tok);
     if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader(shader_name, &pc, sizeof(pc),

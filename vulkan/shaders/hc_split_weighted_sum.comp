@@ -34,22 +34,26 @@ void main() {
     uint mix_base = row * mix_stride;
     uint split_base = row * mix_stride;
 
-    if (lane == 0u) {
-        for (uint i = 0u; i < pc.n_hc; ++i) {
-            float z = mix_val[mix_base + i] * scale_val[0] + base_val[i];
-            split_val[split_base + i] = 1.0 / (1.0 + exp(-z)) + pc.eps;
-        }
-        for (uint i = 0u; i < pc.n_hc; ++i) {
-            uint off = pc.n_hc + i;
-            float z = mix_val[mix_base + off] * scale_val[1] + base_val[off];
-            split_val[split_base + off] = 2.0 / (1.0 + exp(-z));
-        }
-        for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+    /* The original implementation ran every Sinkhorn row and column through
+     * lane zero. Rows (and, after a barrier, columns) are independent. Give
+     * one lane to each while retaining the original serial order inside every
+     * max/sum/divide loop, which preserves the observable arithmetic order. */
+    if (lane < pc.n_hc) {
+        float z = mix_val[mix_base + lane] * scale_val[0] + base_val[lane];
+        split_val[split_base + lane] = 1.0 / (1.0 + exp(-z)) + pc.eps;
+
+        uint off = pc.n_hc + lane;
+        z = mix_val[mix_base + off] * scale_val[1] + base_val[off];
+        split_val[split_base + off] = 2.0 / (1.0 + exp(-z));
+
+        uint dst = lane;
+        {
             float row_max = -3.402823466e+38;
             for (uint src = 0u; src < pc.n_hc; ++src) {
                 uint idx = src + dst * pc.n_hc;
-                uint off = 2u * pc.n_hc + idx;
-                float v = mix_val[mix_base + off] * scale_val[2] + base_val[off];
+                uint matrix_off = 2u * pc.n_hc + idx;
+                float v = mix_val[mix_base + matrix_off] * scale_val[2] +
+                          base_val[matrix_off];
                 sinkhorn[idx] = v;
                 row_max = max(row_max, v);
             }
@@ -64,22 +68,36 @@ void main() {
                 sinkhorn[idx] = sinkhorn[idx] / row_sum + pc.eps;
             }
         }
-        for (uint src = 0u; src < pc.n_hc; ++src) {
+    }
+    barrier();
+
+    if (lane < pc.n_hc) {
+        uint src = lane;
+        {
             float sum = 0.0;
             for (uint dst = 0u; dst < pc.n_hc; ++dst)
                 sum += sinkhorn[src + dst * pc.n_hc];
             for (uint dst = 0u; dst < pc.n_hc; ++dst)
                 sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
         }
-        for (uint iter = 1u; iter < pc.sinkhorn_iters; ++iter) {
-            for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+    }
+    barrier();
+
+    for (uint iter = 1u; iter < pc.sinkhorn_iters; ++iter) {
+        if (lane < pc.n_hc) {
+            uint dst = lane;
+            {
                 float sum = 0.0;
                 for (uint src = 0u; src < pc.n_hc; ++src)
                     sum += sinkhorn[src + dst * pc.n_hc];
                 for (uint src = 0u; src < pc.n_hc; ++src)
                     sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
             }
-            for (uint src = 0u; src < pc.n_hc; ++src) {
+        }
+        barrier();
+        if (lane < pc.n_hc) {
+            uint src = lane;
+            {
                 float sum = 0.0;
                 for (uint dst = 0u; dst < pc.n_hc; ++dst)
                     sum += sinkhorn[src + dst * pc.n_hc];
@@ -87,9 +105,11 @@ void main() {
                     sinkhorn[src + dst * pc.n_hc] /= sum + pc.eps;
             }
         }
-        for (uint i = 0u; i < pc.n_hc * pc.n_hc; ++i)
-            split_val[split_base + 2u * pc.n_hc + i] = sinkhorn[i];
+        barrier();
     }
+
+    for (uint i = lane; i < pc.n_hc * pc.n_hc; i += 256u)
+        split_val[split_base + 2u * pc.n_hc + i] = sinkhorn[i];
     barrier();
 
     if (pc.has_sum == 0u) return;

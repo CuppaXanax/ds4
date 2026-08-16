@@ -899,7 +899,7 @@ static void worker_hazard_barrier(VulkanCommandCtx &ctx, const char *name,
 
 static bool worker_resource_hazards_enabled(void) {
     const char *env = getenv("DS4_VULKAN_WORKER_RESOURCE_HAZARDS");
-    return !env || strcmp(env, "0") != 0;
+    return env && strcmp(env, "0") != 0;
 }
 
 static bool worker_slice_trace_enabled(void) {
@@ -2091,7 +2091,7 @@ extern "C" int ds4_gpu_worker_slice_begin(uint32_t layer_start,
     if (ctx.worker_slice_active || ctx.layer_batch_active ||
         layer_end < layer_start ||
         layer_end - layer_start + 1u != 4u ||
-        (worker_slice_env && strcmp(worker_slice_env, "0") == 0) ||
+        (!worker_slice_env || strcmp(worker_slice_env, "0") == 0) ||
         getenv("DS4_DIST_DECODE_PROFILE") != nullptr ||
         (!slice_bench && getenv("DS4_VULKAN_TIMELINE") != nullptr) ||
         (!slice_bench && getenv("DS4_VULKAN_TIMELINE_LAYER") != nullptr) ||

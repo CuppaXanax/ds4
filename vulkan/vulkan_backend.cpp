@@ -4863,6 +4863,51 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
     if (n_tok > UINT64_MAX / out1_dim ||
         (uint64_t)out1_dim * n_tok * sizeof(float) > out1->bytes) return 0;
 
+    /* Both projections consume the same activation.  The ordinary Q8 path
+     * quantizes that activation into a temporary for each call, which turns
+     * a pair into two quantize dispatches and two temporary buffers.  Keep
+     * one quantized activation alive across both matmuls instead.  This is
+     * deliberately limited to the same capability/shape envelope as the
+     * prequant path; all other shapes retain the established fallback below.
+     *
+     * In a layer batch submit_and_wait() is intentionally a no-op, and
+     * ds4_gpu_tensor_free() defers the temporary until the batch retires. In
+     * the unbatched path the explicit wait below makes the lifetime safe. */
+    const bool prequant_eligible =
+        n_tok <= 65535u && blocks <= 256u &&
+        n_tok <= UINT64_MAX / blocks &&
+        n_tok * blocks <= UINT64_MAX / 36u &&
+        n_tok * blocks * 36u <= UINT32_MAX &&
+        g_vk.caps.max_compute_work_group_size[0] >= 256u &&
+        g_vk.caps.max_compute_work_group_invocations >= 256u;
+    if (prequant_eligible) {
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
+        if (!q) return 0;
+        int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
+        if (ok)
+            ok = ds4_gpu_matmul_q8_0_prequant_tensor(
+                out0, model_map, model_size, weight0_offset,
+                in_dim, out0_dim, q, n_tok);
+        if (ok)
+            ok = ds4_gpu_matmul_q8_0_prequant_tensor(
+                out1, model_map, model_size, weight1_offset,
+                in_dim, out1_dim, q, n_tok);
+
+        auto &ctx = get_cmd_ctx();
+        if (ctx.attention_output_batch) {
+            free_or_defer_attention_tensor(ctx, q);
+            return ok;
+        }
+        if (ok) {
+            /* The temporary is referenced by both recorded matmuls. */
+            ok = submit_and_wait();
+        } else if (ctx.recording && ctx.command_count != 0) {
+            submit_and_wait();
+        }
+        ds4_gpu_tensor_free(q);
+        return ok;
+    }
+
     if (ds4_gpu_matmul_q8_0_tensor(out0, model_map, model_size,
                                    weight0_offset, in_dim, out0_dim,
                                    x, n_tok) == 0) return 0;
@@ -6822,10 +6867,9 @@ static int ds4_shared_gate_up_swiglu_q8_0_core(
         up = owned_up;
     }
     int ok = gate && up;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
-                                             gate_offset, in_dim, out_dim, x, 1) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(up, model_map, model_size,
-                                             up_offset, in_dim, out_dim, x, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_pair_tensor(
+        gate, up, model_map, model_size, gate_offset, up_offset,
+        in_dim, out_dim, out_dim, x, 1) != 0;
     if (ok) ok = ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim,
                                         clamp, 1.0f) != 0;
     if (owned_up) ds4_gpu_tensor_free(owned_up);

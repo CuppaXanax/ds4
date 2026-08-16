@@ -20,6 +20,12 @@ The previous published record was `4d46c92` (`f85a909` code plus docs).
   indexed Wave64/inverse-RoPE paths;
 - warm worker trace: 76 weight uses, zero uploads, zero evictions.
 
+Cluster operating state: all 12 blades run the enabled upstream
+`cyan-skillfish-governor-smu` v0.4.12 service with a conservative
+1000-2000 MHz / 800-1000 mV curve. The `.42` pilot reduced idle power from
+55.2 W to 43.2 W. Performance comparisons must record governor state and load
+clock; pre-governor TPS figures are retained as history, not clock-matched A/Bs.
+
 ## Production-qualified work
 
 | Commit/range | Result |

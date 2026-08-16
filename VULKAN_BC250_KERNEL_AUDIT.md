@@ -26,6 +26,19 @@ The integrated path and its control produced the same 35,108-byte artifact.
 Exact qualification also compares selected tokens, top-20 ordering, logits,
 and logprobs. The complete GFX1013 suite remains 86/86 passing.
 
+## Cluster clock and power baseline
+
+All 12 blades run `cyan-skillfish-governor-smu` v0.4.12 as an enabled systemd
+service. The conservative SMU curve is 1000 MHz/800 mV, 1500 MHz/900 mV, and
+2000 MHz/1000 mV, with thermal throttle/recovery at 85/75 C. D-Bus is disabled.
+This does not change firmware or the 24-CU mask.
+
+Before installation, every blade was fixed at 1500 MHz. On the `.42` pilot,
+idle power/temperature changed from 55.2 W/57 C to 43.2 W/53 C; all blades
+subsequently reported 1000 MHz idle, roughly 43-47 W, and 53-58 C. Decode
+benchmarks recorded before this rollout are not valid governor-on comparisons;
+future performance records must include observed load clock and temperature.
+
 ## What the current production path contains
 
 The qualified `74a22cd..c519309` range includes:

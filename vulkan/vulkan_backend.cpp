@@ -507,6 +507,7 @@ static int load_all_shaders(void) {
         {"fp8_kv_quantize", 12, 1},
         {"attention_prefill_raw", 16, 4},
         {"attention_decode_mixed", 32, 6},
+        {"attention_decode_mixed_wave64", 32, 6},
         {"attention_mixed_online", 64, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
@@ -4234,8 +4235,15 @@ int ds4_gpu_attention_decode_heads_tensor(
     };
     struct { uint32_t n_raw, raw_cap, raw_start, n_comp, comp_f16, use_mask, n_head, head_dim; }
         pc = {n_raw, raw_cap, raw_start, n_comp, comp_kv_f16, use_mask, n_head, head_dim};
-    DS4_VK_TRACE_KERNEL("attention_decode_mixed");
-    return record_simple_shader("attention_decode_mixed", &pc, sizeof(pc), bufs, 6,
+    const char *wave64_env = getenv("DS4_VULKAN_ATTN_WAVE64");
+    const bool use_wave64 = g_vk.caps.subgroup_size == 64u &&
+        !(wave64_env && strcmp(wave64_env, "0") == 0) &&
+        g_vk.shader_map.find("attention_decode_mixed_wave64") !=
+            g_vk.shader_map.end();
+    const char *shader_name = use_wave64 ?
+        "attention_decode_mixed_wave64" : "attention_decode_mixed";
+    DS4_VK_TRACE_KERNEL(shader_name);
+    return record_simple_shader(shader_name, &pc, sizeof(pc), bufs, 6,
                                 n_head, 1, 1, resume_recording);
 }
 

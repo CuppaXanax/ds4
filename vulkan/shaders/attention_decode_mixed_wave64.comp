@@ -1,0 +1,131 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/* Exact wave64 form of attention_decode_mixed.
+ *
+ * One 64-lane subgroup owns one attention head.  The canonical shader used
+ * workgroup memory plus a barrier for every step of every KV dot-product,
+ * then two more barriers per KV row while accumulating values.  On the
+ * BC-250 the workgroup is exactly one wave64, so the identical
+ * 32,16,8,4,2,1 reduction tree can stay in registers.  Value dimensions are
+ * lane-private and need no synchronization.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer OutBuf { float out_val[]; };
+layout(set = 0, binding = 1) readonly buffer QBuf { float q_val[]; };
+layout(set = 0, binding = 2) readonly buffer RawBuf { float raw_val[]; };
+layout(set = 0, binding = 3) readonly buffer CompBuf { float comp_val[]; };
+layout(set = 0, binding = 4) readonly buffer MaskBuf { float mask_val[]; };
+layout(set = 0, binding = 5) readonly buffer SinkBuf { float sink_val[]; };
+layout(push_constant) uniform PC {
+    uint n_raw;
+    uint raw_cap;
+    uint raw_start;
+    uint n_comp;
+    uint comp_f16;
+    uint use_mask;
+    uint n_head;
+    uint head_dim;
+} pc;
+
+shared float score[1024];
+
+uint add_mod(uint a, uint b, uint m) {
+    a %= m;
+    b %= m;
+    return a >= m - b ? a - (m - b) : a + b;
+}
+
+float comp_at(uint index) {
+    if (pc.comp_f16 == 0u) return comp_val[index];
+    uint word = index >> 1u;
+    vec2 v = unpackHalf2x16(floatBitsToUint(comp_val[word]));
+    return (index & 1u) == 0u ? v.x : v.y;
+}
+
+float wave_sum_exact(float value, uint lane) {
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        float other = subgroupShuffle(value, lane + stride);
+        if (lane < stride) value += other;
+    }
+    return value;
+}
+
+float wave_max_exact(float value, uint lane) {
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        float other = subgroupShuffle(value, lane + stride);
+        if (lane < stride) value = max(value, other);
+    }
+    return value;
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_head) return;
+
+    uint dim = pc.head_dim;
+    uint qbase = h * dim;
+    float scale = inversesqrt(float(dim));
+
+    for (uint r = 0u; r < pc.n_raw; r++) {
+        uint kbase = add_mod(pc.raw_start, r, pc.raw_cap) * dim;
+        float dot = 0.0;
+        for (uint d = lane; d < dim; d += 64u)
+            dot += q_val[qbase + d] * raw_val[kbase + d];
+        dot = wave_sum_exact(dot, lane);
+        if (lane == 0u) score[r] = dot * scale;
+    }
+    for (uint c = 0u; c < pc.n_comp; c++) {
+        float add = pc.use_mask != 0u ? mask_val[c] : 0.0;
+        float dot = 0.0;
+        uint cbase = c * dim;
+        if (add > -1.0e20) {
+            for (uint d = lane; d < dim; d += 64u)
+                dot += q_val[qbase + d] * comp_at(cbase + d);
+        }
+        dot = wave_sum_exact(dot, lane);
+        if (lane == 0u)
+            score[pc.n_raw + c] =
+                add <= -1.0e20 ? -1.0e30 : dot * scale + add;
+    }
+    barrier();
+
+    uint total = pc.n_raw + pc.n_comp;
+    float lane_max = sink_val[h];
+    for (uint i = lane; i < total; i += 64u) {
+        if (i < pc.n_raw || score[i] > -1.0e20)
+            lane_max = max(lane_max, score[i]);
+    }
+    lane_max = wave_max_exact(lane_max, lane);
+    float max_score = subgroupShuffle(lane_max, 0u);
+
+    for (uint i = lane; i < total; i += 64u)
+        score[i] = (i >= pc.n_raw && score[i] <= -1.0e20) ?
+            0.0 : exp(score[i] - max_score);
+    barrier();
+
+    float lane_denom = 0.0;
+    for (uint i = lane; i < total; i += 64u)
+        lane_denom += score[i];
+    lane_denom = wave_sum_exact(lane_denom, lane);
+    float denom = exp(sink_val[h] - max_score) +
+                  subgroupShuffle(lane_denom, 0u);
+
+    /* Each lane owns disjoint output dimensions, so initialization and the
+     * ordered raw-then-compressed accumulation require no wave barriers. */
+    for (uint d = lane; d < dim; d += 64u) {
+        float acc = 0.0;
+        for (uint r = 0u; r < pc.n_raw; r++) {
+            uint kbase = add_mod(pc.raw_start, r, pc.raw_cap) * dim;
+            acc += score[r] * raw_val[kbase + d];
+        }
+        for (uint c = 0u; c < pc.n_comp; c++) {
+            float add = pc.use_mask != 0u ? mask_val[c] : 0.0;
+            if (add > -1.0e20)
+                acc += score[pc.n_raw + c] * comp_at(c * dim + d);
+        }
+        out_val[qbase + d] = acc / denom;
+    }
+}

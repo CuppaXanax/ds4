@@ -23815,6 +23815,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t gate_expert_bytes DS4_MAYBE_UNUSED = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes DS4_MAYBE_UNUSED = routed_out_dim * down_row_bytes;
+    bool ffn_replay_done = false;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
         ok = metal_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
     } else {
@@ -23897,7 +23898,78 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok && router_shared_done == 0 && router_only_done == 0)
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
                                                      DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
-        if (ok && !router_project_select_fused) {
+        const bool ffn_replay_shape =
+            phase == METAL_DECODE_LAYER_FULL &&
+            !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
+            !decode_stage_profile && !g->cuda_tp_decode &&
+            !g->cuda_tp_moe && !g->cuda_tp_shared && g->tp_world < 2 &&
+            !keep_ffn_out && !metal_graph_use_reference_shared_down_hc() &&
+            fuse_shared_gate_up &&
+            layer->ffn_gate_tid2eid == NULL &&
+            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+            layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+            layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+            layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+            DS4_N_EXPERT == 256u && DS4_N_EXPERT_USED == 6u &&
+            expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+            routed_out_dim == 4096u && shared_dim == 4096u &&
+            gate_row_bytes == 1056u && gate_expert_bytes == 2162688u &&
+            down_row_bytes == 672u && down_expert_bytes == 2752512u &&
+            !g_expert_profile.active &&
+            getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
+            metal_graph_debug_get_config()->prefix == NULL;
+#ifdef DS4_VULKAN_BUILD
+        if (ok && !router_project_select_fused && ffn_replay_shape) {
+            ds4_vulkan_ffn_replay_args replay = {};
+            replay.router_selected = metal_graph_router_selected(g);
+            replay.router_weights = metal_graph_router_weights(g);
+            replay.router_probs = metal_graph_router_probs(g);
+            replay.router_logits = metal_graph_router_logits(g);
+            replay.ffn_norm = metal_graph_ffn_norm(g);
+            replay.shared_gate = metal_graph_shared_gate(g);
+            replay.shared_up = metal_graph_shared_up(g);
+            replay.shared_mid = metal_graph_shared_mid(g);
+            replay.shared_out = metal_graph_shared_out(g);
+            replay.routed_out = metal_graph_routed_out(g);
+            replay.routed_gate = metal_graph_routed_gate(g);
+            replay.routed_up = metal_graph_routed_up(g);
+            replay.routed_mid = metal_graph_routed_mid(g);
+            replay.routed_down = metal_graph_routed_down(g);
+            replay.after_ffn_hc = metal_graph_after_ffn_hc(g);
+            replay.after_attn_hc = metal_graph_after_attn_hc(g);
+            replay.hc_split = metal_graph_hc_split(g);
+            replay.model_map = model->map;
+            replay.model_size = model->size;
+            replay.router_bias_offset = layer->ffn_exp_probs_b
+                ? layer->ffn_exp_probs_b->abs_offset : 0;
+            replay.shared_gate_offset = layer->ffn_gate_shexp->abs_offset;
+            replay.shared_up_offset = layer->ffn_up_shexp->abs_offset;
+            replay.shared_down_offset = layer->ffn_down_shexp->abs_offset;
+            replay.routed_gate_offset = layer->ffn_gate_exps->abs_offset;
+            replay.routed_up_offset = layer->ffn_up_exps->abs_offset;
+            replay.routed_down_offset = layer->ffn_down_exps->abs_offset;
+            replay.routed_gate_expert_bytes = gate_expert_bytes;
+            replay.routed_gate_row_bytes = gate_row_bytes;
+            replay.routed_down_expert_bytes = down_expert_bytes;
+            replay.routed_down_row_bytes = down_row_bytes;
+            replay.gate_type = layer->ffn_gate_exps->type;
+            replay.down_type = layer->ffn_down_exps->type;
+            replay.expert_in_dim = (uint32_t)expert_in_dim;
+            replay.expert_mid_dim = (uint32_t)expert_mid_dim;
+            replay.routed_out_dim = (uint32_t)routed_out_dim;
+            replay.shared_dim = shared_dim;
+            replay.n_total_expert = DS4_N_EXPERT;
+            replay.n_expert = DS4_N_EXPERT_USED;
+            replay.n_expert_used = DS4_N_EXPERT_USED;
+            replay.n_embd = DS4_N_EMBD;
+            replay.n_hc = DS4_N_HC;
+            replay.token = (uint32_t)token;
+            replay.clamp = DS4_SWIGLU_CLAMP_EXP;
+            replay.router_has_bias = layer->ffn_exp_probs_b != NULL;
+            ffn_replay_done = ds4_gpu_vulkan_ffn_replay_one(&replay) != 0;
+        }
+#endif
+        if (ok && !router_project_select_fused && !ffn_replay_done) {
 #if defined(DS4_VULKAN_BUILD)
             const bool router_overlap_active =
                 phase == METAL_DECODE_LAYER_FULL &&
@@ -23935,6 +24007,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    g);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
+    if (ffn_replay_done) {
+        DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+        DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+        DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+        return ok;
+    }
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);

@@ -81,6 +81,19 @@ static constexpr uint32_t DS4_VK_TIMELINE_QUERY_COUNT = 2048;
 static constexpr uint64_t DS4_VK_TIMELINE_MAX_DISPATCHES =
     DS4_VK_TIMELINE_QUERY_COUNT / 2u;
 
+/* A replay body owns every descriptor and scratch allocation referenced by
+ * its secondary command buffer.  The key is a complete stable-resource and
+ * shape fingerprint; dynamic router contents stay in the graph tensors. */
+struct FfnReplayBody {
+    std::vector<uint64_t> key;
+    VkCommandBuffer secondary = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptors;
+    std::vector<ds4_gpu_tensor *> tensors;
+    std::vector<VkDescriptorBufferInfo> bindings;
+    std::vector<uint64_t> weight_offsets;
+    std::vector<VkBuffer> weight_buffers;
+    uint32_t dispatches = 0;
+};
 struct VulkanCommandCtx {
     VkCommandPool   pool     = VK_NULL_HANDLE;
     VkCommandBuffer cmd      = VK_NULL_HANDLE;
@@ -130,6 +143,9 @@ struct VulkanCommandCtx {
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
+    std::vector<FfnReplayBody> ffn_replay_bodies;
+    bool ffn_replay_recording = false;
+    FfnReplayBody *ffn_replay_active = nullptr;
 };
 
 struct ShaderEntry {
@@ -1308,6 +1324,7 @@ static uint32_t command_submit_limit(void) {
  * in-flight weight eviction is bounded by keeping command buffers short. */
 static void maybe_submit(void) {
     auto &c = get_cmd_ctx();
+    if (c.ffn_replay_recording) return;
     if (c.recording && c.command_count >= command_submit_limit()) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr, "ds4: [dbg] maybe_submit cc=%u\n", (unsigned)c.command_count);
@@ -1353,6 +1370,9 @@ static int dispatch_shader(const char *name,
     if (n_bufs) vkUpdateDescriptorSets(g_vk.device, n_bufs, writes.data(), 0, nullptr);
     mark_bound_weight_buffers(bufs, n_bufs, c.recording_generation);
     timeline_descriptors(c, name, bufs, n_bufs);
+    if (c.ffn_replay_recording && c.ffn_replay_active)
+        c.ffn_replay_active->bindings.insert(
+            c.ffn_replay_active->bindings.end(), bufs, bufs + n_bufs);
 
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             e.layout, 0, 1, &ds, 0, nullptr);
@@ -1412,6 +1432,16 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, c] : g_vk.cmd_ctxs) {
         (void)retire_completed_slots(c, c.last_submit_value);
         timeline_dump(c);
+        for (FfnReplayBody &body : c.ffn_replay_bodies) {
+            for (VkDescriptorSet set : body.descriptors)
+                if (set != VK_NULL_HANDLE)
+                    vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+            for (ds4_gpu_tensor *tensor : body.tensors)
+                free(tensor);
+            if (body.secondary != VK_NULL_HANDLE)
+                vkFreeCommandBuffers(g_vk.device, c.pool, 1, &body.secondary);
+        }
+        c.ffn_replay_bodies.clear();
         for (VkQueryPool pool : c.timestamp_pools)
             if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
@@ -1602,6 +1632,13 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
     if (!t) return;
     auto &ctx = get_cmd_ctx();
+    if (ctx.ffn_replay_recording && t->owner && t->ptr &&
+        ctx.ffn_replay_active) {
+        /* A body may execute after this call returns.  Keep the allocation
+         * and its identity token alive with the secondary command buffer. */
+        ctx.ffn_replay_active->tensors.push_back(t);
+        return;
+    }
     if (ctx.layer_batch_active && t->owner && t->ptr) {
         ctx.layer_batch_tensors.push_back(t);
         return;
@@ -2532,11 +2569,19 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
     auto &ctx = get_cmd_ctx();
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+    if (ctx.ffn_replay_recording && ctx.ffn_replay_active)
+        ctx.ffn_replay_active->bindings.insert(
+            ctx.ffn_replay_active->bindings.end(), buffers, buffers + count);
     return 1;
 }
 
 static int release_simple_descriptors(VkDescriptorSet set) {
     auto &ctx = get_cmd_ctx();
+    if (ctx.ffn_replay_recording && set != VK_NULL_HANDLE &&
+        ctx.ffn_replay_active) {
+        ctx.ffn_replay_active->descriptors.push_back(set);
+        return 1;
+    }
     if (ctx.layer_batch_active) {
         ctx.layer_batch_descriptors.push_back(set);
         maybe_submit();
@@ -7629,6 +7674,266 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                                                residual_hc, split, n_embd, n_hc);
 }
 
+static bool ffn_replay_key_tensor(std::vector<uint64_t> &key,
+                                   const ds4_gpu_tensor *tensor) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    if (!tensor || !find_tensor_buffer(tensor, buffer, offset)) return false;
+    key.push_back((uint64_t)(uintptr_t)buffer);
+    key.push_back((uint64_t)offset);
+    key.push_back(tensor->bytes);
+    return true;
+}
+
+static void ffn_replay_discard_body(FfnReplayBody &body) {
+    for (VkDescriptorSet set : body.descriptors)
+        if (set != VK_NULL_HANDLE)
+            vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+    for (ds4_gpu_tensor *tensor : body.tensors) {
+        if (tensor && tensor->owner && tensor->ptr) {
+            auto it = g_vk.tensor_headers.find(tensor->ptr);
+            if (it != g_vk.tensor_headers.end()) {
+                if (!release_tensor_header(it->second))
+                    g_vk.tensor_headers.erase(it);
+            }
+        }
+        free(tensor);
+    }
+    if (body.secondary != VK_NULL_HANDLE)
+        vkFreeCommandBuffers(g_vk.device, get_cmd_ctx().pool, 1,
+                             &body.secondary);
+    body = {};
+}
+
+static bool ffn_replay_source_live(uint64_t source, VkBuffer expected) {
+    auto aligned = g_vk.aligned_cache.find(source);
+    if (aligned != g_vk.aligned_cache.end())
+        return aligned->second.gpu.buffer == expected;
+    for (const auto &[base, entry] : g_vk.weight_cache) {
+        if (source >= base && source - base < entry.size)
+            return entry.buffer == expected;
+    }
+    return false;
+}
+
+static bool ffn_replay_weights_live(const FfnReplayBody &body) {
+    if (body.weight_offsets.size() != body.weight_buffers.size()) return false;
+    for (size_t i = 0; i < body.weight_offsets.size(); i++)
+        if (!ffn_replay_source_live(body.weight_offsets[i],
+                                    body.weight_buffers[i])) return false;
+    return true;
+}
+
+static bool ffn_replay_track_source(FfnReplayBody &body, uint64_t source) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, range = 0;
+    if (g_vk.aligned_cache.find(source) != g_vk.aligned_cache.end()) {
+        buffer = g_vk.aligned_cache[source].gpu.buffer;
+    } else if (!find_model_buffer(source, 1, buffer, offset, range)) {
+        return false;
+    }
+    body.weight_offsets.push_back(source);
+    body.weight_buffers.push_back(buffer);
+    return true;
+}
+
+/* Record and replay the strict single-GPU Flash FFN body.  The body contains
+ * no position-dependent state: router IDs/weights are written by the first
+ * dispatch and consumed directly by the routed shaders.  Each command-ring
+ * slot gets its own body so its scratch buffers cannot race an earlier
+ * in-flight submission. */
+extern "C" int ds4_gpu_vulkan_ffn_replay_one(
+        const ds4_vulkan_ffn_replay_args *args) {
+    const char *enabled = getenv("DS4_VULKAN_FFN_REPLAY");
+    if (!enabled || enabled[0] == '\0' || strcmp(enabled, "0") == 0 || !args)
+        return 0;
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.layer_batch_active || !ctx.recording || ctx.ffn_replay_recording)
+        return 0;
+    if (ctx.timeline_enabled || ctx.layer_timeline_active ||
+        getenv("DS4_VULKAN_TIMELINE") || getenv("DS4_VULKAN_DEBUG"))
+        return 0;
+    const char *mid_only = getenv("DS4_VULKAN_ROUTED_MID_ONLY");
+    const char *down_reduce = getenv("DS4_VULKAN_ROUTED_DOWN_REDUCE");
+    const char *hc_fuse = getenv("DS4_VULKAN_DISABLE_Q8_HC_EXPAND_FUSE");
+    if ((mid_only && strcmp(mid_only, "0") == 0) ||
+        (down_reduce && strcmp(down_reduce, "0") == 0) ||
+        (hc_fuse && strcmp(hc_fuse, "0") != 0))
+        return 0;
+    if (!args->model_map || args->model_size == 0 ||
+        args->gate_type != 16u || args->down_type != 10u ||
+        args->expert_in_dim != 4096u || args->expert_mid_dim != 2048u ||
+        args->routed_out_dim != 4096u || args->shared_dim != 4096u ||
+        args->n_total_expert != 256u || args->n_expert != 6u ||
+        args->n_expert_used != 6u || args->n_embd != 4096u ||
+        args->n_hc != 4u || !std::isfinite(args->clamp))
+        return 0;
+    const ds4_gpu_tensor *tensors[] = {
+        args->router_selected, args->router_weights, args->router_probs,
+        args->router_logits, args->ffn_norm, args->shared_gate,
+        args->shared_up, args->shared_mid, args->shared_out,
+        args->routed_out, args->routed_gate, args->routed_up,
+        args->routed_mid, args->routed_down, args->after_ffn_hc,
+        args->after_attn_hc, args->hc_split};
+    for (const ds4_gpu_tensor *tensor : tensors)
+        if (!tensor || !tensor->ptr) return 0;
+
+    std::vector<uint64_t> key;
+    key.reserve(128);
+    key.push_back((uint64_t)ctx.cmd_rot_idx);
+    key.push_back((uint64_t)(uintptr_t)args->model_map);
+    key.push_back(args->model_size);
+    for (const ds4_gpu_tensor *tensor : tensors)
+        if (!ffn_replay_key_tensor(key, tensor)) return 0;
+    const uint64_t scalar_key[] = {
+        args->router_bias_offset, args->shared_gate_offset,
+        args->shared_up_offset, args->shared_down_offset,
+        args->routed_gate_offset, args->routed_up_offset,
+        args->routed_down_offset, args->routed_gate_expert_bytes,
+        args->routed_gate_row_bytes, args->routed_down_expert_bytes,
+        args->routed_down_row_bytes, args->gate_type, args->down_type,
+        args->expert_in_dim, args->expert_mid_dim, args->routed_out_dim,
+        args->shared_dim, args->n_total_expert, args->n_expert,
+        args->n_expert_used, args->n_embd, args->n_hc,
+        args->router_has_bias ? 1u : 0u};
+    key.insert(key.end(), scalar_key, scalar_key +
+               sizeof(scalar_key) / sizeof(scalar_key[0]));
+
+    for (FfnReplayBody &body : ctx.ffn_replay_bodies) {
+        if (body.key != key) continue;
+        if (body.secondary == VK_NULL_HANDLE || body.dispatches == 0) return 0;
+        if (!ffn_replay_weights_live(body)) {
+            ffn_replay_discard_body(body);
+            return 0;
+        }
+        if (!body.bindings.empty())
+            mark_bound_weight_buffers(body.bindings.data(),
+                                      (uint32_t)body.bindings.size(),
+                                      ctx.recording_generation);
+        VkCommandBuffer secondary = body.secondary;
+        vkCmdExecuteCommands(ctx.cmd, 1, &secondary);
+        ctx.command_count += body.dispatches;
+        maybe_submit();
+        return 1;
+    }
+
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = ctx.pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    ai.commandBufferCount = 1;
+    FfnReplayBody body;
+    body.key = key;
+    if (vkAllocateCommandBuffers(g_vk.device, &ai, &body.secondary) != VK_SUCCESS)
+        return 0;
+    VkCommandBufferInheritanceInfo inheritance{};
+    inheritance.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    begin.pInheritanceInfo = &inheritance;
+    if (vkBeginCommandBuffer(body.secondary, &begin) != VK_SUCCESS) {
+        vkFreeCommandBuffers(g_vk.device, ctx.pool, 1, &body.secondary);
+        return 0;
+    }
+
+    const VkCommandBuffer saved_cmd = ctx.cmd;
+    const bool saved_recording = ctx.recording;
+    const uint32_t saved_command_count = ctx.command_count;
+    const bool saved_replay_recording = ctx.ffn_replay_recording;
+    FfnReplayBody *saved_replay_active = ctx.ffn_replay_active;
+    const bool saved_routed_profile = ctx.routed_profile_enabled;
+    const bool saved_timeline_enabled = ctx.timeline_enabled;
+    const bool saved_timeline_collecting = ctx.timeline_collecting;
+    const bool saved_timeline_queries = ctx.timeline_queries_pending;
+    const uint64_t saved_seen = ctx.timeline_seen_dispatches;
+    const uint64_t saved_captured = ctx.timeline_captured_dispatches;
+    const uint32_t saved_timestamp_cursor = ctx.timestamp_cursor;
+    ctx.cmd = body.secondary;
+    ctx.recording = true;
+    ctx.command_count = 0;
+    ctx.ffn_replay_recording = true;
+    ctx.ffn_replay_active = &body;
+    ctx.routed_profile_enabled = false;
+    ctx.timeline_enabled = false;
+    ctx.timeline_collecting = false;
+    ctx.timeline_queries_pending = false;
+
+    const int captured =
+        ds4_gpu_router_select_tensor(
+            args->router_selected, args->router_weights, args->router_probs,
+            args->model_map, args->model_size, args->router_bias_offset,
+            0, 0, args->token, 256, 6, 1.5f, 0, 0,
+            args->router_has_bias, false, args->router_logits) &&
+        ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+            args->shared_gate, args->shared_up, args->shared_mid,
+            args->model_map, args->model_size, args->shared_gate_offset,
+            args->shared_up_offset, args->n_embd, args->shared_dim,
+            args->ffn_norm, args->clamp) &&
+        ds4_gpu_routed_moe_one_tensor(
+            args->routed_out, args->routed_gate, args->routed_up,
+            args->routed_mid, args->routed_down, args->model_map,
+            args->model_size, args->routed_gate_offset, args->routed_up_offset,
+            args->routed_down_offset, args->gate_type, args->down_type,
+            args->routed_gate_expert_bytes, args->routed_gate_row_bytes,
+            args->routed_down_expert_bytes, args->routed_down_row_bytes,
+            args->expert_in_dim, args->expert_mid_dim, args->routed_out_dim,
+            args->router_selected, args->router_weights, args->n_total_expert,
+            args->n_expert, args->clamp, args->ffn_norm, nullptr, 0, false) &&
+        ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+            args->after_ffn_hc, args->shared_out, args->model_map,
+            args->model_size, args->shared_down_offset, args->shared_dim,
+            args->n_embd, args->shared_mid, args->routed_out,
+            args->after_attn_hc, args->hc_split, args->n_embd, args->n_hc);
+
+    body.dispatches = ctx.command_count;
+    ctx.cmd = saved_cmd;
+    ctx.recording = saved_recording;
+    ctx.command_count = saved_command_count;
+    ctx.ffn_replay_recording = saved_replay_recording;
+    ctx.ffn_replay_active = saved_replay_active;
+    ctx.routed_profile_enabled = saved_routed_profile;
+    ctx.timeline_enabled = saved_timeline_enabled;
+    ctx.timeline_collecting = saved_timeline_collecting;
+    ctx.timeline_queries_pending = saved_timeline_queries;
+    ctx.timeline_seen_dispatches = saved_seen;
+    ctx.timeline_captured_dispatches = saved_captured;
+    ctx.timestamp_cursor = saved_timestamp_cursor;
+
+    if (!captured || body.dispatches < 10u ||
+        vkEndCommandBuffer(body.secondary) != VK_SUCCESS) {
+        ffn_replay_discard_body(body);
+        return 0;
+    }
+    const uint64_t sources[] = {
+        args->shared_gate_offset, args->shared_up_offset,
+        args->shared_down_offset, args->routed_gate_offset,
+        args->routed_up_offset, args->routed_down_offset};
+    if (args->router_has_bias) {
+        if (!ffn_replay_track_source(body, args->router_bias_offset)) {
+            ffn_replay_discard_body(body);
+            return 0;
+        }
+    }
+    for (uint64_t source : sources) {
+        if (!ffn_replay_track_source(body, source)) {
+            ffn_replay_discard_body(body);
+            return 0;
+        }
+    }
+    ctx.ffn_replay_bodies.push_back(std::move(body));
+    FfnReplayBody &stored = ctx.ffn_replay_bodies.back();
+    if (!stored.bindings.empty())
+        mark_bound_weight_buffers(stored.bindings.data(),
+                                  (uint32_t)stored.bindings.size(),
+                                  ctx.recording_generation);
+    VkCommandBuffer secondary = stored.secondary;
+    vkCmdExecuteCommands(ctx.cmd, 1, &secondary);
+    ctx.command_count += stored.dispatches;
+    maybe_submit();
+    return 1;
+}
+
 int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
         ds4_gpu_tensor *out_hc,
         ds4_gpu_tensor *shared_out,
@@ -8675,6 +8980,14 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
     if (t->owner && t->ptr) {
         auto &ctx = get_cmd_ctx();
+        if (ctx.ffn_replay_recording && ctx.ffn_replay_active) {
+            ds4_gpu_tensor *held = (ds4_gpu_tensor *)malloc(sizeof(*held));
+            if (!held) return;
+            *held = *t;
+            ctx.ffn_replay_active->tensors.push_back(held);
+            memset(t, 0, sizeof(*t));
+            return;
+        }
         if (ctx.layer_batch_active) {
             ctx.layer_batch_in_place_ptrs.push_back(t->ptr);
             memset(t, 0, sizeof(*t));

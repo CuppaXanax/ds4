@@ -2593,6 +2593,58 @@ int ds4_gpu_routed_moe_batch_tensor(
         bool                   *mid_is_f16,
         bool                    force_resident);
 
+/* Opt-in Vulkan decode appliance.  The backend returns 1 only when it
+ * recorded/executed the complete GPU-resident router -> shared/routed -> HC
+ * FFN body; 0 means the caller must use its ordinary path. */
+typedef struct ds4_vulkan_ffn_replay_args {
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *router_probs;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *ffn_norm;
+    ds4_gpu_tensor *shared_gate;
+    ds4_gpu_tensor *shared_up;
+    ds4_gpu_tensor *shared_mid;
+    ds4_gpu_tensor *shared_out;
+    ds4_gpu_tensor *routed_out;
+    ds4_gpu_tensor *routed_gate;
+    ds4_gpu_tensor *routed_up;
+    ds4_gpu_tensor *routed_mid;
+    ds4_gpu_tensor *routed_down;
+    ds4_gpu_tensor *after_ffn_hc;
+    ds4_gpu_tensor *after_attn_hc;
+    ds4_gpu_tensor *hc_split;
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t router_bias_offset;
+    uint64_t shared_gate_offset;
+    uint64_t shared_up_offset;
+    uint64_t shared_down_offset;
+    uint64_t routed_gate_offset;
+    uint64_t routed_up_offset;
+    uint64_t routed_down_offset;
+    uint64_t routed_gate_expert_bytes;
+    uint64_t routed_gate_row_bytes;
+    uint64_t routed_down_expert_bytes;
+    uint64_t routed_down_row_bytes;
+    uint32_t gate_type;
+    uint32_t down_type;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t routed_out_dim;
+    uint32_t shared_dim;
+    uint32_t n_total_expert;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_embd;
+    uint32_t n_hc;
+    uint32_t token;
+    float clamp;
+    bool router_has_bias;
+} ds4_vulkan_ffn_replay_args;
+
+int ds4_gpu_vulkan_ffn_replay_one(const ds4_vulkan_ffn_replay_args *args);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================

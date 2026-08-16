@@ -3029,7 +3029,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
     struct { uint32_t n, rows; float eps; } push = {n, rows, eps};
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
-    timeline_dispatch(ctx, "rms_norm_weight_rows", buffers, 3, rows, 1, 1);
+    timeline_dispatch(ctx, "rms_norm", buffers, 2, rows, 1, 1);
     int ok = finish_simple_dispatch(ctx, resume_recording);
     if (!release_simple_descriptors(set)) ok = 0;
     return ok;

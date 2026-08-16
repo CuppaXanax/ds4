@@ -1,0 +1,80 @@
+#version 460 core
+
+/* Grouped Q8_0 matrix-vector appliance for decode attention output.
+ *
+ * The eight group-A projections use contiguous activation rows and contiguous
+ * Q8_0 weight rows.  One workgroup computes one output row for one group;
+ * group is the Y workgroup coordinate and output row is X.  The reduction is
+ * intentionally the same ascending block order as matmul_q8_0_aligned_bfe.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_groups;
+    uint blocks_per_row;
+    uint reserved;
+} pc;
+
+shared float block_scale_products[256];
+shared int block_dots[256];
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) :
+        0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(payload_buf[word]), int(byte_index * 8u), 8);
+}
+
+int x_i8(uint word, uint byte_index) {
+    return bitfieldExtract(int(x_q8_buf[word]), int(byte_index * 8u), 8);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint group = gl_WorkGroupID.y;
+    uint lid = gl_LocalInvocationIndex;
+    if (row >= pc.out_dim || group >= pc.n_groups) return;
+
+    uint weight_row = group * pc.out_dim + row;
+    float weight_scale = 0.0;
+    float activation_scale = 0.0;
+    int block_dot = 0;
+    if (lid < pc.blocks_per_row) {
+        uint record = weight_row * pc.blocks_per_row + lid;
+        uint scale_word = scale_buf[record >> 1u];
+        uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+        uint x_off = (group * pc.blocks_per_row + lid) * 9u;
+        uint count = min(32u, pc.in_dim - lid * 32u);
+        for (uint i = 0u; i < count; i++) {
+            block_dot += i8_at(record * 8u + (i >> 2u), i & 3u) *
+                         x_i8(x_off + 1u + (i >> 2u), i & 3u);
+        }
+        weight_scale = f16tof32(scale_bits);
+        activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
+    }
+    block_scale_products[lid] = weight_scale * activation_scale;
+    block_dots[lid] = block_dot;
+    barrier();
+
+    if (lid == 0u) {
+        float sum = 0.0;
+        for (uint block = 0u; block < pc.blocks_per_row; block++)
+            sum += block_scale_products[block] * float(block_dots[block]);
+        out_buf[group * pc.out_dim + row] = sum;
+    }
+}

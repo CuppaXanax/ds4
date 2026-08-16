@@ -475,6 +475,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
+        {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
@@ -3006,6 +3007,79 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
                                 (uint32_t)n_tok, resume_recording);
 }
 
+/* Grouped decode appliance for contiguous Q8_0 output rows.  The input has
+ * one prequantized row per group and the weights are laid out as
+ * [group][out_row][block].  A single workgroup computes one output row; the
+ * shader keeps the exact ascending block reduction used by the ordinary
+ * aligned path. */
+static int ds4_gpu_matmul_q8_0_group_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        uint32_t n_groups, const ds4_gpu_tensor *x_q8) {
+    DS4_VK_TRACE_KERNEL("matmul_q8_0_group_bfe");
+    if (!out || !x_q8 || !model_map || in_dim == 0 || out_dim == 0 ||
+        n_groups == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        !out->ptr || !x_q8->ptr) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks == 0 || blocks > 256u ||
+        (uint64_t)n_groups > UINT64_MAX / blocks ||
+        (uint64_t)n_groups * blocks > UINT64_MAX / 36u ||
+        (uint64_t)n_groups * blocks * 36u > x_q8->bytes ||
+        (uint64_t)n_groups > UINT64_MAX / out_dim ||
+        (uint64_t)n_groups * out_dim > UINT64_MAX / (blocks * 34u) ||
+        (uint64_t)n_groups * out_dim * sizeof(float) > out->bytes)
+        return 0;
+    const uint64_t total_rows = (uint64_t)n_groups * out_dim;
+    const uint64_t weight_bytes = total_rows * blocks * 34u;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return 0;
+    if (out_dim > g_vk.caps.max_compute_work_group_count[0] ||
+        n_groups > g_vk.caps.max_compute_work_group_count[1]) return 0;
+    auto si = g_vk.shader_map.find("matmul_q8_0_group_bfe");
+    if (si == g_vk.shader_map.end()) return 0;
+
+    decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+    if (!ensure_aligned_weight(model_map, model_size, weight_offset,
+                               in_dim, total_rows, aligned) || !aligned)
+        return 0;
+    const uint64_t records = total_rows * blocks;
+    const uint64_t scale_bytes = (records * 2u + 3u) & ~3ull;
+    const uint64_t payload_bytes = records * 32u;
+    if (scale_bytes > aligned->scale_bytes ||
+        payload_bytes > aligned->payload_bytes ||
+        (g_vk.caps.max_storage_buffer_range != 0 &&
+         (scale_bytes > g_vk.caps.max_storage_buffer_range ||
+          payload_bytes > g_vk.caps.max_storage_buffer_range))) return 0;
+
+    VkBuffer xbuf, obuf; VkDeviceSize xoff, ooff;
+    if (!find_tensor_buffer(x_q8, xbuf, xoff) ||
+        !find_tensor_buffer(out, obuf, ooff)) return 0;
+    const VkDeviceSize align = (VkDeviceSize)g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((xoff | ooff) % align) != 0) return 0;
+    const VkDeviceSize out_bytes = (VkDeviceSize)total_rows * sizeof(float);
+    if (g_vk.caps.max_storage_buffer_range != 0 &&
+        (n_groups * blocks * 36u > g_vk.caps.max_storage_buffer_range ||
+         out_bytes > g_vk.caps.max_storage_buffer_range)) return 0;
+
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (!ctx.attention_output_batch && ctx.recording &&
+        ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+    VkDescriptorBufferInfo buffers[4] = {
+        {xbuf, xoff, (VkDeviceSize)n_groups * blocks * 36u},
+        {aligned->gpu.buffer, 0, (VkDeviceSize)scale_bytes},
+        {aligned->gpu.buffer, (VkDeviceSize)aligned->payload_offset,
+         (VkDeviceSize)payload_bytes},
+        {obuf, ooff, out_bytes},
+    };
+    struct { uint32_t in_dim, out_dim, n_groups, blocks_per_row, reserved; } pc = {
+        (uint32_t)in_dim, (uint32_t)out_dim, n_groups, (uint32_t)blocks, 0u};
+    return record_simple_shader("matmul_q8_0_group_bfe", &pc, sizeof(pc),
+                                buffers, 4, (uint32_t)out_dim, n_groups, 1u,
+                                resume_recording);
+}
+
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */
 int ds4_gpu_matmul_f32_tensor(
     ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -4152,13 +4226,76 @@ static int ds4_vk_attention_output_low_gpu(
 
     /* Decode has one head row per group and the graph stores those rows
      * contiguously: group g begins at g*group_dim floats and the destination
-     * low vector begins at g*rank.  The historical path copied each group to
-     * a temporary tensor before the GEMV, then copied it back, which costs 16
-     * extra dispatches and materializes two short-lived buffers per layer.
-     * Preserve the batched/prefill path below, where groups are strided across
-     * tokens, but use aligned tensor views for the single-token decode shape.
-     * The projection sees exactly the same bytes and accumulation order. */
+     * low vector begins at g*rank.  Preserve the batched/prefill path below,
+     * where groups are strided across tokens, but use aligned tensor views for
+     * the single-token decode shape.  The projection sees exactly the same
+     * bytes and accumulation order. */
     if (n_tokens == 1) {
+        /* All eight group-A GEMVs consume rows of the same activation.  The
+         * ordinary Q8 path quantizes each row on every call, creating eight
+         * Q8 temporaries and eight quantize dispatches.  Quantize the complete
+         * contiguous group-row span once, then run the grouped prequant
+         * appliance over the same eight weight-row ranges.  Each output row
+         * keeps its established shader reduction order. */
+        const uint64_t q_row_bytes = blocks_a * 36u;
+        const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
+        const bool shared_q8_eligible =
+            !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
+            n_groups <= 65535u && blocks_a <= 256u &&
+            n_groups <= UINT64_MAX / blocks_a &&
+            n_groups * blocks_a <= UINT64_MAX / 36u &&
+            n_groups * blocks_a * 36u <= UINT32_MAX &&
+            g_vk.caps.max_compute_work_group_size[0] >= 256u &&
+            g_vk.caps.max_compute_work_group_invocations >= 256u;
+        bool grouped_ready = shared_q8_eligible;
+        if (grouped_ready) {
+            /* Complete this preflight before recording quantization.  A
+             * missing bundled shader or an unavailable full-span aligned
+             * artifact must select the original eight-call path, rather than
+             * leaving a partially recorded grouped graph with no fallback. */
+            const uint64_t grouped_rows = (uint64_t)n_groups * rank;
+            auto grouped_shader = g_vk.shader_map.find("matmul_q8_0_group_bfe");
+            decltype(g_vk.aligned_cache)::mapped_type *grouped_aligned = nullptr;
+            grouped_ready = grouped_shader != g_vk.shader_map.end() &&
+                grouped_rows != 0 &&
+                grouped_rows <= UINT64_MAX / row_a_bytes &&
+                out_a_offset <= model_size &&
+                grouped_rows * row_a_bytes <= model_size - out_a_offset &&
+                rank <= g_vk.caps.max_compute_work_group_count[0] &&
+                n_groups <= g_vk.caps.max_compute_work_group_count[1] &&
+                ensure_aligned_weight(model_map, model_size, out_a_offset,
+                                      group_dim, grouped_rows, grouped_aligned) &&
+                grouped_aligned != nullptr;
+        }
+        if (grouped_ready) {
+            const uint64_t q_bytes = (uint64_t)n_groups * q_row_bytes;
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+            if (q) {
+                int ok = ds4_gpu_quantize_q8_0_tensor(q, heads,
+                                                       group_dim, n_groups);
+                if (ok) ok = ds4_gpu_matmul_q8_0_group_tensor(
+                    low, model_map, model_size, out_a_offset,
+                    group_dim, rank, n_groups, q);
+
+                if (ctx.attention_output_batch) {
+                    free_or_defer_attention_tensor(ctx, q);
+                    if (resume_recording && !ctx.recording && !begin_cmd()) ok = 0;
+                    return ok;
+                }
+                if (ok) {
+                    /* Keep q alive until every recorded GEMV has consumed it. */
+                    ok = submit_and_wait();
+                } else if (ctx.recording && ctx.command_count != 0) {
+                    submit_and_wait();
+                }
+                ds4_gpu_tensor_free(q);
+                if (resume_recording && !ctx.recording && !begin_cmd()) ok = 0;
+                return ok;
+            }
+        }
+
+        /* Capability, allocation, or stale-shader fallback: retain the
+         * original one-row path rather than changing the production contract. */
         int ok = 1;
         for (uint32_t g = 0; g < n_groups && ok; g++) {
             ds4_gpu_tensor heads_view = *heads;

@@ -23919,6 +23919,34 @@ static bool metal_graph_encode_decode_layer_phase(
             getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") == NULL &&
             metal_graph_debug_get_config()->prefix == NULL;
 #ifdef DS4_VULKAN_BUILD
+        if (getenv("DS4_VULKAN_TRACE_FFN_REPLAY")) {
+            fprintf(stderr,
+                    "ds4: [ffn-replay-diag] il=%u phase=%u router_fused=%d "
+                    "batch_shape=%d fuse_shared=%d tid2eid=%d types=%u/%u/%u/%u "
+                    "dims=%llu/%llu/%llu/%llu bytes=%llu/%llu/%llu/%llu "
+                    "profile=%d debug=%d tp=%u stream=%d quality=%d keep=%d\n",
+                    il, (unsigned)phase, router_project_select_fused,
+                    ffn_replay_shape, fuse_shared_gate_up,
+                    layer->ffn_gate_tid2eid != NULL,
+                    (unsigned)layer->ffn_gate_exps->type,
+                    (unsigned)layer->ffn_up_exps->type,
+                    (unsigned)layer->ffn_down_exps->type,
+                    (unsigned)layer->ffn_down_shexp->type,
+                    (unsigned long long)expert_in_dim,
+                    (unsigned long long)expert_mid_dim,
+                    (unsigned long long)routed_out_dim,
+                    (unsigned long long)shared_dim,
+                    (unsigned long long)gate_row_bytes,
+                    (unsigned long long)gate_expert_bytes,
+                    (unsigned long long)down_row_bytes,
+                    (unsigned long long)down_expert_bytes,
+                    g_expert_profile.active,
+                    metal_graph_debug_get_config()->prefix != NULL,
+                    g->tp_world, g->ssd_streaming || g->ssd_streaming_cold,
+                    g->quality, keep_ffn_out);
+        }
+#endif
+#ifdef DS4_VULKAN_BUILD
         if (ok && !router_project_select_fused && ffn_replay_shape) {
             ds4_vulkan_ffn_replay_args replay = {};
             replay.router_selected = metal_graph_router_selected(g);

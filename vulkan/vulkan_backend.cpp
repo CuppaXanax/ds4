@@ -146,6 +146,11 @@ struct ShaderEntry {
 struct TensorHeader {
     VkBuffer       buffer = VK_NULL_HANDLE;
     VmaAllocation  allocation = VK_NULL_HANDLE;
+    /* The public tensor pointer is also the lookup key used by the legacy
+     * Vulkan ABI.  Keep it explicit so a non-host-visible scratch buffer can
+     * use a stable 1-byte identity token without pretending that the buffer
+     * is CPU mapped. */
+    void          *mapped_ptr = nullptr;
     uint64_t       bytes = 0;
     bool           is_managed = false;
     /* Mapped host-coherent allocations do not need VMA cache maintenance.
@@ -153,6 +158,9 @@ struct TensorHeader {
      * paying for flush/invalidate calls without changing non-coherent
      * behavior. */
     bool           host_coherent = false;
+    bool           host_visible = false;
+    bool           reusable_scratch = false;
+    bool           device_local_scratch = false;
 };
 
 /* ds4_gpu_tensor struct definition comes from ds4_gpu_mgpu.h (the header
@@ -187,6 +195,12 @@ static struct {
     std::map<std::thread::id, VulkanCommandCtx> cmd_ctxs;
     
     std::unordered_map<void*, TensorHeader*> tensor_headers;
+    /* Scratch is deliberately a small, exact-size pool rather than a general
+     * allocator.  Entries are returned only from ring retirement (or after a
+     * synchronous fallback has completed), so a reused VkBuffer cannot still
+     * be referenced by an in-flight command buffer. */
+    std::unordered_map<uint64_t, std::vector<TensorHeader*>> scratch_pool;
+    std::unordered_map<uint64_t, std::vector<TensorHeader*>> device_scratch_pool;
     ds4_gpu_tensor     routed_iq2_lut;
     
     /* Weight cache: maps model file offset -> VkBuffer with weights copied to
@@ -979,6 +993,8 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
     ctx.slot_timestamp_counts[slot] = 0;
 }
 
+static bool release_tensor_header(TensorHeader *header);
+
 static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
     int ok = 1;
     const uint64_t descriptor_start = timeline_now_ns();
@@ -997,10 +1013,8 @@ static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
                 if (getenv("DS4_VULKAN_TIMELINE"))
                     timeline_resource(ctx, TimelineEventKind::TensorFree,
                                       "tensor", it->second->bytes);
-                vmaDestroyBuffer(g_vk.allocator, it->second->buffer,
-                                 it->second->allocation);
-                free(it->second);
-                g_vk.tensor_headers.erase(it);
+                if (!release_tensor_header(it->second))
+                    g_vk.tensor_headers.erase(it);
             }
         }
         free(tensor);
@@ -1011,10 +1025,8 @@ static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
         if (getenv("DS4_VULKAN_TIMELINE"))
             timeline_resource(ctx, TimelineEventKind::TensorFree,
                               "tensor", it->second->bytes);
-        vmaDestroyBuffer(g_vk.allocator, it->second->buffer,
-                         it->second->allocation);
-        free(it->second);
-        g_vk.tensor_headers.erase(it);
+        if (!release_tensor_header(it->second))
+            g_vk.tensor_headers.erase(it);
     }
     ctx.slot_descriptors[slot].clear();
     ctx.slot_tensors[slot].clear();
@@ -1129,7 +1141,7 @@ static int end_and_submit(void) {
     const uint64_t flush_start = timeline_now_ns();
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
-        if (!header->host_coherent)
+        if (header->host_visible && !header->host_coherent)
             (void)vmaFlushAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
     timeline_duration_current(TimelineEventKind::HostFlush, "flush_live_tensors",
@@ -1179,7 +1191,7 @@ static void invalidate_live_tensors(void) {
     const uint64_t invalidate_start = timeline_now_ns();
     for (auto &[base, header] : g_vk.tensor_headers) {
         (void)base;
-        if (!header->host_coherent)
+        if (header->host_visible && !header->host_coherent)
             (void)vmaInvalidateAllocation(g_vk.allocator, header->allocation, 0, header->bytes);
     }
     timeline_duration_current(TimelineEventKind::HostInvalidate,
@@ -1266,9 +1278,8 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     for (void *ptr : ctx.layer_batch_in_place_ptrs) {
         auto it = g_vk.tensor_headers.find(ptr);
         if (it == g_vk.tensor_headers.end()) continue;
-        vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
-        free(it->second);
-        g_vk.tensor_headers.erase(it);
+        if (!release_tensor_header(it->second))
+            g_vk.tensor_headers.erase(it);
     }
     ctx.layer_batch_descriptors.clear();
     ctx.layer_batch_tensors.clear();
@@ -1410,9 +1421,12 @@ void ds4_gpu_cleanup(void) {
     /* Free all tracked tensor allocations */
     for (auto &[_, h] : g_vk.tensor_headers) {
         if (h->buffer) vmaDestroyBuffer(g_vk.allocator, h->buffer, h->allocation);
+        if (h->device_local_scratch) free(h->mapped_ptr);
         free(h);
     }
     g_vk.tensor_headers.clear();
+    g_vk.scratch_pool.clear();
+    g_vk.device_scratch_pool.clear();
     for (auto &[_, e] : g_vk.weight_cache)
         if (e.buffer) vmaDestroyBuffer(g_vk.allocator, e.buffer, e.allocation);
     g_vk.weight_cache.clear();
@@ -1452,18 +1466,40 @@ void ds4_vulkan_get_caps(ds4_vulkan_caps *caps) { if (caps) *caps = g_vk.caps; }
 
 /* ---- Tensor Management ---- */
 
-ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+static ds4_gpu_tensor *alloc_tensor_kind(uint64_t bytes, bool device_local,
+                                         bool reusable_scratch) {
     if (!bytes) return nullptr;
     ds4_gpu_tensor *t = (ds4_gpu_tensor*)calloc(1, sizeof(ds4_gpu_tensor));
     if (!t) return nullptr;
+
+    auto &pool = device_local ? g_vk.device_scratch_pool : g_vk.scratch_pool;
+    if (reusable_scratch) {
+        auto pit = pool.find(bytes);
+        if (pit != pool.end() && !pit->second.empty()) {
+            TensorHeader *h = pit->second.back();
+            pit->second.pop_back();
+            t->ptr = h->mapped_ptr;
+            t->bytes = bytes;
+            t->owner = 1;
+            h->bytes = bytes;
+            if (getenv("DS4_VULKAN_TIMELINE"))
+                timeline_resource(get_cmd_ctx(), TimelineEventKind::TensorAlloc,
+                                  device_local ? "device_scratch_reuse" : "scratch_reuse",
+                                  bytes);
+            return t;
+        }
+    }
 
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = bytes;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO;
-    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    aci.usage = device_local ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+                             : VMA_MEMORY_USAGE_AUTO;
+    aci.flags = device_local ? 0u
+                             : (VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
     VkBuffer buf; VmaAllocation alloc;
     VmaAllocationInfo ai;
     VkResult res = vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buf, &alloc, &ai);
@@ -1472,16 +1508,29 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
                 (unsigned long)bytes, (int)res);
         free(t); return nullptr;
     }
-    t->ptr = ai.pMappedData;
+    /* Device-local scratch is shader-only.  Keep a stable identity token for
+     * the legacy pointer-keyed tensor registry; no CPU path may dereference
+     * it, and flush/invalidate explicitly skip non-host-visible allocations. */
+    t->ptr = device_local ? malloc(1) : ai.pMappedData;
+    if (!t->ptr) {
+        vmaDestroyBuffer(g_vk.allocator, buf, alloc);
+        free(t);
+        return nullptr;
+    }
     t->bytes = bytes; t->owner = 1;
 
     TensorHeader *h = (TensorHeader*)calloc(1, sizeof(TensorHeader));
     if (!h) {
         vmaDestroyBuffer(g_vk.allocator, buf, alloc);
+        if (device_local) free(t->ptr);
         free(t);
         return nullptr;
     }
     h->buffer = buf; h->allocation = alloc; h->bytes = bytes;
+    h->mapped_ptr = t->ptr;
+    h->reusable_scratch = reusable_scratch;
+    h->device_local_scratch = device_local;
+    h->host_visible = !device_local;
     VkMemoryPropertyFlags memory_properties = 0;
     vmaGetAllocationMemoryProperties(g_vk.allocator, alloc, &memory_properties);
     h->host_coherent = (memory_properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -1490,6 +1539,38 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
         timeline_resource(get_cmd_ctx(), TimelineEventKind::TensorAlloc,
                           "tensor", bytes);
     return t;
+}
+
+static bool release_tensor_header(TensorHeader *header) {
+    if (!header) return false;
+    if (header->reusable_scratch) {
+        auto &pool = header->device_local_scratch
+            ? g_vk.device_scratch_pool : g_vk.scratch_pool;
+        pool[header->bytes].push_back(header);
+        return true;
+    }
+    if (header->buffer)
+        vmaDestroyBuffer(g_vk.allocator, header->buffer, header->allocation);
+    free(header);
+    return false;
+}
+
+static ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_scratch(uint64_t bytes) {
+    return alloc_tensor_kind(bytes, true, true);
+}
+
+static int ds4_gpu_tensor_alloc_host_scratch_in_place(ds4_gpu_tensor *t,
+                                                       uint64_t bytes) {
+    if (!t) return 1;
+    ds4_gpu_tensor *a = alloc_tensor_kind(bytes, false, true);
+    if (!a) return 2;
+    *t = *a;
+    free(a);
+    return 0;
+}
+
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    return alloc_tensor_kind(bytes, false, false);
 }
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
@@ -1524,9 +1605,8 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *t) {
             if (getenv("DS4_VULKAN_TIMELINE"))
                 timeline_resource(get_cmd_ctx(), TimelineEventKind::TensorFree,
                                   "tensor", it->second->bytes);
-            vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
-            free(it->second);
-            g_vk.tensor_headers.erase(it);
+            if (!release_tensor_header(it->second))
+                g_vk.tensor_headers.erase(it);
         }
     }
     free(t);
@@ -2736,7 +2816,12 @@ int ds4_gpu_matmul_q8_0_tensor(
         g_vk.caps.max_compute_work_group_size[0] >= 256u &&
         g_vk.caps.max_compute_work_group_invocations >= 256u;
     if (prequant_eligible) {
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * n_blocks * 36u);
+        /* Quantized activation scratch is shader-produced and shader-consumed;
+         * keeping it device-local removes a per-projection host-visible VMA
+         * allocation while the existing synchronous/layer-ring lifetime rules
+         * remain unchanged. */
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+            n_tok * n_blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
         if (ok)
@@ -5092,7 +5177,8 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         g_vk.caps.max_compute_work_group_size[0] >= 256u &&
         g_vk.caps.max_compute_work_group_invocations >= 256u;
     if (prequant_eligible) {
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+            n_tok * blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
         if (ok)
@@ -6659,9 +6745,10 @@ static bool ds4gk_routed_common(
         g_vk.caps.max_compute_work_group_invocations < 256)
         return false;
     ds4_gpu_tensor q8{}, invalid{};
-    if (ds4_gpu_tensor_alloc_on(&q8, 0, q8_bytes) != 0 ||
+    if (ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0 ||
         (validate_selected &&
-         ds4_gpu_tensor_alloc_on(&invalid, 0, sizeof(uint32_t)) != 0)) {
+         ds4_gpu_tensor_alloc_host_scratch_in_place(&invalid,
+                                                    sizeof(uint32_t)) != 0)) {
         ds4_gpu_tensor_free_in_place(&q8);
         ds4_gpu_tensor_free_in_place(&invalid);
         return false;
@@ -8290,9 +8377,8 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
             if (getenv("DS4_VULKAN_TIMELINE"))
                 timeline_resource(get_cmd_ctx(), TimelineEventKind::TensorFree,
                                   "tensor", it->second->bytes);
-            vmaDestroyBuffer(g_vk.allocator, it->second->buffer, it->second->allocation);
-            free(it->second);
-            g_vk.tensor_headers.erase(it);
+            if (!release_tensor_header(it->second))
+                g_vk.tensor_headers.erase(it);
         }
     }
     memset(t, 0, sizeof(*t));

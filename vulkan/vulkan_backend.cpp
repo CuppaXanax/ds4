@@ -4189,7 +4189,11 @@ struct VulkanDecodeAttnRopeFuse {
 static thread_local VulkanDecodeAttnRopeFuse g_decode_attn_rope_fuse;
 
 extern "C" int ds4_gpu_decode_attn_rope_fuse_available(void) {
-    return g_vk.shader_map.find("attention_decode_mixed_rope") != g_vk.shader_map.end();
+    const char *wave64_env = getenv("DS4_VULKAN_ATTN_WAVE64");
+    return g_vk.caps.subgroup_size == 64u &&
+        !(wave64_env && strcmp(wave64_env, "0") == 0) &&
+        g_vk.shader_map.find("attention_decode_mixed_rope") !=
+            g_vk.shader_map.end();
 }
 
 extern "C" int ds4_gpu_decode_attn_rope_fuse_used(void) {

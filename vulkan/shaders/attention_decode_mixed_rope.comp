@@ -1,4 +1,6 @@
 #version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 /* Decode mixed attention with the inverse RoPE tail kept in the same
  * head-owned workgroup.  The attention math is byte-for-byte the ordinary
  * attention_decode_mixed path; the optional tail uses the same angle/ramp
@@ -18,11 +20,7 @@ layout(push_constant) uniform PC {
     float freq_base; float freq_scale; float ext_factor; float attn_factor;
     float beta_fast; float beta_slow;
 } pc;
-shared float dot_reduce[64];
 shared float score[1024];
-shared float weight;
-shared float denom;
-shared float max_score;
 shared float rope_cos[256];
 shared float rope_sin[256];
 
@@ -39,8 +37,24 @@ float comp_at(uint index) {
     return (index & 1u) == 0u ? v.x : v.y;
 }
 
+float wave_sum_exact(float value, uint lane) {
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        float other = subgroupShuffle(value, lane + stride);
+        if (lane < stride) value += other;
+    }
+    return value;
+}
+
+float wave_max_exact(float value, uint lane) {
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        float other = subgroupShuffle(value, lane + stride);
+        if (lane < stride) value = max(value, other);
+    }
+    return value;
+}
+
 void main() {
-    uint lane = gl_LocalInvocationIndex;
+    uint lane = gl_SubgroupInvocationID;
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_head) return;
     uint dim = pc.head_dim;
@@ -49,14 +63,10 @@ void main() {
     for (uint r = 0u; r < pc.n_raw; r++) {
         uint kbase = add_mod(pc.raw_start, r, pc.raw_cap) * dim;
         float dot = 0.0;
-        for (uint d = lane; d < dim; d += 64u) dot += q_val[qbase + d] * raw_val[kbase + d];
-        dot_reduce[lane] = dot; barrier();
-        for (uint stride = 32u; stride != 0u; stride >>= 1u) {
-            if (lane < stride) dot_reduce[lane] += dot_reduce[lane + stride];
-            barrier();
-        }
-        if (lane == 0u) score[r] = dot_reduce[0] * scale;
-        barrier();
+        for (uint d = lane; d < dim; d += 64u)
+            dot += q_val[qbase + d] * raw_val[kbase + d];
+        dot = wave_sum_exact(dot, lane);
+        if (lane == 0u) score[r] = dot * scale;
     }
     for (uint c = 0u; c < pc.n_comp; c++) {
         float add = pc.use_mask != 0u ? mask_val[c] : 0.0;
@@ -64,56 +74,38 @@ void main() {
         uint cbase = c * dim;
         if (add > -1.0e20)
             for (uint d = lane; d < dim; d += 64u) dot += q_val[qbase + d] * comp_at(cbase + d);
-        dot_reduce[lane] = dot; barrier();
-        for (uint stride = 32u; stride != 0u; stride >>= 1u) {
-            if (lane < stride) dot_reduce[lane] += dot_reduce[lane + stride];
-            barrier();
-        }
+        dot = wave_sum_exact(dot, lane);
         if (lane == 0u)
-            score[pc.n_raw + c] = add <= -1.0e20 ? -1.0e30 : dot_reduce[0] * scale + add;
-        barrier();
+            score[pc.n_raw + c] = add <= -1.0e20 ? -1.0e30 : dot * scale + add;
     }
+    barrier();
     uint total = pc.n_raw + pc.n_comp;
     float lane_max = sink_val[h];
     for (uint i = lane; i < total; i += 64u)
         if (i < pc.n_raw || score[i] > -1.0e20) lane_max = max(lane_max, score[i]);
-    dot_reduce[lane] = lane_max; barrier();
-    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
-        if (lane < stride) dot_reduce[lane] = max(dot_reduce[lane], dot_reduce[lane + stride]);
-        barrier();
-    }
-    if (lane == 0u) max_score = dot_reduce[0];
-    barrier();
+    lane_max = wave_max_exact(lane_max, lane);
+    float max_score = subgroupShuffle(lane_max, 0u);
     for (uint i = lane; i < total; i += 64u)
         score[i] = (i >= pc.n_raw && score[i] <= -1.0e20) ? 0.0 : exp(score[i] - max_score);
+    barrier();
     float lane_denom = 0.0;
     for (uint i = lane; i < total; i += 64u) lane_denom += score[i];
-    dot_reduce[lane] = lane_denom; barrier();
-    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
-        if (lane < stride) dot_reduce[lane] += dot_reduce[lane + stride];
-        barrier();
+    lane_denom = wave_sum_exact(lane_denom, lane);
+    float denom = exp(sink_val[h] - max_score) +
+                  subgroupShuffle(lane_denom, 0u);
+    for (uint d = lane; d < dim; d += 64u) {
+        float acc = 0.0;
+        for (uint r = 0u; r < pc.n_raw; r++) {
+            uint kbase = add_mod(pc.raw_start, r, pc.raw_cap) * dim;
+            acc += score[r] * raw_val[kbase + d];
+        }
+        for (uint c = 0u; c < pc.n_comp; c++) {
+            float add = pc.use_mask != 0u ? mask_val[c] : 0.0;
+            if (add > -1.0e20)
+                acc += score[pc.n_raw + c] * comp_at(c * dim + d);
+        }
+        out_val[qbase + d] = acc / denom;
     }
-    if (lane == 0u) denom = exp(sink_val[h] - max_score) + dot_reduce[0];
-    barrier();
-    for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] = 0.0;
-    barrier();
-    for (uint r = 0u; r < pc.n_raw; r++) {
-        uint kbase = add_mod(pc.raw_start, r, pc.raw_cap) * dim;
-        if (lane == 0u) weight = score[r];
-        barrier();
-        for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] += weight * raw_val[kbase + d];
-        barrier();
-    }
-    for (uint c = 0u; c < pc.n_comp; c++) {
-        float add = pc.use_mask != 0u ? mask_val[c] : 0.0;
-        uint cbase = c * dim;
-        if (lane == 0u) weight = add <= -1.0e20 ? 0.0 : score[pc.n_raw + c];
-        barrier();
-        if (add > -1.0e20)
-            for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] += weight * comp_at(cbase + d);
-        barrier();
-    }
-    for (uint d = lane; d < dim; d += 64u) out_val[qbase + d] /= denom;
     barrier();
 
     if (pc.rope_enable != 0u && pc.n_rot != 0u &&

@@ -21908,9 +21908,6 @@ static bool metal_graph_encode_decode_layer_phase(
      * 64-threadgroup dispatch per layer. */
     const bool fuse_attn_inv_rope =
         getenv("DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE") == NULL &&
-        (ds4_gpu_device_is_pre_m5_apple_silicon() ||
-         ds4_gpu_device_is_m5_apple_silicon() ||
-         ds4_gpu_decode_attn_rope_fuse_available() != 0) &&
         ds4_gpu_decode_attn_rope_fuse_available() != 0;
     /* The backend's consumed flag is process-global and remains true after a
      * gathered-attention layer. Track whether this layer actually armed the

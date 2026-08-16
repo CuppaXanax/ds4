@@ -1610,8 +1610,16 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
     if (ctx.layer_batch_active) return 0;
-    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait_force())
-        return 0;
+    if (ctx.recording && ctx.command_count != 0) {
+        /* Decode records token embedding before opening the first layer
+         * lifetime scope.  The timeline wait attached to the next submit
+         * already orders that work; waiting here needlessly idles the host
+         * once the command ring is enabled.  Keep the old fence boundary in
+         * serial mode, where it remains the diagnostic lifetime contract. */
+        const int ok = command_ring_enabled()
+            ? end_and_submit() : submit_and_wait_force();
+        if (!ok) return 0;
+    }
     if (!ctx.recording && !begin_cmd()) return 0;
     ctx.layer_batch_descriptors.clear();
     ctx.layer_batch_tensors.clear();

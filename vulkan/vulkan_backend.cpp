@@ -4115,6 +4115,37 @@ static int ds4_vk_attention_output_low_gpu(
 
     auto &ctx = get_cmd_ctx();
     const bool resume_recording = ctx.recording;
+
+    /* Decode has one head row per group and the graph stores those rows
+     * contiguously: group g begins at g*group_dim floats and the destination
+     * low vector begins at g*rank.  The historical path copied each group to
+     * a temporary tensor before the GEMV, then copied it back, which costs 16
+     * extra dispatches and materializes two short-lived buffers per layer.
+     * Preserve the batched/prefill path below, where groups are strided across
+     * tokens, but use aligned tensor views for the single-token decode shape.
+     * The projection sees exactly the same bytes and accumulation order. */
+    if (n_tokens == 1) {
+        int ok = 1;
+        for (uint32_t g = 0; g < n_groups && ok; g++) {
+            ds4_gpu_tensor heads_view = *heads;
+            heads_view.ptr = (char *)heads->ptr +
+                (uint64_t)g * group_dim * sizeof(float);
+            heads_view.bytes = heads_bytes -
+                (uint64_t)g * group_dim * sizeof(float);
+            ds4_gpu_tensor low_view = *low;
+            low_view.ptr = (char *)low->ptr +
+                (uint64_t)g * rank * sizeof(float);
+            low_view.bytes = low_bytes - (uint64_t)g * rank * sizeof(float);
+            const uint64_t a_offset = out_a_offset +
+                (uint64_t)g * rank * row_a_bytes;
+            ok = ds4_gpu_matmul_q8_0_tensor(&low_view, model_map, model_size,
+                                            a_offset, group_dim, rank,
+                                            &heads_view, 1);
+        }
+        if (resume_recording && !ctx.recording && !begin_cmd()) ok = 0;
+        return ok;
+    }
+
     ds4_gpu_tensor *group_heads = ds4_gpu_tensor_alloc(tmp_heads_bytes);
     ds4_gpu_tensor *group_low = ds4_gpu_tensor_alloc(tmp_low_bytes);
     if (!group_heads || !group_low) {

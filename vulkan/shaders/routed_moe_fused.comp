@@ -172,8 +172,10 @@ void main() {
     uint output_index = (token * pc.n_selected + rank) * pc.mid_dim + row;
     if (expert >= pc.n_total_expert) {
         if (row_valid && lane == 0u) {
-            b4[output_index] = 0u;
-            b5[output_index] = 0u;
+            if (pc.add_enabled == 0u) {
+                b4[output_index] = 0u;
+                b5[output_index] = 0u;
+            }
             b6[output_index] = 0u;
         }
         return;
@@ -200,8 +202,15 @@ void main() {
             gate = min(gate, pc.clamp_value);
             up = clamp(up, -pc.clamp_value, pc.clamp_value);
         }
-        b4[output_index] = floatBitsToUint(gate);
-        b5[output_index] = floatBitsToUint(up);
+        /* Production appliance mode consumes only the fused mid result.
+         * Keep the gate/up stores for the public/debug ABI, but allow the
+         * layer-batched path to avoid materialising those dead intermediates.
+         * add_enabled is otherwise unused by this shader; the generic path
+         * passes zero and is therefore bit-for-bit unchanged. */
+        if (pc.add_enabled == 0u) {
+            b4[output_index] = floatBitsToUint(gate);
+            b5[output_index] = floatBitsToUint(up);
+        }
         float activation_clamp = pc.clamp_value > 0.0
             ? pc.clamp_value : 3.402823e38;
         float activated_gate = min(gate, activation_clamp);

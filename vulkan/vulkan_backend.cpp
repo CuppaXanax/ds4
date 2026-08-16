@@ -6158,9 +6158,28 @@ static const char *ds4gk_routed_mode_shader(const char *fallback,
     return g_vk.shader_map.find(name) != g_vk.shader_map.end() ? name : fallback;
 }
 
+/* The production Flash decode appliance already keeps router IDs and route
+ * weights on the device for the whole layer command batch.  On that narrow
+ * shape, gate/up are consumed only by the fused IQ2 SwiGLU stage; no later
+ * stage reads their f32 scratch tensors.  Let the fused shader skip those
+ * two stores while retaining the generic/public ABI everywhere else. */
+static bool ds4gk_routed_mid_only_appliance(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_MID_ONLY");
+    if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
+        return false;
+    return get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
+        gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
+}
+
 /* Routed stages use a fixed descriptor ABI: b4 is the stage output for every
  * canonical/specialized mode, while the fused gate/up shader additionally
- * writes b5 and b6. Keep the dependency scoped to those output ranges so a
+ * writes b5 and b6 (or only b6 in its production mid-only appliance mode).
+ * Keep the dependency scoped to those output ranges so a
  * routed dispatch does not publish unrelated allocations through a global
  * memory barrier. The next stage may read or reuse the scratch range. */
 static void ds4gk_routed_output_barrier(
@@ -6470,6 +6489,13 @@ static bool ds4gk_routed_common(
         fused_gate_up = iq2_words &&
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end();
         if (fused_gate_up) {
+            const bool mid_only = ds4gk_routed_mid_only_appliance(
+                gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+                n_total_expert, n_expert, n_tokens);
+            /* add_enabled is unused by routed_moe_fused's generic mode.  In
+             * the bounded appliance it is a source-compatible flag telling
+             * the shader not to materialise dead gate/up f32 outputs. */
+            pc.add_enabled = mid_only ? 1u : 0u;
             VkDescriptorBufferInfo fused_buffers[9] = {
                 q8_info, gate_model, up_model, selected_info, gate_info,
                 up_info, mid_info, weights_info, iq2_lut_info};
@@ -6478,6 +6504,7 @@ static bool ds4gk_routed_common(
                 fused_buffers, 9,
                 ds4gk_routed_projection_groups(expert_mid_dim, pc.q8_blocks),
                 n_tokens, n_expert, sets);
+            pc.add_enabled = 0;
         } else {
             VkDescriptorBufferInfo gate_buffers[6] = {
                 q8_info, gate_model, gate_model, selected_info, gate_info,

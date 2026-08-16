@@ -513,6 +513,7 @@ static int load_all_shaders(void) {
         {"routed_moe_mode2", 68, 6}, {"routed_moe_mode3", 68, 6},
         {"routed_moe_mode4", 68, 6}, {"routed_moe_mode5", 68, 6},
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
+        {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -6321,12 +6322,30 @@ static bool ds4gk_routed_mid_only_appliance(
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
 }
 
-/* Routed stages use a fixed descriptor ABI: b4 is the stage output for every
- * canonical/specialized mode, while the fused gate/up shader additionally
- * writes b5 and b6 (or only b6 in its production mid-only appliance mode).
- * Keep the dependency scoped to those output ranges so a
- * routed dispatch does not publish unrelated allocations through a global
- * memory barrier. The next stage may read or reuse the scratch range. */
+/* Q2 down has eight q8 blocks for Flash (2048 intermediate values).  The
+ * fused appliance assigns six 8-lane slots to each output row, so it can
+ * perform the old down reduction and rank-ascending weighted sum in one
+ * workgroup without atomics or a changed FP32 accumulation order. */
+static bool ds4gk_routed_down_reduce_appliance(
+        uint32_t down_type, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_DOWN_REDUCE");
+    if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
+        return false;
+    return g_vk.shader_map.find("routed_moe_down_reduce_q2") != g_vk.shader_map.end() &&
+        get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
+        down_type == 10u && expert_in_dim == 4096u &&
+        expert_mid_dim == 2048u && out_dim == 4096u &&
+        n_total_expert == 256u && n_expert == 6u;
+}
+
+/* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
+ * while the fused gate/up shader additionally writes b5 and b6 (or only b6
+ * in its production mid-only appliance mode). The compact Q2 appliance has
+ * its output at b3 because it does not bind the dead expert-output scratch.
+ * Keep dependencies scoped to actual output ranges so routed dispatches do
+ * not publish unrelated allocations through a global memory barrier. */
 static void ds4gk_routed_output_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         VkDescriptorBufferInfo *buffers, uint32_t buffer_count) {
@@ -6346,7 +6365,8 @@ static void ds4gk_routed_output_barrier(
         barrier.offset = buffers[binding].offset;
         barrier.size = buffers[binding].range;
     };
-    add(4);
+    add(shader_name && strcmp(shader_name, "routed_moe_down_reduce_q2") == 0
+            ? 3u : 4u);
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
         add(5);
         add(6);
@@ -6380,7 +6400,10 @@ static void ds4gk_routed_input_barrier(
         barrier.offset = buffers[binding].offset;
         barrier.size = buffers[binding].range;
     };
-    if (pc.mode == 1u || pc.mode == 3u) add(3); /* selected IDs */
+    if (pc.mode == 1u || pc.mode == 3u) {
+        add(shader_name && strcmp(shader_name, "routed_moe_down_reduce_q2") == 0
+                ? 2u : 3u); /* selected IDs */
+    }
     if (pc.mode == 2u) add(2);                  /* router weights */
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
         add(7);                                 /* fused weights */
@@ -6485,8 +6508,12 @@ static bool ds4gk_routed_common(
      * already bounds-check them, so its one-token and batched calls pass
      * validate_selected=false.  Calls outside a batch retain validation for
      * focused CPU-written invalid-ID tests. */
+    const bool fused_down_reduce = ds4gk_routed_down_reduce_appliance(
+        down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert, n_tokens);
     if (mid_is_f16) *mid_is_f16 = false;
-    if (!out || !gate || !up || !mid || !experts || !selected || !weights ||
+    if (!out || !gate || !up || !mid || (!experts && !fused_down_reduce) ||
+        !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
         expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
         (gate_type != 8 && gate_type != 10 && gate_type != 16) ||
@@ -6528,7 +6555,8 @@ static bool ds4gk_routed_common(
         weights->bytes < selected_values * sizeof(float) ||
         x->bytes < x_values * sizeof(float) ||
         gate->bytes < pair_values * sizeof(float) || up->bytes < pair_values * sizeof(float) ||
-        mid->bytes < pair_values * sizeof(float) || experts->bytes < expert_values * sizeof(float) ||
+        mid->bytes < pair_values * sizeof(float) ||
+        (!fused_down_reduce && experts->bytes < expert_values * sizeof(float)) ||
         out->bytes < out_values * sizeof(float) ||
         (add_in && add_in->bytes < (uint64_t)out_dim * sizeof(float)))
         return false;
@@ -6538,7 +6566,8 @@ static bool ds4gk_routed_common(
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
         !ds4gk_routed_buffer(gate, gate_info) || !ds4gk_routed_buffer(up, up_info) ||
-        !ds4gk_routed_buffer(mid, mid_info) || !ds4gk_routed_buffer(experts, exp_info) ||
+        !ds4gk_routed_buffer(mid, mid_info) ||
+        (!fused_down_reduce && !ds4gk_routed_buffer(experts, exp_info)) ||
         !ds4gk_routed_buffer(selected, selected_info) || !ds4gk_routed_buffer(weights, weights_info))
         return false;
     if (add_in && !ds4gk_routed_buffer(add_in, add_info)) return false;
@@ -6703,21 +6732,34 @@ static bool ds4gk_routed_common(
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
         pc.q2_words = down_type == 10;
-        VkDescriptorBufferInfo down_buffers[6] = {
-            q8_info, down_model, down_model, selected_info, exp_info, iq2_lut_info};
-        const char *down_stage = pc.q2_words ? "down_words" : "down_raw";
-        ok = ds4gk_routed_dispatch(down_stage, pc,
-            down_buffers,
-            ds4gk_routed_projection_groups(out_dim, pc.q8_blocks),
-            n_tokens, n_expert, sets);
-        if (ok && getenv("DS4_VULKAN_DEBUG")) {
-            ok = ds4gk_routed_flush(sets);
-            float value = 0.0f;
-            if (ds4_gpu_tensor_read(experts, 0, &value, sizeof(value)))
-                fprintf(stderr, "ds4: [dbg] routed down[0]=%g\n", (double)value);
+        if (fused_down_reduce) {
+            pc.add_enabled = add_in ? 1u : 0u;
+            VkDescriptorBufferInfo down_reduce_buffers[5] = {
+                q8_info, down_model, selected_info, out_info, add_info};
+            const uint32_t rows_per_group = 32u / n_expert;
+            ok = ds4gk_routed_dispatch_shader(
+                "routed_moe_down_reduce_q2", "down_reduce_q2", pc,
+                down_reduce_buffers, 5,
+                (out_dim + rows_per_group - 1u) / rows_per_group,
+                n_tokens, 1, sets);
+        } else {
+            VkDescriptorBufferInfo down_buffers[6] = {
+                q8_info, down_model, down_model, selected_info, exp_info,
+                iq2_lut_info};
+            const char *down_stage = pc.q2_words ? "down_words" : "down_raw";
+            ok = ds4gk_routed_dispatch(down_stage, pc,
+                down_buffers,
+                ds4gk_routed_projection_groups(out_dim, pc.q8_blocks),
+                n_tokens, n_expert, sets);
+            if (ok && getenv("DS4_VULKAN_DEBUG")) {
+                ok = ds4gk_routed_flush(sets);
+                float value = 0.0f;
+                if (ds4_gpu_tensor_read(experts, 0, &value, sizeof(value)))
+                    fprintf(stderr, "ds4: [dbg] routed down[0]=%g\n", (double)value);
+            }
         }
     }
-    if (ok) {
+    if (ok && !fused_down_reduce) {
         pc.mode = 4; pc.add_enabled = add_in ? 1u : 0u;
         VkDescriptorBufferInfo reduce_buffers[6] = {
             add_info, exp_info, out_info, out_info, out_info, iq2_lut_info};

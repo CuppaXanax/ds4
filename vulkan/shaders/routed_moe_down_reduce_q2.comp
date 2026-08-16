@@ -1,0 +1,161 @@
+#version 460 core
+
+/* Exact Flash appliance: Q2 down projection and reduction of the already
+ * route-weighted mid in one workgroup. Six selected experts are assigned six
+ * 8-lane slots per
+ * output-row tile.  Each slot keeps the existing q2_block_dot_words and
+ * reduce_row_sum ordering; lane zero then performs the same rank-ascending
+ * FP32 accumulation as the old reduction dispatch. */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { uint b2[]; };
+layout(set = 0, binding = 3) buffer B3 { uint b3[]; };
+layout(set = 0, binding = 4) readonly buffer B4 { uint b4[]; };
+
+layout(push_constant) uniform PC {
+    uint mode;
+    uint gate_type;
+    uint down_type;
+    uint in_dim;
+    uint mid_dim;
+    uint out_dim;
+    uint n_tokens;
+    uint n_selected;
+    uint n_total_expert;
+    uint gate_expert_bytes;
+    uint gate_row_bytes;
+    uint down_expert_bytes;
+    uint down_row_bytes;
+    uint q8_blocks;
+    float clamp_value;
+    uint add_enabled;
+    uint q2_words;
+} pc;
+
+shared float dot_values[256];
+shared float rank_values[32];
+
+int input_i8(uint byte_idx) {
+    return bitfieldExtract(int(b0[byte_idx >> 2u]),
+                           int((byte_idx & 3u) * 8u), 8);
+}
+
+float f16(uint h) {
+    return unpackHalf2x16(h).x;
+}
+
+/* This is the proven Q2 direct-word path from routed_moe.comp.  The byte
+ * layout and integer-loop order are intentionally unchanged. */
+float q2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
+                         uint block) {
+    uint wb = row_byte / 4u + block * 21u;
+    uint xb = (input_token * input_blocks + block) * 73u;
+    uint scale_words[4];
+    uint q_words[16];
+    uint bsum_words[8];
+    for (uint i = 0u; i < 4u; ++i) scale_words[i] = b1[wb + i];
+    for (uint i = 0u; i < 16u; ++i) q_words[i] = b1[wb + 4u + i];
+    for (uint i = 0u; i < 8u; ++i) bsum_words[i] = b0[xb + 65u + i];
+    uint dmin_dword = b1[wb + 20u];
+    uint q8_dword = b0[xb];
+    float dall = uintBitsToFloat(q8_dword) * f16(dmin_dword & 0xffffu);
+    float dmin = uintBitsToFloat(q8_dword) * f16(dmin_dword >> 16u);
+    int isum = 0;
+    int summs = 0;
+    for (uint j = 0u; j < 16u; ++j) {
+        uint raw = bsum_words[j >> 1u];
+        int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
+        if (bsum >= 32768) bsum -= 65536;
+        uint scale_word = scale_words[j >> 2u];
+        uint scale_byte = (scale_word >> ((j & 3u) * 8u)) & 255u;
+        summs += bsum * int(scale_byte >> 4u);
+    }
+    for (uint half_block = 0u; half_block < 2u; ++half_block) {
+        uint q8base = xb + 1u + half_block * 32u;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint shift = j * 2u;
+            uint scale0_index = half_block * 8u + j * 2u;
+            uint scale1_index = scale0_index + 1u;
+            uint scale0_word = scale_words[scale0_index >> 2u];
+            uint scale1_word = scale_words[scale1_index >> 2u];
+            uint scale0 = (scale0_word >> ((scale0_index & 3u) * 8u)) & 15u;
+            uint scale1 = (scale1_word >> ((scale1_index & 3u) * 8u)) & 15u;
+            uint q2base = half_block * 8u;
+            uint q8group = q8base + j * 8u;
+            uint q8_words[8];
+            for (uint i = 0u; i < 8u; ++i) q8_words[i] = b0[q8group + i];
+            for (uint k = 0u; k < 16u; ++k) {
+                uint q0_word = q_words[q2base + (k >> 2u)];
+                uint q1_word = q_words[q2base + 4u + (k >> 2u)];
+                uint q0 = (q0_word >> ((k & 3u) * 8u + shift)) & 3u;
+                uint q1 = (q1_word >> ((k & 3u) * 8u + shift)) & 3u;
+                uint q8_word0 = q8_words[k >> 2u];
+                uint q8_word1 = q8_words[4u + (k >> 2u)];
+                int x0 = bitfieldExtract(int(q8_word0), int((k & 3u) * 8u), 8);
+                int x1 = bitfieldExtract(int(q8_word1), int((k & 3u) * 8u), 8);
+                isum += int(scale0) * int(q0) * x0;
+                isum += int(scale1) * int(q1) * x1;
+            }
+        }
+    }
+    return dall * float(isum) - dmin * float(summs);
+}
+
+float reduce_slot(float value, uint lanes_per_row, uint slot) {
+    uint lid = gl_LocalInvocationIndex;
+    uint lane = lid & (lanes_per_row - 1u);
+    uint base = slot * lanes_per_row;
+    dot_values[lid] = value;
+    barrier();
+    for (uint stride = lanes_per_row >> 1u; stride != 0u; stride >>= 1u) {
+        if (lane < stride)
+            dot_values[lid] += dot_values[lid + stride];
+        barrier();
+    }
+    return dot_values[base];
+}
+
+void main() {
+    const uint lanes_per_row = 8u;
+    const uint slots_per_group = 256u / lanes_per_row;
+    const uint experts = pc.n_selected;
+    const uint lid = gl_LocalInvocationIndex;
+    const uint slot = lid / lanes_per_row;
+    const uint lane = lid & (lanes_per_row - 1u);
+    if (experts == 0u || experts > slots_per_group ||
+        gl_WorkGroupID.y >= pc.n_tokens) return;
+    const uint rows_per_group = slots_per_group / experts;
+    const bool slot_active = slot < rows_per_group * experts;
+    const uint row_in_group = slot_active ? slot / experts : rows_per_group;
+    const uint rank = slot - (slot / experts) * experts;
+    const uint row = gl_WorkGroupID.x * rows_per_group + row_in_group;
+    const uint token = gl_WorkGroupID.y;
+
+    const bool row_valid = slot_active && row < pc.out_dim;
+    const uint selected_index = token * experts + rank;
+    const uint expert = b2[selected_index];
+    float partial = 0.0;
+    if (row_valid && expert < pc.n_total_expert) {
+        const uint row_byte = expert * pc.down_expert_bytes +
+                              row * pc.down_row_bytes;
+        for (uint block = lane; block < pc.q8_blocks;
+             block += lanes_per_row)
+            partial += q2_block_dot_words(row_byte, selected_index,
+                                          pc.q8_blocks, block);
+    }
+    const float expert_value = reduce_slot(partial, lanes_per_row, slot);
+    if (lane == 0u) rank_values[slot] = expert_value;
+    barrier();
+
+    if (lane == 0u && rank == 0u && row_valid) {
+        const uint row_base = row_in_group * experts;
+        float value = rank_values[row_base];
+        for (uint r = 1u; r < experts; ++r)
+            value += rank_values[row_base + r];
+        if (pc.add_enabled != 0u)
+            value += uintBitsToFloat(b4[row]);
+        b3[token * pc.out_dim + row] = floatBitsToUint(value);
+    }
+}

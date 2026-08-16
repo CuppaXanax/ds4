@@ -6,11 +6,11 @@
 
 ## Current qualified deployment
 
-Publication base: `c519309` (`origin/pr-557-merge`).
+Qualified publication: `f85a909` (`origin/pr-557-merge`).
 
 - approximately 5.4-5.5 generation tokens/s;
 - approximately 3.25 ms representative Layer 4 GPU time;
-- 83/83 complete GFX1013 Vulkan tests;
+- 86/86 complete GFX1013 Vulkan tests;
 - exact 16-step artifact SHA-256:
   `5e31e01d847a5f1e409c4169e249ae187efe1c3827fd7009711c3679dcfe8023`;
 - exact fallbacks remain available for F16, Q8, routed Wave64/fusion, and

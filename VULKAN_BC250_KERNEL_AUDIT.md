@@ -6,9 +6,8 @@
 
 ## Qualified baseline
 
-The publication base is `origin/pr-557-merge` at `c519309`. The accompanying
-publication adds the exact indexed Wave64 attention and inverse-RoPE promotion
-described below.
+The qualified publication is `origin/pr-557-merge` at `f85a909`. It includes
+the exact indexed Wave64 attention and inverse-RoPE promotion described below.
 
 | Item | Qualified result |
 |---|---:|
@@ -16,7 +15,7 @@ described below.
 | Representative Layer 4 GPU time | approximately 3.25 ms |
 | Attention/projection group | approximately 1.77 ms/layer |
 | Routed/shared MoE group | approximately 1.31 ms/layer |
-| Complete GFX1013 Vulkan suite | 83/83 passing |
+| Complete GFX1013 Vulkan suite | 86/86 passing |
 | Exact 16-step output artifact SHA-256 | `5e31e01d847a5f1e409c4169e249ae187efe1c3827fd7009711c3679dcfe8023` |
 
 The SHA-256 above is the generated logprob artifact hash, not a binary hash.

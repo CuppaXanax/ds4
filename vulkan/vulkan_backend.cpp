@@ -492,6 +492,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
+        {"matmul_q8_0_token_tiled_bfe", 20, 4},
         {"matmul_q8_0_hc_expand_rows2_bfe", 16, 7},
         {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_group_rows_bfe", 20, 4},
@@ -3068,6 +3069,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     const char *rows8_env = getenv("DS4_VULKAN_Q8_ROWS8");
     const char *rows2_env = getenv("DS4_VULKAN_Q8_ROWS2");
     const char *wave64_env = getenv("DS4_VULKAN_Q8_WAVE64");
+    const char *token_tiled_env = getenv("DS4_VULKAN_Q8_PREFILL_TILED");
     bool use_wave64 = use_aligned &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
         !(wave64_env && strcmp(wave64_env, "0") == 0) &&
@@ -3082,20 +3084,36 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(rows8_env && strcmp(rows8_env, "0") == 0) &&
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
+    /* Qualification-only prefill shape: two output rows reuse their packed
+     * weight rows across four tokens.  Decode remains on its established
+     * one-token kernels, and exact mode retains the exact fallback. */
+    bool use_token_tiled = use_aligned &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
+        token_tiled_env && strcmp(token_tiled_env, "0") != 0 &&
+        n_tok > 1 && in_dim == 4096 && blocks == 128;
     const char *shader_name = use_wave64
         ? "matmul_q8_0_wave64_bfe"
+        : (use_token_tiled
+        ? "matmul_q8_0_token_tiled_bfe"
         : (use_rows2
         ? "matmul_q8_0_rows2_bfe"
         : (use_rows8
         ? "matmul_q8_0_rows8_bfe"
-        : (use_aligned
+            : (use_aligned
             ? (q8_mode && strcmp(q8_mode, "exact") == 0
                 ? "matmul_q8_0_aligned" : "matmul_q8_0_aligned_bfe")
-            : "matmul_q8_0_prequant")));
+                : "matmul_q8_0_prequant"))));
     auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end() && use_wave64) {
         /* A stale shader bundle must preserve the aligned dispatch geometry. */
         use_wave64 = false;
+        shader_name = use_rows2
+            ? "matmul_q8_0_rows2_bfe"
+            : (use_rows8 ? "matmul_q8_0_rows8_bfe" : "matmul_q8_0_aligned_bfe");
+        si = g_vk.shader_map.find(shader_name);
+    }
+    if (si == g_vk.shader_map.end() && use_token_tiled) {
+        use_token_tiled = false;
         shader_name = use_rows2
             ? "matmul_q8_0_rows2_bfe"
             : (use_rows8 ? "matmul_q8_0_rows8_bfe" : "matmul_q8_0_aligned_bfe");
@@ -3145,25 +3163,37 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         (VkDeviceSize)(n_tok * out_dim * sizeof(float))};
     const uint32_t dispatch_x = use_wave64
         ? (uint32_t)out_dim
+        : (use_token_tiled
+        ? (uint32_t)((out_dim + 1u) / 2u)
         : (use_rows2
         ? (uint32_t)((out_dim + 1u) / 2u)
-        : (use_rows8 ? (uint32_t)((out_dim + 7u) / 8u) : y_scale));
-    const uint32_t dispatch_y = (use_wave64 || use_rows2 || use_rows8)
+        : (use_rows8 ? (uint32_t)((out_dim + 7u) / 8u) : y_scale)));
+    const uint32_t dispatch_y = (use_wave64 || use_token_tiled || use_rows2 || use_rows8)
         ? 1u : (uint32_t)y_count64;
+    const uint32_t dispatch_z = use_token_tiled
+        ? (uint32_t)((n_tok + 3u) / 4u) : (uint32_t)n_tok;
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks,
-        use_wave64 ? 1u : (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale))};
+        use_wave64 ? 1u : (use_token_tiled ? 4u :
+        (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale)))};
     if (use_wave64 && getenv("DS4_VULKAN_TRACE_KERNELS"))
         fprintf(stderr,
                 "ds4: [trace] matmul_q8_0_wave64_bfe shape=%ux%u blocks=%u "
                 "dispatch=%ux%ux%u\n",
                 (unsigned)in_dim, (unsigned)out_dim, (unsigned)blocks,
                 (unsigned)dispatch_x, (unsigned)dispatch_y, (unsigned)n_tok);
+    if (use_token_tiled && getenv("DS4_VULKAN_TRACE_KERNELS"))
+        fprintf(stderr,
+                "ds4: [trace] matmul_q8_0_token_tiled_bfe shape=%ux%u blocks=%u "
+                "dispatch=%ux%ux%u tile_tokens=4\n",
+                (unsigned)in_dim, (unsigned)out_dim, (unsigned)blocks,
+                (unsigned)dispatch_x, (unsigned)dispatch_y,
+                (unsigned)dispatch_z);
     if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
     return record_simple_shader(shader_name, &pc, sizeof(pc),
                                 buffers, descriptor_count, dispatch_x, dispatch_y,
-                                (uint32_t)n_tok, resume_recording);
+                                dispatch_z, resume_recording);
 }
 
 /* Grouped decode appliance for contiguous Q8_0 output rows.  The input has

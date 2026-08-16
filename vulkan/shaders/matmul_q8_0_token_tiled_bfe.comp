@@ -1,0 +1,110 @@
+#version 460 core
+
+/*
+ * Cross-token Q8_0 projection for the common 4096-input prefill shape.
+ *
+ * Grid: (ceil(out_dim / 2), 1, ceil(n_tok / 4)).  A workgroup contains two
+ * output rows (local_size_y) and 128 Q8 blocks (local_size_x).  Each row's
+ * eight packed weight words are loaded into LDS once and reused for four
+ * tokens.  The block-dot loop and ascending block reduction intentionally
+ * retain the association used by matmul_q8_0_aligned_bfe.
+ */
+layout(local_size_x = 128, local_size_y = 2, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks_per_row;
+    uint tile_tokens;
+} pc;
+
+/* 2 rows x 8 words x 128 blocks = 8 KiB. */
+shared uint weight_words[2][8][128];
+shared float block_scales[2][128];
+/* 2 rows x 4 tokens x 128 blocks, scale product plus integer dot. */
+shared float block_scale_products[2][4][128];
+shared int block_dots[2][4][128];
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(weight_words[gl_LocalInvocationID.y][byte_index >> 2u][word]),
+                           int((byte_index & 3u) * 8u), 8);
+}
+
+int x_i8(uint word, uint byte_index) {
+    return bitfieldExtract(int(x_q8_buf[word]), int((byte_index & 3u) * 8u), 8);
+}
+
+void main() {
+    const uint row_slot = gl_LocalInvocationID.y;
+    const uint block = gl_LocalInvocationID.x;
+    const uint row = gl_WorkGroupID.x * 2u + row_slot;
+    const uint tile_base = gl_WorkGroupID.z * pc.tile_tokens;
+
+    /* All invocations load and reach every barrier, including a partial final
+     * output-row/token tile.  This is required for workgroup correctness. */
+    const bool row_valid = row < pc.out_dim;
+    const bool block_valid = block < pc.blocks_per_row;
+    for (uint word = 0u; word < 8u; word++) {
+        uint value = 0u;
+        if (row_valid && block_valid)
+            value = payload_buf[(row * pc.blocks_per_row + block) * 8u + word];
+        weight_words[row_slot][word][block] = value;
+    }
+
+    float scale = 0.0;
+    if (row_valid && block_valid) {
+        uint record = row * pc.blocks_per_row + block;
+        uint scale_word = scale_buf[record >> 1u];
+        uint scale_bits = (scale_word >> ((record & 1u) * 16u)) & 0xffffu;
+        scale = f16tof32(scale_bits);
+    }
+    block_scales[row_slot][block] = scale;
+    barrier();
+
+    for (uint token_slot = 0u; token_slot < 4u; token_slot++) {
+        const uint token = tile_base + token_slot;
+        int dot = 0;
+        float activation_scale = 0.0;
+        if (row_valid && block_valid && token_slot < pc.tile_tokens &&
+            token < pc.n_tok) {
+            const uint x_off = (token * pc.blocks_per_row + block) * 9u;
+            activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
+            const uint count = min(32u, pc.in_dim - block * 32u);
+            for (uint i = 0u; i < count; i++)
+                dot += i8_at(block, i) * x_i8(x_off + 1u + (i >> 2u), i & 3u);
+        }
+        block_scale_products[row_slot][token_slot][block] =
+            block_scales[row_slot][block] * activation_scale;
+        block_dots[row_slot][token_slot][block] = dot;
+    }
+    barrier();
+
+    if (row_valid && block == 0u) {
+        for (uint token_slot = 0u; token_slot < 4u; token_slot++) {
+            const uint token = tile_base + token_slot;
+            if (token_slot >= pc.tile_tokens || token >= pc.n_tok) continue;
+            float sum = 0.0;
+            for (uint b = 0u; b < pc.blocks_per_row; b++)
+                sum += block_scale_products[row_slot][token_slot][b] *
+                       float(block_dots[row_slot][token_slot][b]);
+            out_buf[token * pc.out_dim + row] = sum;
+        }
+    }
+}

@@ -535,7 +535,9 @@ static int load_all_shaders(void) {
         {"routed_moe_mode4", 68, 6}, {"routed_moe_mode5", 68, 6},
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
+        {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
+        {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -6648,6 +6650,23 @@ static const char *ds4gk_routed_mode_shader(const char *fallback,
     return g_vk.shader_map.find(name) != g_vk.shader_map.end() ? name : fallback;
 }
 
+/* The Wave64 routed variants are deliberately opt-in until one exact
+ * artifact gate and one sustained decode gate have passed.  They are only
+ * valid on the BC-250 shape for which the shaders use 16-lane/8-lane groups
+ * inside a 64-lane subgroup. */
+static bool ds4gk_routed_wave64_enabled(void) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_WAVE64");
+    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+        return false;
+    return g_vk.caps.subgroup_size == 64u && g_vk.caps.has_subgroup_shuffle;
+}
+
+static const char *ds4gk_routed_shape_shader(const char *ordinary,
+                                              const char *wave64) {
+    return ds4gk_routed_wave64_enabled() &&
+        g_vk.shader_map.find(wave64) != g_vk.shader_map.end() ? wave64 : ordinary;
+}
+
 /* The production Flash decode appliance already keeps router IDs and route
  * weights on the device for the whole layer command batch. On that narrow
  * shape a compact fused shader writes Q8 mid directly; gate/up/f32-mid
@@ -6711,7 +6730,10 @@ static void ds4gk_routed_output_barrier(
         barrier.offset = buffers[binding].offset;
         barrier.size = buffers[binding].range;
     };
-    add(shader_name && strcmp(shader_name, "routed_moe_down_reduce_q2") == 0
+    const bool down_reduce = shader_name &&
+        (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
+         strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
+    add(down_reduce
             ? 3u : 4u);
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
         add(5);
@@ -6746,14 +6768,18 @@ static void ds4gk_routed_input_barrier(
         barrier.offset = buffers[binding].offset;
         barrier.size = buffers[binding].range;
     };
+    const bool down_reduce = shader_name &&
+        (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
+         strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
     if (pc.mode == 1u || pc.mode == 3u) {
-        add(shader_name && strcmp(shader_name, "routed_moe_down_reduce_q2") == 0
+        add(down_reduce
                 ? 2u : 3u); /* selected IDs */
     }
     if (pc.mode == 2u) add(2);                  /* router weights */
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
         add(7);                                 /* fused weights */
-    if (shader_name && strcmp(shader_name, "routed_moe_fused_mid") == 0)
+    if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid") == 0 ||
+                        strcmp(shader_name, "routed_moe_fused_mid_wave64") == 0))
         add(5);                                 /* compact fused weights */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_input_dependency");
@@ -7087,8 +7113,10 @@ static bool ds4gk_routed_common(
                 q8_info, gate_model, up_model, selected_info,
                 compact_mid_q8_info,
                 weights_info, iq2_lut_info};
+            const char *fused_mid_shader = ds4gk_routed_shape_shader(
+                "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
             ok = ds4gk_routed_dispatch_shader(
-                "routed_moe_fused_mid", "gate_up_swiglu_iq2_q8", pc,
+                fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
                 fused_buffers, 7,
                 (expert_mid_dim + 255u) / 256u,
                 n_tokens, n_expert, sets);
@@ -7164,9 +7192,12 @@ static bool ds4gk_routed_common(
             VkDescriptorBufferInfo down_reduce_buffers[5] = {
                 mid_only ? compact_mid_q8_info : q8_info,
                 down_model, selected_info, out_info, add_info};
+            const char *down_reduce_shader = ds4gk_routed_shape_shader(
+                "routed_moe_down_reduce_q2",
+                "routed_moe_down_reduce_q2_wave64");
             const uint32_t rows_per_group = 32u / n_expert;
             ok = ds4gk_routed_dispatch_shader(
-                "routed_moe_down_reduce_q2", "down_reduce_q2", pc,
+                down_reduce_shader, "down_reduce_q2", pc,
                 down_reduce_buffers, 5,
                 (out_dim + rows_per_group - 1u) / rows_per_group,
                 n_tokens, 1, sets);

@@ -1,5 +1,13 @@
 #version 460 core
 
+#ifndef DS4_ROUTED_WAVE64
+#define DS4_ROUTED_WAVE64 0
+#endif
+#if DS4_ROUTED_WAVE64
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
 /* Exact Flash IQ2 gate/up + SwiGLU -> Q8_K appliance. One workgroup owns one
  * 256-value output block. It evaluates the block's 16 row tiles with the same
  * 16-lane reduction tree as routed_moe_fused.comp, then applies the canonical
@@ -34,10 +42,16 @@ layout(push_constant) uniform PC {
     uint q2_words;
 } pc;
 
+#if !DS4_ROUTED_WAVE64
 shared float gate_values[256];
 shared float up_values[256];
+#endif
 shared float mid_values[256];
 shared uint iq2_lut[544];
+#if DS4_ROUTED_WAVE64
+/* Every output row consumes the same token/rank activation vector. */
+shared uint q8_cache[1168]; /* 16 Q8_K blocks x 73 words */
+#endif
 
 uint weight_u32(uint byte_idx) {
     uint word_idx = byte_idx >> 2u;
@@ -77,7 +91,11 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
                         uint block, out float gate, out float up) {
     uint wb = row_byte + block * 66u;
     uint xb = (input_token * input_blocks + block) * 73u;
+#if DS4_ROUTED_WAVE64
+    float input_scale = uintBitsToFloat(q8_cache[block * 73u]);
+#else
     float input_scale = uintBitsToFloat(b0[xb]);
+#endif
     float gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
     float up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
     int gate_sum = 0;
@@ -92,10 +110,18 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
         int up_ls = int(2u * (up_aux >> 28u) + 1u);
         for (uint pair = 0u; pair < 2u; ++pair) {
             uint q8_word = xb + 1u + ib * 8u + pair * 4u;
+#if DS4_ROUTED_WAVE64
+            q8_word = block * 73u + 1u + ib * 8u + pair * 4u;
+            uint q80_lo = q8_cache[q8_word];
+            uint q80_hi = q8_cache[q8_word + 1u];
+            uint q81_lo = q8_cache[q8_word + 2u];
+            uint q81_hi = q8_cache[q8_word + 3u];
+#else
             uint q80_lo = b0[q8_word];
             uint q80_hi = b0[q8_word + 1u];
             uint q81_lo = b0[q8_word + 2u];
             uint q81_hi = b0[q8_word + 3u];
+#endif
 
             uint gate_s0 = (gate_aux >> (14u * pair)) & 127u;
             uint gate_s1 = (gate_aux >> (14u * pair + 7u)) & 127u;
@@ -141,6 +167,22 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
 
 void reduce_pair(float gate, float up, uint lanes_per_row,
                  out float gate_total, out float up_total) {
+#if DS4_ROUTED_WAVE64
+    /* Row groups occupy the low four bits of a Wave64 lane ID. XOR masks
+     * therefore stay inside one row and reproduce the old FP32 tree without
+     * four full-workgroup barriers per tile. */
+    uint lane = gl_SubgroupInvocationID & 15u;
+    for (uint stride = 8u; stride != 0u; stride >>= 1u) {
+        float gate_pair = subgroupShuffleXor(gate, stride);
+        float up_pair = subgroupShuffleXor(up, stride);
+        if (lane < stride) {
+            gate += gate_pair;
+            up += up_pair;
+        }
+    }
+    gate_total = gate;
+    up_total = up;
+#else
     uint lid = gl_LocalInvocationIndex;
     uint lane = lid & (lanes_per_row - 1u);
     gate_values[lid] = gate;
@@ -155,6 +197,7 @@ void reduce_pair(float gate, float up, uint lanes_per_row,
     }
     gate_total = gate_values[lid - lane];
     up_total = up_values[lid - lane];
+#endif
 }
 
 void quantize_mid_block(uint token, uint rank, uint block) {
@@ -212,11 +255,27 @@ void main() {
     uint output_block = gl_WorkGroupID.x;
     const uint lanes_per_row = 16u;
     const uint rows_per_tile = 16u;
+#if DS4_ROUTED_WAVE64
+    /* Runtime admission requires four contiguous Wave64 subgroups.  Use the
+     * logical subgroup coordinate so shuffle partners and row ownership
+     * remain aligned even if local invocation numbering is not subgroup
+     * numbering. */
+    uint logical_id = gl_SubgroupID * gl_SubgroupSize +
+                      gl_SubgroupInvocationID;
+    uint lane = logical_id & (lanes_per_row - 1u);
+    uint row_in_tile = logical_id / lanes_per_row;
+#else
     uint lane = lid & (lanes_per_row - 1u);
     uint row_in_tile = lid / lanes_per_row;
+#endif
     if (token >= pc.n_tokens || rank >= pc.n_selected ||
         output_block >= pc.mid_dim / 256u) return;
     uint expert = b3[token * pc.n_selected + rank];
+#if DS4_ROUTED_WAVE64
+    for (uint i = logical_id; i < pc.q8_blocks * 73u; i += 256u)
+        q8_cache[i] = b0[token * pc.q8_blocks * 73u + i];
+    barrier();
+#endif
     for (uint i = lid; i < 544u; i += 256u) iq2_lut[i] = b6[i];
     barrier();
 

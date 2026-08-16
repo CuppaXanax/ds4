@@ -1,5 +1,13 @@
 #version 460 core
 
+#ifndef DS4_ROUTED_WAVE64
+#define DS4_ROUTED_WAVE64 0
+#endif
+#if DS4_ROUTED_WAVE64
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
 /* Exact Flash appliance: Q2 down projection and reduction of the already
  * route-weighted mid in one workgroup. Six selected experts are assigned six
  * 8-lane slots per
@@ -34,7 +42,9 @@ layout(push_constant) uniform PC {
     uint q2_words;
 } pc;
 
+#if !DS4_ROUTED_WAVE64
 shared float dot_values[256];
+#endif
 shared float rank_values[32];
 
 int input_i8(uint byte_idx) {
@@ -104,6 +114,17 @@ float q2_block_dot_words(uint row_byte, uint input_token, uint input_blocks,
 }
 
 float reduce_slot(float value, uint lanes_per_row, uint slot) {
+#if DS4_ROUTED_WAVE64
+    /* Each slot is an eight-lane subgroup segment.  The XOR sequence is the
+     * same pairwise FP32 tree as the LDS implementation, without a barrier
+     * at every stride. */
+    uint lane = gl_SubgroupInvocationID & 7u;
+    for (uint stride = 4u; stride != 0u; stride >>= 1u) {
+        float pair = subgroupShuffleXor(value, stride);
+        if (lane < stride) value += pair;
+    }
+    return value;
+#else
     uint lid = gl_LocalInvocationIndex;
     uint lane = lid & (lanes_per_row - 1u);
     uint base = slot * lanes_per_row;
@@ -115,6 +136,7 @@ float reduce_slot(float value, uint lanes_per_row, uint slot) {
         barrier();
     }
     return dot_values[base];
+#endif
 }
 
 void main() {
@@ -122,8 +144,15 @@ void main() {
     const uint slots_per_group = 256u / lanes_per_row;
     const uint experts = pc.n_selected;
     const uint lid = gl_LocalInvocationIndex;
+#if DS4_ROUTED_WAVE64
+    const uint logical_id = gl_SubgroupID * gl_SubgroupSize +
+                            gl_SubgroupInvocationID;
+    const uint slot = logical_id / lanes_per_row;
+    const uint lane = logical_id & (lanes_per_row - 1u);
+#else
     const uint slot = lid / lanes_per_row;
     const uint lane = lid & (lanes_per_row - 1u);
+#endif
     if (experts == 0u || experts > slots_per_group ||
         gl_WorkGroupID.y >= pc.n_tokens) return;
     const uint rows_per_group = slots_per_group / experts;

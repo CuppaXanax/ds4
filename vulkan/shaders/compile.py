@@ -51,5 +51,25 @@ for mode in range(6):
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {routed.name} mode {mode}: {diagnostics}", file=sys.stderr)
 
+# BC-250's GFX1013 path has Wave64 subgroups.  These variants preserve the
+# scalar arithmetic and reduction order but replace repeated workgroup
+# barriers with subgroup shuffles; the runtime admits them only on a proven
+# subgroup-size-64 device and keeps the ordinary shaders as fallback.
+for source_name in ("routed_moe_fused_mid", "routed_moe_down_reduce_q2"):
+    src = SRC_DIR / f"{source_name}.comp"
+    spv = OUT_DIR / f"{source_name}_wave64.spv"
+    result = subprocess.run(
+        [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+         "-DDS4_ROUTED_WAVE64=1", str(src), "-o", str(spv)],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        compiled += 1
+    else:
+        failed += 1
+        diagnostics = "\n".join(part for part in
+                                (result.stdout.strip(), result.stderr.strip()) if part)
+        print(f"FAIL {src.name} Wave64: {diagnostics}", file=sys.stderr)
+
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

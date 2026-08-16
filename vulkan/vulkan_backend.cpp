@@ -6650,13 +6650,13 @@ static const char *ds4gk_routed_mode_shader(const char *fallback,
     return g_vk.shader_map.find(name) != g_vk.shader_map.end() ? name : fallback;
 }
 
-/* The Wave64 routed variants are deliberately opt-in until one exact
- * artifact gate and one sustained decode gate have passed.  They are only
- * valid on the BC-250 shape for which the shaders use 16-lane/8-lane groups
- * inside a 64-lane subgroup. */
+/* The Wave64 routed variants are the BC-250 appliance default. They are only
+ * valid for the 16-lane/8-lane groups inside a reported 64-lane subgroup;
+ * unusual devices retain the ordinary shaders, and =0 remains an exact
+ * same-binary fallback for diagnosis. */
 static bool ds4gk_routed_wave64_enabled(void) {
     const char *enabled = getenv("DS4_VULKAN_ROUTED_WAVE64");
-    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+    if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
         return false;
     return g_vk.caps.subgroup_size == 64u && g_vk.caps.has_subgroup_shuffle;
 }

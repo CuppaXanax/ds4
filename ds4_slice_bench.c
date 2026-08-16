@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -154,49 +156,63 @@ static int fail(const char *where, const char *err) {
     return 0;
 }
 
-static int replay_prefill(ds4_session *source, ds4_session *target,
-                          const ds4_tokens *prompt, uint32_t chunk,
-                          uint64_t hidden, float *source_hc, float *target_hc,
-                          uint64_t *last_prefill_hash, double *wall_ms) {
+/* Capture the coordinator-produced hidden input once. This is deliberately
+ * outside the measured loop: the benchmark must report the 4:7 worker slice,
+ * not the coordinator's 0:3 work or its CPU handoff. */
+static int capture_source_inputs(ds4_session *source, const ds4_tokens *prompt,
+                                 uint32_t chunk, uint64_t hidden,
+                                 float *inputs) {
     char err[512] = {0};
     unsetenv("DS4_VULKAN_TIMELINE_LAYER");
-    const double t0 = now_ms();
     for (uint32_t pos = 0; pos < (uint32_t)prompt->len; ) {
         uint32_t n = (uint32_t)prompt->len - pos;
         if (n > chunk) n = chunk;
         if (ds4_session_eval_layer_slice(source, prompt->v + pos, n, pos,
-                                          0, 3, NULL, source_hc, false, NULL,
+                                          0, 3, NULL,
+                                          inputs + (uint64_t)pos * hidden,
+                                          false, NULL,
                                           err, sizeof(err)) != 0)
-            return fail("prefill source 0:3", err);
-        if (ds4_session_eval_layer_slice(target, prompt->v + pos, n, pos,
-                                          SLICE_START, SLICE_END, source_hc,
-                                          target_hc, false, NULL,
-                                          err, sizeof(err)) != 0)
-            return fail("prefill target 4:7", err);
-        if (pos + n == (uint32_t)prompt->len && last_prefill_hash)
-            *last_prefill_hash = hash_f32(target_hc, (uint64_t)n * hidden);
+            return fail("capture source 0:3", err);
         pos += n;
     }
-    if (wall_ms) *wall_ms += now_ms() - t0;
     return 1;
 }
 
-static int replay_decode(ds4_session *source, ds4_session *target, int token,
-                          uint64_t hidden, float *source_hc, float *target_hc,
-                          uint64_t *out_hash, metrics *m) {
+static int replay_target_prefill(ds4_session *target, const ds4_tokens *prompt,
+                                 uint32_t chunk, uint64_t hidden,
+                                 const float *inputs, float *target_hc,
+                                 uint64_t *out_hash, metrics *m) {
     char err[512] = {0};
-    const uint32_t pos = (uint32_t)ds4_session_pos(source);
+    const double t0 = now_ms();
+    unsetenv("DS4_VULKAN_TIMELINE_LAYER");
+    for (uint32_t pos = 0; pos < (uint32_t)prompt->len; ) {
+        uint32_t n = (uint32_t)prompt->len - pos;
+        if (n > chunk) n = chunk;
+        const bool last = pos + n == (uint32_t)prompt->len;
+        if (ds4_session_eval_layer_slice(
+                target, prompt->v + pos, n, pos, SLICE_START, SLICE_END,
+                inputs + (uint64_t)pos * hidden, last ? target_hc : NULL,
+                false, NULL, err, sizeof(err)) != 0)
+            return fail("replay target prefill 4:7", err);
+        pos += n;
+    }
+    if (out_hash) *out_hash = hash_f32(target_hc, hidden);
+    if (m) m->prefill_wall_ms += now_ms() - t0;
+    return 1;
+}
+
+static int replay_target_decode(ds4_session *target, int token, uint32_t pos,
+                                uint64_t hidden, const float *input_hc,
+                                float *target_hc, uint64_t *out_hash,
+                                metrics *m) {
+    char err[512] = {0};
     const double t0 = now_ms();
     setenv("DS4_VULKAN_TIMELINE_LAYER", "4", 1);
-    if (ds4_session_eval_layer_slice(source, &token, 1, pos, 0, 3, NULL,
-                                     source_hc, false, NULL,
-                                     err, sizeof(err)) != 0)
-        return fail("decode source 0:3", err);
     if (ds4_gpu_worker_slice_begin(SLICE_START, SLICE_END) == 0)
         return fail("decode worker slice begin", "Vulkan worker slice unavailable");
     const int rc = ds4_session_eval_layer_slice(target, &token, 1, pos,
                                                 SLICE_START, SLICE_END,
-                                                source_hc, target_hc, false,
+                                                input_hc, target_hc, false,
                                                 NULL, err, sizeof(err));
     const int end_rc = ds4_gpu_worker_slice_end(SLICE_START, SLICE_END);
     if (rc != 0) return fail("decode target 4:7", err);
@@ -217,10 +233,8 @@ static int replay_decode(ds4_session *source, ds4_session *target, int token,
     return 1;
 }
 
-static int reset_sessions(ds4_session *source, ds4_session *target) {
+static int reset_target(ds4_session *target) {
     char err[256] = {0};
-    if (ds4_session_layer_slice_reset(source, err, sizeof(err)) != 0)
-        return fail("reset source", err);
     if (ds4_session_layer_slice_reset(target, err, sizeof(err)) != 0)
         return fail("reset target", err);
     return 1;
@@ -238,7 +252,7 @@ int main(int argc, char **argv) {
     setenv("DS4_VULKAN_WORKER_SLICE_BATCH", "1", 1);
     setenv("DS4_VULKAN_SLICE_BENCH", "1", 1);
     setenv("DS4_VULKAN_TIMELINE_COUNT", "1024", 0);
-    /* Query pools are created at engine startup for decode. replay_prefill()
+    /* Query pools are created at engine startup for decode. replay_target_prefill()
      * removes this selector while running production-shaped prefill. */
     setenv("DS4_VULKAN_TIMELINE_LAYER", "4", 1);
 
@@ -292,35 +306,67 @@ int main(int argc, char **argv) {
         ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
     }
     if (chunk > (uint32_t)prompt.len) chunk = (uint32_t)prompt.len;
-    float *source_hc = calloc((size_t)chunk * hidden, sizeof(*source_hc));
-    float *target_hc = calloc((size_t)chunk * hidden, sizeof(*target_hc));
-    if (!source_hc || !target_hc) {
+    const uint64_t input_rows = (uint64_t)prompt.len + 1u;
+    if (input_rows > SIZE_MAX / hidden ||
+        input_rows * hidden > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4-slice-bench: captured hidden-state input is too large\n");
+        ds4_session_free(source); ds4_session_free(target);
+        ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
+    }
+    float *captured_inputs = calloc((size_t)(input_rows * hidden), sizeof(*captured_inputs));
+    float *target_hc = calloc((size_t)hidden, sizeof(*target_hc));
+    if (!captured_inputs || !target_hc) {
         fprintf(stderr, "ds4-slice-bench: hidden-state allocation failed\n");
-        free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+        free(captured_inputs); free(target_hc);
+        ds4_session_free(source); ds4_session_free(target);
         ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
     }
 
-    uint64_t capture_prefill_hash = 0, capture_decode_hash = 0;
-    double ignored = 0.0;
-    if (!replay_prefill(source, target, &prompt, chunk, hidden, source_hc,
-                        target_hc, &capture_prefill_hash, &ignored) ||
-        !replay_decode(source, target, c.decode_token, hidden, source_hc,
-                       target_hc, &capture_decode_hash, NULL)) {
-        free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+    if (!capture_source_inputs(source, &prompt, chunk, hidden, captured_inputs)) {
+        free(captured_inputs); free(target_hc); ds4_session_free(source); ds4_session_free(target);
         ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
     }
-    if (!reset_sessions(source, target)) {
-        free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+    /* Capture the exact coordinator hidden input for the one-token decode. */
+    {
+        char err[512] = {0};
+        const uint32_t pos = (uint32_t)prompt.len;
+        int token = c.decode_token;
+        if (ds4_session_eval_layer_slice(
+                source, &token, 1, pos, 0, 3, NULL,
+                captured_inputs + (uint64_t)pos * hidden, false, NULL,
+                err, sizeof(err)) != 0) {
+            fail("capture source decode 0:3", err);
+            free(captured_inputs); free(target_hc);
+            ds4_session_free(source); ds4_session_free(target);
+            ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
+        }
+    }
+
+    uint64_t capture_prefill_hash = 0, capture_decode_hash = 0;
+    if (!replay_target_prefill(target, &prompt, chunk, hidden, captured_inputs,
+                               target_hc, &capture_prefill_hash, NULL) ||
+        !replay_target_decode(target, c.decode_token, (uint32_t)prompt.len,
+                              hidden, captured_inputs + (uint64_t)prompt.len * hidden,
+                              target_hc, &capture_decode_hash, NULL)) {
+        free(captured_inputs); free(target_hc);
+        ds4_session_free(source); ds4_session_free(target);
+        ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
+    }
+    if (!reset_target(target)) {
+        free(captured_inputs); free(target_hc);
+        ds4_session_free(source); ds4_session_free(target);
         ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
     }
 
     for (int i = 0; i < c.warmup; i++) {
-        if (!replay_prefill(source, target, &prompt, chunk, hidden, source_hc,
-                            target_hc, NULL, NULL) ||
-            !replay_decode(source, target, c.decode_token, hidden, source_hc,
-                           target_hc, NULL, NULL) ||
-            !reset_sessions(source, target)) {
-            free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+        if (!replay_target_prefill(target, &prompt, chunk, hidden, captured_inputs,
+                                   target_hc, NULL, NULL) ||
+            !replay_target_decode(target, c.decode_token, (uint32_t)prompt.len,
+                                  hidden, captured_inputs + (uint64_t)prompt.len * hidden,
+                                  target_hc, NULL, NULL) ||
+            !reset_target(target)) {
+            free(captured_inputs); free(target_hc);
+            ds4_session_free(source); ds4_session_free(target);
             ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
         }
     }
@@ -328,12 +374,14 @@ int main(int argc, char **argv) {
     metrics m = {0};
     uint64_t measured_prefill_hash = 0, measured_decode_hash = 0;
     for (int i = 0; i < c.iters; i++) {
-        if (!replay_prefill(source, target, &prompt, chunk, hidden, source_hc,
-                            target_hc, &measured_prefill_hash, &m.prefill_wall_ms) ||
-            !replay_decode(source, target, c.decode_token, hidden, source_hc,
-                           target_hc, &measured_decode_hash, &m) ||
-            !reset_sessions(source, target)) {
-            free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+        if (!replay_target_prefill(target, &prompt, chunk, hidden, captured_inputs,
+                                   target_hc, &measured_prefill_hash, &m) ||
+            !replay_target_decode(target, c.decode_token, (uint32_t)prompt.len,
+                                  hidden, captured_inputs + (uint64_t)prompt.len * hidden,
+                                  target_hc, &measured_decode_hash, &m) ||
+            !reset_target(target)) {
+            free(captured_inputs); free(target_hc);
+            ds4_session_free(source); ds4_session_free(target);
             ds4_tokens_free(&prompt); ds4_engine_close(engine); return 2;
         }
         if (measured_prefill_hash != capture_prefill_hash ||
@@ -343,7 +391,8 @@ int main(int argc, char **argv) {
                     "(prefill=%016" PRIx64 "/%016" PRIx64 " decode=%016" PRIx64 "/%016" PRIx64 ")\n",
                     i, measured_prefill_hash, capture_prefill_hash,
                     measured_decode_hash, capture_decode_hash);
-            free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+            free(captured_inputs); free(target_hc);
+            ds4_session_free(source); ds4_session_free(target);
             ds4_tokens_free(&prompt); ds4_engine_close(engine); return 3;
         }
     }
@@ -354,6 +403,9 @@ int main(int argc, char **argv) {
            c.warmup, c.iters, c.decode_token);
     printf("capture_hash prefill=%016" PRIx64 " decode=%016" PRIx64 "\n",
            capture_prefill_hash, capture_decode_hash);
+    printf("scope target_only=layers_%u:%u source_capture=untimed_0:3 "
+           "input_hc_upload=each_chunk_and_decode output_hc_readback=final_prefill_and_decode\n",
+           SLICE_START, SLICE_END);
     printf("timing prefill_wall_ms=%.3f decode_wall_ms=%.3f total_wall_ms=%.3f\n",
            m.prefill_wall_ms / c.iters, m.decode_wall_ms / c.iters,
            (m.prefill_wall_ms + m.decode_wall_ms) / c.iters);
@@ -364,7 +416,8 @@ int main(int argc, char **argv) {
            (double)m.submissions / c.iters, (double)m.waits / c.iters);
     printf("hash_check=PASS\n");
 
-    free(source_hc); free(target_hc); ds4_session_free(source); ds4_session_free(target);
+    free(captured_inputs); free(target_hc);
+    ds4_session_free(source); ds4_session_free(target);
     ds4_tokens_free(&prompt); ds4_engine_close(engine);
     return 0;
 }

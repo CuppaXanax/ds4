@@ -7292,7 +7292,7 @@ static bool ds4gk_routed_common(
         const bool iq2_words = gate_type == 16 && (gate_bytes & 3u) == 0u &&
             (!iq2_words_env || strcmp(iq2_words_env, "0") != 0);
         pc.q2_words = iq2_words ? 1u : 0u;
-        fused_gate_up = iq2_words && (mid_only ||
+        fused_gate_up = !projection_only && iq2_words && (mid_only ||
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
         if (projection_only) {
             VkDescriptorBufferInfo project_buffers[7] = {

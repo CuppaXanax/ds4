@@ -71,5 +71,27 @@ for source_name in ("routed_moe_fused_mid", "routed_moe_down_reduce_q2"):
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {src.name} Wave64: {diagnostics}", file=sys.stderr)
 
+# The routed IQ2 execution-artifact consumer reuses the exact fused source
+# with a different descriptor ABI and tile-addressing macro.  Keep this as a
+# separately named pipeline without duplicating the shader body.
+src = SRC_DIR / "routed_moe_fused_mid.comp"
+for suffix, defines in (
+    ("_exec", ["-DDS4_EXECUTION_ARTIFACT_IQ2=1"]),
+    ("_exec_wave64", ["-DDS4_EXECUTION_ARTIFACT_IQ2=1", "-DDS4_ROUTED_WAVE64=1"]),
+):
+    spv = OUT_DIR / f"routed_moe_fused_mid{suffix}.spv"
+    result = subprocess.run(
+        [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+         *defines, str(src), "-o", str(spv)],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        compiled += 1
+    else:
+        failed += 1
+        diagnostics = "\n".join(part for part in
+                                (result.stdout.strip(), result.stderr.strip()) if part)
+        print(f"FAIL {src.name}{suffix}: {diagnostics}", file=sys.stderr)
+
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

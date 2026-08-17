@@ -556,6 +556,8 @@ static int load_all_shaders(void) {
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
+        {"routed_moe_fused_mid_exec", 68, 9}, /* IQ2 execution-artifact fused mid */
+        {"routed_moe_fused_mid_exec_wave64", 68, 9},
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
     };
@@ -2106,9 +2108,9 @@ static void execution_arena_clear(void) {
 static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
 static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset);
 
-static bool ensure_execution_q8_artifact(
+static bool ensure_execution_artifact(
         const void *model_map, uint64_t model_size, uint64_t source_offset,
-        uint64_t in_dim, uint64_t out_dim,
+        uint64_t in_dim, uint64_t out_dim, uint32_t format,
         decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
     if (!model_map || in_dim == 0 || out_dim == 0) return false;
     if (g_vk.model_map != model_map || g_vk.model_size != model_size)
@@ -2116,15 +2118,15 @@ static bool ensure_execution_q8_artifact(
     auto found = g_vk.execution_artifacts.find(source_offset);
     if (found != g_vk.execution_artifacts.end()) {
         const auto &old = found->second.arena_entry;
-        if (old.in_dim != in_dim || old.out_dim < out_dim ||
-            old.format != DS4_VULKAN_EXEC_Q8_0) return false;
+        if (old.in_dim != in_dim || old.out_dim < out_dim || old.format != format)
+            return false;
         entry = &found->second;
         return true;
     }
     ds4_vulkan_execution_artifact artifact{};
     if (!ds4_vulkan_execution_artifact_build(
             &artifact, model_map, model_size, source_offset, in_dim, out_dim,
-            DS4_VULKAN_EXEC_Q8_0,
+            format,
             g_vk.caps.min_storage_buffer_offset_alignment))
         return false;
     if (!remove_raw_weight_overlap(source_offset, artifact.source_bytes) ||
@@ -2184,6 +2186,23 @@ static bool ensure_execution_q8_artifact(
     ds4_vulkan_execution_artifact_free(&artifact);
     return true;
 }
+
+static bool ensure_execution_q8_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_Q8_0, entry);
+}
+
+static bool ensure_execution_iq2_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_IQ2_XXS, entry);
+}
+
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
 
@@ -2643,6 +2662,34 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
     }
     decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
     return ensure_aligned_weight(m, s, off, idim, odim, entry) || ensure_weight(off, bytes);
+}
+
+int ds4_gpu_cache_iq2_expert_range(const void *m, uint64_t s, uint64_t off,
+                                   uint64_t bytes, uint64_t idim, uint64_t odim,
+                                   const char *label) {
+    (void)label;
+    if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off ||
+        idim == 0 || odim == 0 || idim % 256u != 0 ||
+        odim > UINT64_MAX / (idim / 256u) ||
+        odim * (idim / 256u) > UINT64_MAX / 66u ||
+        bytes != odim * (idim / 256u) * 66u)
+        return 0;
+    set_model_map_identity(m, s);
+    const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
+    if (g_vk.shader_map.find("routed_moe_fused_mid_exec") == g_vk.shader_map.end() ||
+        (exec_env && strcmp(exec_env, "0") == 0))
+        return ensure_weight(off, bytes);
+    decltype(g_vk.execution_artifacts)::mapped_type *entry = nullptr;
+    if (ensure_execution_iq2_artifact(m, s, off, idim, odim, entry)) {
+        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+            fprintf(stderr,
+                    "ds4: [trace] routed IQ2 execution artifact off=%llu in=%llu out=%llu\n",
+                    (unsigned long long)off, (unsigned long long)idim,
+                    (unsigned long long)odim);
+        return 1;
+    }
+    if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2")) return 0;
+    return ensure_weight(off, bytes);
 }
 
 void ds4_gpu_release_q8_f16_cache(void) {
@@ -7122,6 +7169,13 @@ static bool ds4gk_routed_mid_only_appliance(
         return false;
     const char *iq2_words = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
     if (iq2_words && strcmp(iq2_words, "0") == 0) return false;
+    const char *exec_test = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2_TEST");
+    if (exec_test && strcmp(exec_test, "1") == 0 &&
+        gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 256u && expert_mid_dim == 256u &&
+        out_dim == 256u && n_total_expert == 1u && n_expert == 1u)
+        return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
+            get_cmd_ctx().layer_batch_active && n_tokens == 1u;
     return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
         get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
         gate_type == 16u && down_type == 10u &&
@@ -7175,8 +7229,10 @@ static void ds4gk_routed_output_barrier(
     const bool down_reduce = shader_name &&
         (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
-    add(down_reduce
-            ? 3u : 4u);
+    const bool exec_mid = shader_name &&
+        (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+         strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
+    add(down_reduce ? 3u : exec_mid ? 6u : 4u);
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
         add(5);
         add(6);
@@ -7213,9 +7269,11 @@ static void ds4gk_routed_input_barrier(
     const bool down_reduce = shader_name &&
         (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
+    const bool exec_mid = shader_name &&
+        (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+         strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
     if (pc.mode == 1u || pc.mode == 3u) {
-        add(down_reduce
-                ? 2u : 3u); /* selected IDs */
+        add(exec_mid ? 5u : (down_reduce ? 2u : 3u)); /* selected IDs */
     }
     if (pc.mode == 2u) add(2);                  /* router weights */
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
@@ -7223,6 +7281,9 @@ static void ds4gk_routed_input_barrier(
     if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid") == 0 ||
                         strcmp(shader_name, "routed_moe_fused_mid_wave64") == 0))
         add(5);                                 /* compact fused weights */
+    if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+                        strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0))
+        add(7);                                 /* artifact weights */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_input_dependency");
     vkCmdPipelineBarrier(ctx.cmd,
@@ -7417,6 +7478,31 @@ static bool ds4gk_routed_common(
 
     VkDescriptorBufferInfo x_info, out_info, gate_info, up_info, mid_info, exp_info;
     VkDescriptorBufferInfo gate_model, up_model, down_model;
+    decltype(g_vk.execution_artifacts)::mapped_type *gate_execution = nullptr;
+    decltype(g_vk.execution_artifacts)::mapped_type *up_execution = nullptr;
+    const char *iq2_execution_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
+    bool use_iq2_execution = mid_only && gate_type == 16u &&
+        g_vk.shader_map.find("routed_moe_fused_mid_exec") != g_vk.shader_map.end() &&
+        !(iq2_execution_env && strcmp(iq2_execution_env, "0") == 0);
+    if (use_iq2_execution) {
+        auto gate_found = g_vk.execution_artifacts.find(gate_offset);
+        auto up_found = g_vk.execution_artifacts.find(up_offset);
+        const uint64_t artifact_rows = (uint64_t)n_total_expert * expert_mid_dim;
+        use_iq2_execution = gate_found != g_vk.execution_artifacts.end() &&
+            up_found != g_vk.execution_artifacts.end() &&
+            gate_found->second.arena_entry.format == DS4_VULKAN_EXEC_IQ2_XXS &&
+            up_found->second.arena_entry.format == DS4_VULKAN_EXEC_IQ2_XXS &&
+            gate_found->second.arena_entry.in_dim == expert_in_dim &&
+            up_found->second.arena_entry.in_dim == expert_in_dim &&
+            gate_found->second.arena_entry.out_dim >= artifact_rows &&
+            up_found->second.arena_entry.out_dim >= artifact_rows;
+        if (use_iq2_execution) {
+            gate_execution = &gate_found->second;
+            up_execution = &up_found->second;
+        } else if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2")) {
+            return false;
+        }
+    }
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
         (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
@@ -7427,8 +7513,9 @@ static bool ds4gk_routed_common(
         return false;
     if (add_in && !ds4gk_routed_buffer(add_in, add_info)) return false;
     if (!add_in) add_info = out_info;
-    if (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
-        !ds4gk_routed_model(up_offset, gate_bytes, up_model) ||
+    if ((!use_iq2_execution &&
+         (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
+          !ds4gk_routed_model(up_offset, gate_bytes, up_model))) ||
         !ds4gk_routed_model(down_offset, down_bytes, down_model))
         return false;
 
@@ -7551,17 +7638,47 @@ static bool ds4gk_routed_common(
         fused_gate_up = iq2_words && (mid_only ||
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
         if (mid_only) {
-            VkDescriptorBufferInfo fused_buffers[7] = {
-                q8_info, gate_model, up_model, selected_info,
-                compact_mid_q8_info,
-                weights_info, iq2_lut_info};
-            const char *fused_mid_shader = ds4gk_routed_shape_shader(
-                "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
-            ok = ds4gk_routed_dispatch_shader(
-                fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
-                fused_buffers, 7,
-                (expert_mid_dim + 255u) / 256u,
-                n_tokens, n_expert, sets);
+            if (use_iq2_execution) {
+                VkDescriptorBufferInfo fused_buffers[9] = {
+                    q8_info,
+                    {g_vk.execution_arena_buffer,
+                     (VkDeviceSize)(gate_execution->arena_entry.data_offset +
+                                    gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE]),
+                     (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {g_vk.execution_arena_buffer,
+                     (VkDeviceSize)(gate_execution->arena_entry.data_offset +
+                                    gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD]),
+                     (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {g_vk.execution_arena_buffer,
+                     (VkDeviceSize)(up_execution->arena_entry.data_offset +
+                                    up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE]),
+                     (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {g_vk.execution_arena_buffer,
+                     (VkDeviceSize)(up_execution->arena_entry.data_offset +
+                                    up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD]),
+                     (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    selected_info, compact_mid_q8_info, weights_info, iq2_lut_info};
+                const char *fused_mid_shader = ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid_exec",
+                    "routed_moe_fused_mid_exec_wave64");
+                ok = ds4gk_routed_dispatch_shader(
+                    fused_mid_shader, "gate_up_swiglu_iq2_q8_exec", pc,
+                    fused_buffers, 9,
+                    (expert_mid_dim + 255u) / 256u,
+                    n_tokens, n_expert, sets);
+            } else {
+                VkDescriptorBufferInfo fused_buffers[7] = {
+                    q8_info, gate_model, up_model, selected_info,
+                    compact_mid_q8_info,
+                    weights_info, iq2_lut_info};
+                const char *fused_mid_shader = ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
+                ok = ds4gk_routed_dispatch_shader(
+                    fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
+                    fused_buffers, 7,
+                    (expert_mid_dim + 255u) / 256u,
+                    n_tokens, n_expert, sets);
+            }
         } else if (fused_gate_up) {
             VkDescriptorBufferInfo fused_buffers[9] = {
                 q8_info, gate_model, up_model, selected_info, gate_info,

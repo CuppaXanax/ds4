@@ -3013,6 +3013,17 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     return true;
 }
 
+static bool accelerator_tensor_name_contains(const ds4_tensor *t,
+                                             const char *needle) {
+    if (!t || !needle) return false;
+    const size_t needle_len = strlen(needle);
+    if (needle_len == 0 || t->name.len < needle_len) return false;
+    for (size_t i = 0; i + needle_len <= t->name.len; i++) {
+        if (memcmp(t->name.ptr + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
 static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
                                          const uint64_t *span_offsets,
                                          const uint64_t *span_sizes,
@@ -3033,6 +3044,21 @@ static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
                     (int)t->name.len, t->name.ptr);
             return false;
         }
+#ifdef DS4_VULKAN_BUILD
+        if (t->type == DS4_TENSOR_IQ2_XXS && t->ndim == 3 &&
+            (accelerator_tensor_name_contains(t, "ffn_gate_exps") ||
+             accelerator_tensor_name_contains(t, "ffn_up_exps"))) {
+            if (t->dim[1] == 0 || t->dim[2] == 0 ||
+                t->dim[2] > UINT64_MAX / t->dim[1] ||
+                ds4_gpu_cache_iq2_expert_range(
+                    m->map, m->size, t->abs_offset, t->bytes,
+                    t->dim[0], t->dim[1] * t->dim[2], label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to cache routed IQ2 tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+        }
+#endif
     }
     return true;
 }

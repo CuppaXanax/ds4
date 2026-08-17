@@ -42,6 +42,9 @@ extern "C" int ds4_gpu_matmul_q8_0_prequant_tensor(
 
 namespace {
 
+static uint32_t g_iterations = 10;
+static bool g_routed_only = false;
+
 constexpr uint32_t kLayer = 4;
 constexpr uint32_t kQ8In = 4096;
 constexpr uint32_t kQ8Out = 4096;
@@ -248,7 +251,7 @@ static int run_q8_case(const char *label, uint32_t in_dim, uint32_t out_dim,
     std::printf("roofline_c %s path=production_aligned_artifact "
                 "shader=matmul_q8_0_aligned_bfe\n", label);
     uint64_t baseline = 0;
-    for (int iter = 0; iter < 2; ++iter) {
+    for (uint32_t iter = 0; iter < g_iterations; ++iter) {
         if (!ds4_gpu_begin_commands()) return 1;
         ds4_gpu_timeline_layer_begin(kLayer);
         const int quant_ok = ds4_gpu_quantize_q8_0_tensor(q8, x, in_dim, 1);
@@ -310,7 +313,7 @@ static int run_routed(void) {
                 (unsigned long long)(2 * kGateTableBytes + kDownTableBytes),
                 (unsigned long long)(2 * kSelectedGateBytes + kSelectedDownBytes));
     uint64_t baseline = 0;
-    for (int iter = 0; iter < 2; ++iter) {
+    for (uint32_t iter = 0; iter < g_iterations; ++iter) {
         if (!ds4_gpu_batch_layer_begin(kLayer)) return 1;
         ds4_gpu_timeline_layer_begin(kLayer);
         const int ok = ds4_gpu_routed_moe_one_tensor(
@@ -340,7 +343,24 @@ static int run_routed(void) {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--routed-only") == 0) {
+            g_routed_only = true;
+        } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            const unsigned long value = std::strtoul(argv[++i], nullptr, 10);
+            if (value == 0 || value > 1000) {
+                std::fprintf(stderr, "roofline_c: --iters must be 1..1000\n");
+                return 2;
+            }
+            g_iterations = (uint32_t)value;
+        } else {
+            std::fprintf(stderr,
+                         "usage: %s [--routed-only] [--iters 1..1000]\n",
+                         argv[0]);
+            return 2;
+        }
+    }
     if (!std::getenv("DS4_VULKAN_TIMELINE_LAYER"))
         setenv("DS4_VULKAN_TIMELINE_LAYER", "4", 1);
     setenv("DS4_VULKAN_TRACE_KERNELS", "1", 1);
@@ -349,7 +369,7 @@ int main() {
         std::fprintf(stderr, "roofline_c: ds4_gpu_init failed\n");
         return 2;
     }
-    const int q8_rc = run_q8();
+    const int q8_rc = g_routed_only ? 0 : run_q8();
     const int routed_rc = q8_rc == 0 ? run_routed() : 1;
     ds4_gpu_cleanup();
     if (q8_rc != 0 || routed_rc != 0) {

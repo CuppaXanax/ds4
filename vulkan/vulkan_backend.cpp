@@ -345,10 +345,15 @@ static void timeline_barrier(VulkanCommandCtx &ctx, const char *name);
 static bool hazard_tracker_enabled(const VulkanCommandCtx &ctx) {
     const char *env = getenv("DS4_VULKAN_HAZARD_TRACKER");
     /* Allocation aliases are conservatively recognized when VMA owns both
-     * handles, but the model-wide external buffer is not represented by a
-     * VmaAllocation in this backend.  Keep promotion opt-in until that last
-     * alias class has an explicit identity. */
-    if (!env || strcmp(env, "1") != 0) return false;
+     * handles. The model-wide external buffer is read-only, and all views of
+     * it share one VkBuffer handle, so range overlap remains explicit. */
+    /* The complete GFX1013 suite passed with tracking enabled. Make it the
+     * bounded worker-slice contract while retaining an explicit kill switch
+     * and the legacy layer/unbatched path. A slice is the only scope large
+     * enough for barrier elimination to address the orchestration budget. */
+    if (env && strcmp(env, "0") == 0) return false;
+    if ((!env || strcmp(env, "1") != 0) && !ctx.slice_batch_active)
+        return false;
     /* Keep the optimization scoped to the bounded worker/layer graph.  The
      * legacy path remains unchanged outside an explicit lifetime scope. */
     return ctx.layer_batch_active || ctx.slice_batch_active;

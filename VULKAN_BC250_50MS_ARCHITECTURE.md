@@ -206,9 +206,11 @@ never rewritten while a submitted command buffer can reference them.  The
 recording-generation key prevents reuse across command-buffer generations and
 unsubmitted validation allocations are returned safely.
 
-The hazard tracker is deliberately opt-in (`DS4_VULKAN_HAZARD_TRACKER=1`) and
-also requires an active layer or worker-slice batch.  Outside that explicit
-scope the established blanket-barrier path is unchanged.  Unknown shader
+The hazard tracker is now the default inside a bounded worker-slice batch
+after the complete 89-test GFX1013 suite passed with it enabled. Setting
+`DS4_VULKAN_HAZARD_TRACKER=0` is the explicit kill switch; ordinary layer and
+unbatched execution retain the established blanket-barrier path unless
+explicitly opted in. Unknown shader
 interfaces and allocation aliases are conservative; routed dispatches retain
 their existing explicit input/output barriers.  This branch is therefore
 passed the complete BC-250 Vulkan harness on `.53`: 89 tests passed and zero

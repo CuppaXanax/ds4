@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "runtime_lkg": {
+    "branch": "pr-557-merge",
+    "commit": "8fb6bd9039dd207dd852c90b585742efff01d6a6",
+    "tree": "1076b98610160e25f3e6ffe12bc63cf6086ec380",
+    "fleet_binary_sha256": "f0d32af04aade31505ecb698514d703a2569c772fe1c98258e29d525455bb028",
+    "runtime_shader_count": 62,
+    "historical_decode_tps_range": [5.1, 5.5],
+    "canonical_baseline_score": null
+  },
+  "model": {
+    "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+    "default_path": "/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+  },
+  "topology": {
+    "blades": 12,
+    "compute_units_per_blade": 24,
+    "coordinator": {"host": "192.168.42.42", "layers": "0:3"},
+    "workers": [
+      {"host": "192.168.42.43", "layers": "4:7"},
+      {"host": "192.168.42.44", "layers": "8:11"},
+      {"host": "192.168.42.45", "layers": "12:15"},
+      {"host": "192.168.42.46", "layers": "16:19"},
+      {"host": "192.168.42.47", "layers": "20:23"},
+      {"host": "192.168.42.48", "layers": "24:27"},
+      {"host": "192.168.42.49", "layers": "28:31"},
+      {"host": "192.168.42.50", "layers": "32:35"},
+      {"host": "192.168.42.51", "layers": "36:38"},
+      {"host": "192.168.42.52", "layers": "39:40"},
+      {"host": "192.168.42.53", "layers": "41:output"}
+    ]
+  },
+  "benchmark": {
+    "tool": "ds4-bench",
+    "prompt_path": "tests/long_context_story_prompt.txt",
+    "prompt_sha256": "3b2b09a2403a8a255632bf82f364264fb670fccee9fcd4b57739219c1a3c24ad",
+    "ctx_start": 4096,
+    "ctx_max": 4096,
+    "ctx_alloc": 128000,
+    "gen_tokens": 512,
+    "gen_steady_tokens": 511,
+    "repetitions": 3,
+    "fleet_identity_max_age_seconds": 900,
+    "weight_budget_gib": 11,
+    "dist_activation_bits": 32,
+    "primary_metric": "gen_steady_tps",
+    "first_milestone_tps": 10.0,
+    "target_tps": 20.0
+  },
+  "promotion": {
+    "regression_ratio": 0.99,
+    "automatic_eligibility_ratio": 1.03,
+    "requires_exact_artifact_match": true,
+    "requires_activation_evidence": true,
+    "requires_user_approval": true
+  },
+  "archives": [
+    {
+      "path": "D:/cuppaxanax/github/bc-250-dbg/archives/codex-experiments-2026-08-17.bundle",
+      "sha256": "02ce65f0af09fb57951418380caa5c8d71c773f59b799d8c01139dfc1c1716fd",
+      "refs": 65
+    },
+    {
+      "path": "D:/cuppaxanax/github/bc-250-dbg/archives/iq2-repacked-contaminated-2026-08-17.bundle",
+      "sha256": "c4aac0ca9379225d24423ecfb9079809fe64002a1ea3e1dfa38d29ff09d15d73",
+      "refs": 1
+    }
+  ]
+}

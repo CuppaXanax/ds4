@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+if [ "${DS4_USER_APPROVED_PUSH:-}" != "1" ]; then
+    echo "Refusing every push without human DS4_USER_APPROVED_PUSH=1." >&2
+    exit 1
+fi

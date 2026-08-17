@@ -35,5 +35,6 @@
 __pycache__/
 *.pyc
 /misc/
+/performance/bc250/evidence/
 .*.swp
 .DS_Store

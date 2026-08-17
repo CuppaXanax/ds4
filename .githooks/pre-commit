@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+branch="$(git branch --show-current)"
+worktree_count="$(git worktree list --porcelain | grep -c '^worktree ' || true)"
+if [ "$worktree_count" -ne 1 ]; then
+    echo "Refusing commit with $worktree_count worktrees; the BC-250 contract permits one." >&2
+    exit 1
+fi
+
+extra_branches="$(git for-each-ref --format='%(refname:short)' refs/heads/ |
+    grep -Ev '^(main|pr-557-merge)$' || true)"
+extra_count="$(printf '%s\n' "$extra_branches" | grep -c . || true)"
+if [ "$extra_count" -gt 1 ]; then
+    echo "Refusing commit with more than one candidate branch:" >&2
+    echo "$extra_branches" >&2
+    exit 1
+fi
+
+if [ "$branch" != "pr-557-merge" ]; then
+    exit 0
+fi
+
+outside_system="$(git diff --cached --name-only --diff-filter=ACMRD |
+    grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/)' || true)"
+if [ -z "$outside_system" ]; then
+    exit 0
+fi
+
+if [ "${DS4_USER_APPROVED_PROMOTION:-}" != "1" ]; then
+    echo "Refusing runtime commit directly to pr-557-merge." >&2
+    echo "Staged runtime paths:" >&2
+    echo "$outside_system" >&2
+    echo "Only the user may set DS4_USER_APPROVED_PROMOTION=1 after reviewing qualifying evidence." >&2
+    exit 1
+fi
+
+evidence="${DS4_PROMOTION_EVIDENCE:-performance/bc250/evidence/current/verdict.json}"
+python3 - "$evidence" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(f"missing promotion evidence: {p}")
+data = json.loads(p.read_text(encoding="utf-8"))
+if data.get("verdict") != "promote_eligible":
+    raise SystemExit(f"promotion evidence verdict is {data.get('verdict')!r}")
+if not data.get("exactness", {}).get("match"):
+    raise SystemExit("promotion evidence does not prove exactness")
+PY

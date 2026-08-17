@@ -511,6 +511,7 @@ static int load_all_shaders(void) {
         {"attention_decode_mixed", 32, 6},
         {"attention_decode_mixed_wave64", 32, 6},
         {"attention_decode_mixed_rope", 76, 6},
+        {"attention_decode_mixed_rope_wave64_512", 76, 6},
         {"attention_mixed_online", 64, 8},
         {"attention_indexed_online_wave64", 108, 8},
         {"attention_decode_raw_batch", 32, 4},
@@ -4334,10 +4335,18 @@ int ds4_gpu_attention_decode_heads_tensor(
         !(wave64_env && strcmp(wave64_env, "0") == 0) &&
         g_vk.shader_map.find("attention_decode_mixed_wave64") !=
             g_vk.shader_map.end();
-    const char *shader_name = use_fused_rope ?
-        "attention_decode_mixed_rope" :
+    const char *rope512_env = getenv("DS4_VULKAN_ATTN_DECODE_ROPE_WAVE64_512");
+    const bool use_fused_rope_wave64_512 = use_fused_rope && head_dim == 512u &&
+        g_decode_attn_rope_fuse.n_rot == 64u &&
+        g_vk.caps.subgroup_size == 64u &&
+        !(rope512_env && strcmp(rope512_env, "0") == 0) &&
+        g_vk.shader_map.find("attention_decode_mixed_rope_wave64_512") !=
+            g_vk.shader_map.end();
+    const char *shader_name = use_fused_rope_wave64_512 ?
+        "attention_decode_mixed_rope_wave64_512" :
+        (use_fused_rope ? "attention_decode_mixed_rope" :
         (use_wave64 ? "attention_decode_mixed_wave64" :
-                      "attention_decode_mixed");
+                      "attention_decode_mixed"));
     DS4_VK_TRACE_KERNEL(shader_name);
     int ok = record_simple_shader(shader_name, &pc,
                                   use_fused_rope ? sizeof(pc) : 32u,

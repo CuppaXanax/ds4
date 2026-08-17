@@ -518,6 +518,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_aligned_bfe", 20, 4},
         {"matmul_q8_0_exec", 20, 4},
         {"matmul_q8_0_exec_128", 20, 4},
+        {"matmul_q8_0_exec_wave64", 20, 4},
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
@@ -3633,8 +3634,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         out_dim == 32768;
     bool use_execution_128 = use_execution && blocks <= 128u &&
         g_vk.shader_map.find("matmul_q8_0_exec_128") != g_vk.shader_map.end();
+    bool use_execution_wave64 = use_execution &&
+        g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
+        g_vk.shader_map.find("matmul_q8_0_exec_wave64") != g_vk.shader_map.end();
     const char *shader_name = use_execution
-        ? (use_execution_128 ? "matmul_q8_0_exec_128" : "matmul_q8_0_exec")
+        ? (use_execution_wave64 ? "matmul_q8_0_exec_wave64"
+           : (use_execution_128 ? "matmul_q8_0_exec_128" : "matmul_q8_0_exec"))
         : (use_wave64
         ? "matmul_q8_0_wave64_bfe"
         : (use_rows2
@@ -3646,6 +3651,13 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
                 ? "matmul_q8_0_aligned" : "matmul_q8_0_aligned_bfe")
             : "matmul_q8_0_prequant"))));
     auto si = g_vk.shader_map.find(shader_name);
+    if (si == g_vk.shader_map.end() && use_execution && use_execution_wave64) {
+        /* A stale shader bundle may omit only the Wave64 artifact variant. */
+        use_execution_wave64 = false;
+        shader_name = use_execution_128 ? "matmul_q8_0_exec_128" :
+                                          "matmul_q8_0_exec";
+        si = g_vk.shader_map.find(shader_name);
+    }
     if (si == g_vk.shader_map.end() && use_wave64) {
         /* A stale shader bundle must preserve the aligned dispatch geometry. */
         use_wave64 = false;

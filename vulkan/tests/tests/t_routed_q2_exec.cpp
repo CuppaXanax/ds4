@@ -71,6 +71,11 @@ static int test_routed_q2_execution_artifact(void) {
     ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
     int result = 1;
     auto cleanup = [&]() {
+        /* Retire the backend's model identity while the synthetic storage is
+         * still alive.  The next test may reuse this allocation address; if
+         * the dangling identity survives, cached execution/artifact state can
+         * be mistaken for the next model and poison later router tests. */
+        ds4_gpu_set_model_map(model.data(), model.size());
         unsetenv("DS4_VULKAN_ROUTED_Q2_EXECUTION");
         unsetenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION");
         unsetenv("DS4_VULKAN_TEST_ROUTED_DOWN_REDUCE");

@@ -739,7 +739,11 @@ static int load_spirv(const std::string &path, std::vector<uint32_t> &out) {
 }
 
 static int create_compute_pipeline(ShaderEntry &entry) {
-    VkDescriptorSetLayoutBinding bindings[9] = {};
+    /* Several fused appliance kernels legitimately bind more than the old
+     * nine-slot helper ceiling (the mixed routed/shared HC tail has twelve).
+     * A fixed stack array silently overflowed here and crashed RADV while
+     * creating the layout, before model loading. */
+    std::vector<VkDescriptorSetLayoutBinding> bindings(entry.binding_count);
     for (uint32_t i = 0; i < entry.binding_count; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -748,7 +752,8 @@ static int create_compute_pipeline(ShaderEntry &entry) {
     }
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = entry.binding_count; dslci.pBindings = bindings;
+    dslci.bindingCount = entry.binding_count;
+    dslci.pBindings = bindings.data();
     VK_CHECK_RAW(vkCreateDescriptorSetLayout(g_vk.device, &dslci, nullptr, &entry.desc_layout));
 
     VkPushConstantRange pr{};

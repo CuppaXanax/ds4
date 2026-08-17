@@ -767,6 +767,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_hc_expand_rows2_bfe", 16, 7},
+        {"matmul_q8_0_hc_expand_add_rows2_bfe", 16, 7},
         {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_group_rows_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
@@ -8747,6 +8748,88 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
     rows = std::min(rows, out_hc->bytes / (hc_values * sizeof(float)));
     if (rows == 0 || rows > UINT32_MAX) return 0;
+
+    /* Opt-in exact appliance candidate: the common single-token Flash shape
+     * can consume routed_out directly while computing the shared Q8 down row,
+     * eliminating shared_out plus the separate HC-expand dispatch.  Keep it
+     * opt-in until the full-model artifact gate measures it; the established
+     * path remains the default and is also the fallback for every other shape.
+     */
+    const bool add_rows2_fuse =
+        getenv("DS4_VULKAN_Q8_HC_ADD_FUSE") != nullptr &&
+        in_dim == 4096u && out_dim == 4096u && n_embd == 4096u &&
+        n_hc == 4u && rows == 1u;
+    if (add_rows2_fuse) {
+        auto shader_it = g_vk.shader_map.find(
+            "matmul_q8_0_hc_expand_add_rows2_bfe");
+        decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        const uint64_t q_bytes = blocks * 36u;
+        const uint64_t records = out_dim * blocks;
+        const uint64_t scale_bytes = (records * 2u + 3u) & ~3ull;
+        const uint64_t payload_bytes = records * 32u;
+        const bool aligned_ok = shader_it != g_vk.shader_map.end() &&
+            ensure_aligned_weight(model_map, model_size, weight_offset,
+                                  in_dim, out_dim, aligned) && aligned &&
+            scale_bytes <= aligned->scale_bytes &&
+            payload_bytes <= aligned->payload_bytes &&
+            (!g_vk.caps.max_storage_buffer_range ||
+             (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
+              payload_bytes <= g_vk.caps.max_storage_buffer_range));
+        if (aligned_ok) {
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(q_bytes);
+            if (q) {
+                auto &ctx = get_cmd_ctx();
+                const bool resume_recording = ctx.recording;
+                int fused_ok = ds4_gpu_quantize_q8_0_tensor(
+                    q, shared_mid, in_dim, 1);
+                VkBuffer xbuf, hbuf, rbuf, sbuf, routed_buf;
+                VkDeviceSize xoff, hoff, roff, soff, routed_off;
+                if (fused_ok && find_tensor_buffer(q, xbuf, xoff) &&
+                    find_tensor_buffer(out_hc, hbuf, hoff) &&
+                    find_tensor_buffer(residual_hc, rbuf, roff) &&
+                    find_tensor_buffer(split, sbuf, soff) &&
+                    find_tensor_buffer(routed_out, routed_buf, routed_off)) {
+                    const VkDeviceSize align =
+                        g_vk.caps.min_storage_buffer_offset_alignment;
+                    if (align && ((xoff | hoff | roff | soff | routed_off) % align) != 0) {
+                        fused_ok = 0;
+                    } else {
+                        VkDescriptorBufferInfo buffers[7] = {
+                            {xbuf, xoff, (VkDeviceSize)q_bytes},
+                            {aligned->gpu.buffer, 0, (VkDeviceSize)scale_bytes},
+                            {aligned->gpu.buffer,
+                             (VkDeviceSize)aligned->payload_offset,
+                             (VkDeviceSize)payload_bytes},
+                            {hbuf, hoff, (VkDeviceSize)hc_values * sizeof(float)},
+                            {rbuf, roff, (VkDeviceSize)hc_values * sizeof(float)},
+                            {sbuf, soff, (VkDeviceSize)mix_hc * sizeof(float)},
+                            {routed_buf, routed_off,
+                             (VkDeviceSize)embd_values * sizeof(float)}};
+                        struct { uint32_t in_dim, out_dim, n_hc, blocks; } pc = {
+                            (uint32_t)in_dim, (uint32_t)out_dim, n_hc,
+                            (uint32_t)blocks};
+                        fused_ok = record_simple_shader(
+                            "matmul_q8_0_hc_expand_add_rows2_bfe", &pc,
+                            sizeof(pc), buffers, 7,
+                            (uint32_t)((out_dim + 1u) / 2u), 1, 1,
+                            resume_recording);
+                    }
+                } else {
+                    fused_ok = 0;
+                }
+                if (ctx.layer_batch_active) {
+                    ds4_gpu_tensor_free(q);
+                } else {
+                    if (fused_ok) fused_ok = submit_and_wait();
+                    else if (ctx.recording && ctx.command_count != 0)
+                        (void)submit_and_wait();
+                    ds4_gpu_tensor_free(q);
+                }
+                if (fused_ok) return 1;
+            }
+        }
+    }
 
     if (ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
                                    weight_offset, in_dim, out_dim,

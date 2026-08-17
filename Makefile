@@ -196,7 +196,7 @@ rocm: strix-halo
 vulkan:
 	cd vulkan/shaders && python3 compile.py
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o vulkan/q8_aligned_artifact.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o vulkan/q8_aligned_artifact.o vulkan/iq2_repacked_artifact.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK="$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK_LIBS="$(VULKAN_LDLIBS)"
@@ -365,8 +365,11 @@ ds4_vulkan.o: vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.h vulkan/shad
 vulkan/q8_aligned_artifact.o: vulkan/q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.h
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/q8_aligned_artifact.cpp
 
-vulkan-roofline-c: vulkan/roofline_c.cpp vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.cpp
+vulkan-roofline-c: vulkan/roofline_c.cpp vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.cpp vulkan/iq2_repacked_artifact.cpp
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD -o $@ $^ $(VULKAN_LDLIBS)
+
+vulkan/iq2_repacked_artifact.o: vulkan/iq2_repacked_artifact.cpp vulkan/iq2_repacked_artifact.h
+	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/iq2_repacked_artifact.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

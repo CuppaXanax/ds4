@@ -18,6 +18,7 @@
 #include "../ds4_gpu.h"
 #include "../ds4_vulkan.h"
 #include "q8_aligned_artifact.h"
+#include "iq2_repacked_artifact.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -230,6 +231,7 @@ static struct {
     };
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
     std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache; /* source offset -> artifact */
+    std::unordered_map<uint64_t, AlignedWeightEntry> iq2_repacked_cache;
     /* Model tensor ranges registered by cache_model_range (metadata only). */
     std::unordered_map<uint64_t, uint64_t> range_registry; /* offset -> bytes */
     uint64_t weight_budget = 40ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
@@ -537,6 +539,7 @@ static int load_all_shaders(void) {
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
+        {"routed_moe_fused_mid_iq2_repacked_wave64", 68, 7},
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
         {"roofline_weight_stream", 12, 2}, /* checksum-only resident weight read */
@@ -1484,6 +1487,9 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, e] : g_vk.aligned_cache)
         if (e.gpu.buffer) vmaDestroyBuffer(g_vk.allocator, e.gpu.buffer, e.gpu.allocation);
     g_vk.aligned_cache.clear();
+    for (auto &[_, e] : g_vk.iq2_repacked_cache)
+        if (e.gpu.buffer) vmaDestroyBuffer(g_vk.allocator, e.gpu.buffer, e.gpu.allocation);
+    g_vk.iq2_repacked_cache.clear();
     g_vk.range_registry.clear();
     /* Destroy the external-host-memory model buffer (no heap budget) */
     if (g_vk.model_buffer) vkDestroyBuffer(g_vk.device, g_vk.model_buffer, nullptr);
@@ -1902,6 +1908,15 @@ static void clear_weight_cache(void) {
         }
         g_vk.aligned_cache.clear();
     }
+    if (!g_vk.iq2_repacked_cache.empty()) {
+        (void)timeline_device_wait_idle("iq2_repacked_cache_clear");
+        for (auto &[offset, entry] : g_vk.iq2_repacked_cache) {
+            timeline_resource_current(TimelineEventKind::BufferFree,
+                                      "iq2_repacked_cache_clear", entry.gpu.size, offset);
+            vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
+        }
+        g_vk.iq2_repacked_cache.clear();
+    }
     g_vk.weight_used = 0;
     g_vk.range_registry.clear();
 }
@@ -2000,6 +2015,9 @@ static void mark_bound_weight_buffers(VkDescriptorBufferInfo *buffers,
             if (entry.buffer == buffers[i].buffer)
                 mark_weight_generation(entry, generation);
         for (auto &[_, entry] : g_vk.aligned_cache)
+            if (entry.gpu.buffer == buffers[i].buffer)
+                mark_weight_generation(entry.gpu, generation);
+        for (auto &[_, entry] : g_vk.iq2_repacked_cache)
             if (entry.gpu.buffer == buffers[i].buffer)
                 mark_weight_generation(entry.gpu, generation);
     }
@@ -2204,6 +2222,7 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
         uint64_t victim = UINT64_MAX;
         uint64_t oldest = UINT64_MAX;
         bool victim_aligned = false;
+        bool victim_iq2 = false;
         for (auto &[candidate, value] : g_vk.aligned_cache) {
             if (candidate == protected_offset ||
             weight_entry_in_use(value.gpu)) continue;
@@ -2211,6 +2230,16 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
                 victim = candidate;
                 oldest = value.gpu.last_used;
                 victim_aligned = true;
+                victim_iq2 = false;
+            }
+        }
+        for (auto &[candidate, value] : g_vk.iq2_repacked_cache) {
+            if (candidate == protected_offset || weight_entry_in_use(value.gpu)) continue;
+            if (value.gpu.last_used < oldest) {
+                victim = candidate;
+                oldest = value.gpu.last_used;
+                victim_aligned = true;
+                victim_iq2 = true;
             }
         }
         for (auto &[candidate, value] : g_vk.weight_cache) {
@@ -2219,9 +2248,17 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
             victim = candidate;
             oldest = value.last_used;
             victim_aligned = false;
+            victim_iq2 = false;
         }
         if (victim == UINT64_MAX) return false;
-        if (victim_aligned) {
+        if (victim_aligned && victim_iq2) {
+            auto it = g_vk.iq2_repacked_cache.find(victim);
+            timeline_resource_current(TimelineEventKind::BufferFree,
+                                      "iq2_repacked_cache_evict", it->second.gpu.size, victim);
+            vmaDestroyBuffer(g_vk.allocator, it->second.gpu.buffer, it->second.gpu.allocation);
+            g_vk.weight_used -= it->second.gpu.size;
+            g_vk.iq2_repacked_cache.erase(it);
+        } else if (victim_aligned) {
             auto it = g_vk.aligned_cache.find(victim);
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "aligned_cache_evict", it->second.gpu.size, victim);
@@ -2314,6 +2351,121 @@ static bool upload_aligned_artifact(const ds4_vulkan_q8_aligned_artifact &artifa
         buf = VK_NULL_HANDLE; alloc = VK_NULL_HANDLE;
     }
     return ok;
+}
+
+/* Upload an offline-built transposed IQ2 artifact through the same staging
+ * path used by the aligned-Q8 cache. */
+static bool upload_iq2_repacked_artifact(
+        const ds4_vulkan_iq2_repacked_artifact &artifact,
+        VkBuffer &buf, VmaAllocation &alloc) {
+    VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = artifact.bytes;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo aci{}; aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaAllocationInfo ai;
+    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buf, &alloc, &ai) != VK_SUCCESS)
+        return false;
+    static VkCommandPool load_pool = VK_NULL_HANDLE;
+    if (load_pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo cpci{}; cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.queueFamilyIndex = g_vk.queue_family;
+        cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (vkCreateCommandPool(g_vk.device, &cpci, nullptr, &load_pool) != VK_SUCCESS) {
+            vmaDestroyBuffer(g_vk.allocator, buf, alloc); return false;
+        }
+    }
+    VkBufferCreateInfo sbci{}; sbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    sbci.size = artifact.bytes; sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo saci{}; saci.usage = VMA_MEMORY_USAGE_AUTO;
+    saci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo sai; VkBuffer sbuf = VK_NULL_HANDLE; VmaAllocation salloc = VK_NULL_HANDLE;
+    bool ok = vmaCreateBuffer(g_vk.allocator, &sbci, &saci, &sbuf, &salloc, &sai) == VK_SUCCESS;
+    if (ok && sai.pMappedData) memcpy(sai.pMappedData, artifact.data, (size_t)artifact.bytes);
+    if (ok) {
+        VkCommandBufferAllocateInfo cbai{}; cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = load_pool; cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cbai.commandBufferCount = 1;
+        VkCommandBuffer cb; ok = vkAllocateCommandBuffers(g_vk.device, &cbai, &cb) == VK_SUCCESS;
+        if (ok) {
+            VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            ok = vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS;
+            if (ok) { VkBufferCopy copy{}; copy.size = artifact.bytes; vkCmdCopyBuffer(cb, sbuf, buf, 1, &copy); ok = vkEndCommandBuffer(cb) == VK_SUCCESS; }
+            VkFence fence = VK_NULL_HANDLE; VkFenceCreateInfo fci{}; fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            if (ok) ok = vkCreateFence(g_vk.device, &fci, nullptr, &fence) == VK_SUCCESS;
+            if (ok) {
+                VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+                std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+                ok = vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS;
+            }
+            if (ok) ok = vkWaitForFences(g_vk.device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+            if (fence) vkDestroyFence(g_vk.device, fence, nullptr);
+            vkFreeCommandBuffers(g_vk.device, load_pool, 1, &cb);
+        }
+    }
+    if (sbuf) vmaDestroyBuffer(g_vk.allocator, sbuf, salloc);
+    if (!ok) {
+        vmaDestroyBuffer(g_vk.allocator, buf, alloc);
+        buf = VK_NULL_HANDLE; alloc = VK_NULL_HANDLE;
+    }
+    return ok;
+}
+
+static bool ensure_iq2_repacked_weight(
+        const void *model_map, uint64_t model_size, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim, uint64_t experts,
+        uint64_t raw_row_bytes,
+        decltype(g_vk.iq2_repacked_cache)::mapped_type *&entry) {
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    auto it = g_vk.iq2_repacked_cache.find(offset);
+    if (it != g_vk.iq2_repacked_cache.end()) {
+        if (it->second.model_map != model_map || it->second.model_size != model_size ||
+            it->second.in_dim != in_dim || it->second.out_dim != out_dim ||
+            it->second.blocks != experts || it->second.payload_offset != raw_row_bytes)
+            return false;
+        it->second.gpu.last_used = ++g_vk.lru_counter;
+        mark_weight_generation(it->second.gpu);
+        entry = &it->second;
+        return true;
+    }
+    ds4_vulkan_iq2_repacked_artifact artifact{};
+    if (!ds4_vulkan_iq2_repacked_build(
+            &artifact, model_map, model_size, offset, in_dim, out_dim, experts,
+            raw_row_bytes, g_vk.caps.min_storage_buffer_offset_alignment))
+        return false;
+    if (!reserve_aligned_weight_budget(artifact.bytes, offset)) {
+        ds4_vulkan_iq2_repacked_free(&artifact);
+        return false;
+    }
+    VkBuffer buf = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE;
+    const bool ok = upload_iq2_repacked_artifact(artifact, buf, alloc);
+    if (ok) {
+        g_vk.iq2_repacked_cache[offset] = {
+            model_map, model_size, offset, in_dim, out_dim,
+            experts, artifact.row_bytes, raw_row_bytes, artifact.bytes,
+            {buf, alloc, artifact.bytes, ++g_vk.lru_counter, false, {}, {}}};
+        mark_weight_generation(g_vk.iq2_repacked_cache[offset].gpu);
+        g_vk.weight_used += artifact.bytes;
+        entry = &g_vk.iq2_repacked_cache.find(offset)->second;
+    }
+    ds4_vulkan_iq2_repacked_free(&artifact);
+    return ok;
+}
+
+static bool ds4gk_iq2_repacked_model(
+        const void *model_map, uint64_t model_size, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim, uint64_t experts,
+        uint64_t raw_row_bytes, VkDescriptorBufferInfo &info,
+        uint64_t &expert_bytes, uint64_t &row_bytes) {
+    decltype(g_vk.iq2_repacked_cache)::mapped_type *entry = nullptr;
+    if (!ensure_iq2_repacked_weight(model_map, model_size, offset, in_dim,
+                                    out_dim, experts, raw_row_bytes, entry))
+        return false;
+    info = {entry->gpu.buffer, 0, entry->gpu.size};
+    expert_bytes = entry->gpu.size / experts;
+    row_bytes = entry->scale_bytes;
+    return info.range != 0;
 }
 
 static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
@@ -6837,6 +6989,23 @@ static bool ds4gk_routed_mid_only_appliance(
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
 }
 
+/* Repacked IQ2 is opt-in and admitted only for the exact BC-250 Flash decode
+ * shape; all other routed calls retain the raw-GGUF descriptor path. */
+static bool ds4gk_routed_iq2_repacked_enabled(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_IQ2_REPACKED");
+    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+        return false;
+    return ds4gk_routed_wave64_enabled() &&
+        g_vk.shader_map.find("routed_moe_fused_mid_iq2_repacked_wave64") !=
+            g_vk.shader_map.end() &&
+        n_tokens == 1u && gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u && out_dim == 4096u &&
+        n_total_expert == 256u && n_expert == 6u;
+}
+
 /* Q2 down has eight q8 blocks for Flash (2048 intermediate values).  The
  * fused appliance assigns six 8-lane slots to each output row, so it can
  * perform the old down reduction and rank-ascending weighted sum in one
@@ -7038,6 +7207,9 @@ static bool ds4gk_routed_common(
     const bool mid_only = ds4gk_routed_mid_only_appliance(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
+    const bool iq2_repacked = mid_only && ds4gk_routed_iq2_repacked_enabled(
+        gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert, n_tokens);
     if (mid_is_f16) *mid_is_f16 = false;
     if (!out || !mid || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
@@ -7125,6 +7297,9 @@ static bool ds4gk_routed_common(
 
     VkDescriptorBufferInfo x_info, out_info, gate_info, up_info, mid_info, exp_info;
     VkDescriptorBufferInfo gate_model, up_model, down_model;
+    VkDescriptorBufferInfo gate_exec_model{}, up_exec_model{};
+    uint64_t exec_gate_expert_bytes = gate_expert_bytes;
+    uint64_t exec_gate_row_bytes = gate_row_bytes;
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
         (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
@@ -7138,6 +7313,18 @@ static bool ds4gk_routed_common(
     if (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
         !ds4gk_routed_model(up_offset, gate_bytes, up_model) ||
         !ds4gk_routed_model(down_offset, down_bytes, down_model))
+        return false;
+    if (iq2_repacked &&
+        (!ds4gk_iq2_repacked_model(model_map, model_size, gate_offset,
+                                    expert_in_dim, expert_mid_dim,
+                                    n_total_expert, gate_row_bytes,
+                                    gate_exec_model, exec_gate_expert_bytes,
+                                    exec_gate_row_bytes) ||
+         !ds4gk_iq2_repacked_model(model_map, model_size, up_offset,
+                                    expert_in_dim, expert_mid_dim,
+                                    n_total_expert, gate_row_bytes,
+                                    up_exec_model, exec_gate_expert_bytes,
+                                    exec_gate_row_bytes)))
         return false;
 
     uint64_t q8_blocks = 0, q8_bytes = 0;
@@ -7209,6 +7396,10 @@ static bool ds4gk_routed_common(
           n_tokens, n_expert, n_total_expert, (uint32_t)gate_expert_bytes,
           (uint32_t)gate_row_bytes, (uint32_t)down_expert_bytes,
              (uint32_t)down_row_bytes, (uint32_t)gate_blocks, clamp, 0, 0};
+    if (iq2_repacked) {
+        pc.gate_expert_bytes = (uint32_t)exec_gate_expert_bytes;
+        pc.gate_row_bytes = (uint32_t)exec_gate_row_bytes;
+    }
     VkDescriptorBufferInfo q8_info, compact_mid_q8_info{}, invalid_info{}, iq2_lut_info;
     ok = ds4gk_routed_iq2_lut_ensure() &&
          ds4gk_routed_buffer(&q8, q8_info) &&
@@ -7260,11 +7451,14 @@ static bool ds4gk_routed_common(
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
         if (mid_only) {
             VkDescriptorBufferInfo fused_buffers[7] = {
-                q8_info, gate_model, up_model, selected_info,
+                q8_info, iq2_repacked ? gate_exec_model : gate_model,
+                iq2_repacked ? up_exec_model : up_model, selected_info,
                 compact_mid_q8_info,
                 weights_info, iq2_lut_info};
-            const char *fused_mid_shader = ds4gk_routed_shape_shader(
-                "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
+            const char *fused_mid_shader = iq2_repacked
+                ? "routed_moe_fused_mid_iq2_repacked_wave64"
+                : ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
             ok = ds4gk_routed_dispatch_shader(
                 fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
                 fused_buffers, 7,

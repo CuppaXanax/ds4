@@ -71,5 +71,21 @@ for source_name in ("routed_moe_fused_mid", "routed_moe_down_reduce_q2"):
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {src.name} Wave64: {diagnostics}", file=sys.stderr)
 
+# Opt-in IQ2 execution-layout candidate.  Host-side repacking transposes
+# q/aux fields across blocks while preserving the exact shader arithmetic.
+src = SRC_DIR / "routed_moe_fused_mid.comp"
+spv = OUT_DIR / "routed_moe_fused_mid_iq2_repacked_wave64.spv"
+result = subprocess.run(
+    [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+     "-DDS4_ROUTED_WAVE64=1", "-DDS4_ROUTED_IQ2_REPACKED=1", str(src), "-o", str(spv)],
+    capture_output=True, text=True)
+if result.returncode == 0:
+    compiled += 1
+else:
+    failed += 1
+    diagnostics = "\n".join(part for part in
+                            (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"FAIL {src.name} IQ2 repacked Wave64: {diagnostics}", file=sys.stderr)
+
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

@@ -2166,6 +2166,14 @@ static bool ensure_execution_iq2_artifact(
                                      in_dim, out_dim, DS4_VULKAN_EXEC_IQ2_XXS, entry);
 }
 
+static bool ensure_execution_q2_down_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_Q2_K, entry);
+}
+
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
 

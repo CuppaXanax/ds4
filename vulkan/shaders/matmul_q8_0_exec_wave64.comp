@@ -82,11 +82,19 @@ void main() {
                 i8_at(weight_word, 2u) * x_value2 +
                 i8_at(weight_word, 3u) * x_value3;
 
+            /* First reduce only this lane's source block.  All eight lanes
+             * in the block get the same exact integer dot, so the leader
+             * value can then be broadcast once per block.  The previous
+             * version rebuilt all eight block dots in every lane (64
+             * shuffles here); this preserves the integer/FP32 ordering with
+             * 16 shuffles per row instead of 64. */
+            int own_block_dot = 0;
+            const uint own_base = source_block * 8u;
+            for (uint word = 0u; word < 8u; ++word)
+                own_block_dot += subgroupShuffle(partial, own_base + word);
+
             for (uint block = 0u; block < 8u; ++block) {
-                const uint base = block * 8u;
-                int block_dot = 0;
-                for (uint word = 0u; word < 8u; ++word)
-                    block_dot += subgroupShuffle(partial, base + word);
+                const int block_dot = subgroupShuffle(own_block_dot, block * 8u);
                 if (lane == 0u) {
                     const uint scale_byte = entry * 16u + block * 2u;
                     const uint scale_word = scale_buf[scale_byte >> 2u];

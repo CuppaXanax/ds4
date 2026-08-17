@@ -1,0 +1,121 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/* Q8 execution-artifact shared-down + routed-add + HC post.
+ *
+ * This is the artifact-native counterpart of
+ * matmul_q8_0_hc_expand_add_rows2_bfe.  One Wave64 owns four output rows in
+ * one 256-element artifact tile.  The Q8 integer/block and FP32 reduction
+ * order is the same as matmul_q8_0_exec_wave64; only the final routed add and
+ * HC expansion are moved into the row leader before the result is stored.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) readonly buffer ScaleBuf { uint scale_buf[]; };
+layout(set = 0, binding = 2) readonly buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer HcOutBuf { float out_hc[]; };
+layout(set = 0, binding = 4) readonly buffer ResidualBuf { float residual[]; };
+layout(set = 0, binding = 5) readonly buffer SplitBuf { float split[]; };
+layout(set = 0, binding = 6) readonly buffer RoutedBuf { float routed[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_hc;
+    uint artifact_blocks;
+    uint source_blocks_per_tile;
+} pc;
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(word), int(byte_index * 8u), 8);
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tile = gl_WorkGroupID.x;
+    const uint row_base = tile * 4u;
+    const uint source_block = lane >> 3u;
+    const uint word_slot = lane & 7u;
+    const uint q8_blocks = pc.artifact_blocks * pc.source_blocks_per_tile;
+    const uint x_base = gl_WorkGroupID.z * q8_blocks * 9u;
+    float sums[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    if (pc.in_dim != 4096u || pc.n_hc != 4u ||
+        pc.source_blocks_per_tile != 8u || pc.artifact_blocks == 0u ||
+        row_base >= pc.out_dim)
+        return;
+
+    for (uint artifact_block = 0u;
+         artifact_block < pc.artifact_blocks; ++artifact_block) {
+        const uint x_block = artifact_block * 8u + source_block;
+        const uint x_word = x_base + x_block * 9u + 1u + word_slot;
+        const int x_value0 = i8_at(x_q8_buf[x_word], 0u);
+        const int x_value1 = i8_at(x_q8_buf[x_word], 1u);
+        const int x_value2 = i8_at(x_q8_buf[x_word], 2u);
+        const int x_value3 = i8_at(x_q8_buf[x_word], 3u);
+        const uint x_scale_base = x_base + x_block * 9u;
+
+        for (uint row_in_tile = 0u; row_in_tile < 4u; ++row_in_tile) {
+            const uint row = row_base + row_in_tile;
+            if (row >= pc.out_dim) continue;
+            const uint entry = ((tile * pc.artifact_blocks + artifact_block) * 4u) +
+                               row_in_tile;
+            const uint payload_word = entry * 64u + source_block * 8u + word_slot;
+            const uint weight_word = payload_buf[payload_word];
+            const int partial =
+                i8_at(weight_word, 0u) * x_value0 +
+                i8_at(weight_word, 1u) * x_value1 +
+                i8_at(weight_word, 2u) * x_value2 +
+                i8_at(weight_word, 3u) * x_value3;
+
+            int own_block_dot = 0;
+            const uint own_base = source_block * 8u;
+            for (uint word = 0u; word < 8u; ++word)
+                own_block_dot += subgroupShuffle(partial, own_base + word);
+
+            for (uint block = 0u; block < 8u; ++block) {
+                const int block_dot = subgroupShuffle(own_block_dot, block * 8u);
+                if (lane == 0u) {
+                    const uint scale_byte = entry * 16u + block * 2u;
+                    const uint scale_word = scale_buf[scale_byte >> 2u];
+                    const uint scale_bits =
+                        (scale_word >> ((scale_byte & 3u) * 8u)) & 0xffffu;
+                    const float scale_product = f16tof32(scale_bits) *
+                        uintBitsToFloat(x_q8_buf[x_scale_base + block * 9u]);
+                    sums[row_in_tile] += scale_product * float(block_dot);
+                }
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        const uint comb_base = 2u * pc.n_hc;
+        for (uint row_in_tile = 0u; row_in_tile < 4u; ++row_in_tile) {
+            const uint row = row_base + row_in_tile;
+            if (row >= pc.out_dim) continue;
+            /* Keep the established hc_expand_add_split order: routed first,
+             * shared second, then post multiplication and comb accumulation. */
+            const float block_value = routed[row] + sums[row_in_tile];
+            for (uint dst = 0u; dst < pc.n_hc; ++dst) {
+                float acc = block_value * split[pc.n_hc + dst];
+                for (uint src = 0u; src < pc.n_hc; ++src)
+                    acc += split[comb_base + dst + src * pc.n_hc] *
+                           residual[src * pc.out_dim + row];
+                out_hc[dst * pc.out_dim + row] = acc;
+            }
+        }
+    }
+}

@@ -763,6 +763,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_exec", 20, 4},
         {"matmul_q8_0_exec_128", 20, 4},
         {"matmul_q8_0_exec_wave64", 20, 4},
+        {"matmul_q8_0_exec_hc_expand_add_wave64", 20, 7},
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
@@ -8760,15 +8761,102 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         in_dim == 4096u && out_dim == 4096u && n_embd == 4096u &&
         n_hc == 4u && rows == 1u;
     if (add_rows2_fuse) {
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        /* Prefer the immutable execution artifact used by the ordinary
+         * decode path.  The legacy aligned cache overlaps the same GGUF
+         * range and would evict the artifact; never silently switch storage
+         * representation just because this fusion is enabled. */
+        const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
+        const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
+        const bool execution_candidate =
+            g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
+            !(exec_env && strcmp(exec_env, "0") == 0) &&
+            !(q8_mode && strcmp(q8_mode, "exact") == 0);
+        bool execution_available = false;
+        if (execution_candidate) {
+            auto exec_shader_it = g_vk.shader_map.find(
+                "matmul_q8_0_exec_hc_expand_add_wave64");
+            decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
+            execution_available = ensure_execution_q8_artifact(
+                model_map, model_size, weight_offset, in_dim, out_dim, execution);
+            if (execution_available &&
+                g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
+                exec_shader_it != g_vk.shader_map.end()) {
+                ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+                    blocks * 36u);
+                if (q) {
+                    auto &ctx = get_cmd_ctx();
+                    const bool resume_recording = ctx.recording;
+                    int fused_ok = ds4_gpu_quantize_q8_0_tensor(q, shared_mid,
+                                                                  in_dim, 1);
+                    VkBuffer xbuf, hbuf, rbuf, sbuf, routed_buf;
+                    VkDeviceSize xoff, hoff, roff, soff, routed_off;
+                    if (fused_ok && find_tensor_buffer(q, xbuf, xoff) &&
+                        find_tensor_buffer(out_hc, hbuf, hoff) &&
+                        find_tensor_buffer(residual_hc, rbuf, roff) &&
+                        find_tensor_buffer(split, sbuf, soff) &&
+                        find_tensor_buffer(routed_out, routed_buf, routed_off)) {
+                        const VkDeviceSize align =
+                            g_vk.caps.min_storage_buffer_offset_alignment;
+                        if (align && ((xoff | hoff | roff | soff | routed_off) % align) != 0) {
+                            fused_ok = 0;
+                        } else {
+                            VkDescriptorBufferInfo buffers[7] = {
+                                {xbuf, xoff, (VkDeviceSize)(blocks * 36u)},
+                                {execution->buffer,
+                                 (VkDeviceSize)execution->plane_offset[0],
+                                 (VkDeviceSize)execution->plane_bytes[0]},
+                                {execution->buffer,
+                                 (VkDeviceSize)execution->plane_offset[1],
+                                 (VkDeviceSize)execution->plane_bytes[1]},
+                                {hbuf, hoff, (VkDeviceSize)hc_values * sizeof(float)},
+                                {rbuf, roff, (VkDeviceSize)hc_values * sizeof(float)},
+                                {sbuf, soff, (VkDeviceSize)mix_hc * sizeof(float)},
+                                {routed_buf, routed_off,
+                                 (VkDeviceSize)embd_values * sizeof(float)}};
+                            struct {
+                                uint32_t in_dim, out_dim, n_hc;
+                                uint32_t artifact_blocks, source_blocks_per_tile;
+                            } pc = {(uint32_t)in_dim, (uint32_t)out_dim, n_hc,
+                                    (uint32_t)(blocks / 8u), 8u};
+                            if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                                fprintf(stderr,
+                                        "ds4: [trace] matmul_q8_0_exec_hc_expand_add_wave64 "
+                                        "shape=%llux%llu\n",
+                                        (unsigned long long)in_dim,
+                                        (unsigned long long)out_dim);
+                            fused_ok = record_simple_shader(
+                                "matmul_q8_0_exec_hc_expand_add_wave64", &pc,
+                                sizeof(pc), buffers, 7,
+                                (uint32_t)((out_dim + 3u) / 4u), 1, 1,
+                                resume_recording);
+                        }
+                    } else {
+                        fused_ok = 0;
+                    }
+                    if (ctx.layer_batch_active) {
+                        ds4_gpu_tensor_free(q);
+                    } else {
+                        if (fused_ok) fused_ok = submit_and_wait();
+                        else if (ctx.recording && ctx.command_count != 0)
+                            (void)submit_and_wait();
+                        ds4_gpu_tensor_free(q);
+                    }
+                    if (fused_ok) return 1;
+                }
+            }
+        }
+
         auto shader_it = g_vk.shader_map.find(
             "matmul_q8_0_hc_expand_add_rows2_bfe");
         decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
-        const uint64_t blocks = (in_dim + 31u) / 32u;
         const uint64_t q_bytes = blocks * 36u;
         const uint64_t records = out_dim * blocks;
         const uint64_t scale_bytes = (records * 2u + 3u) & ~3ull;
         const uint64_t payload_bytes = records * 32u;
-        const bool aligned_ok = shader_it != g_vk.shader_map.end() &&
+        const bool aligned_ok = !execution_available &&
+            !execution_artifact_required(ExecQ8) &&
+            shader_it != g_vk.shader_map.end() &&
             ensure_aligned_weight(model_map, model_size, weight_offset,
                                   in_dim, out_dim, aligned) && aligned &&
             scale_bytes <= aligned->scale_bytes &&
@@ -8809,6 +8897,12 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
                         struct { uint32_t in_dim, out_dim, n_hc, blocks; } pc = {
                             (uint32_t)in_dim, (uint32_t)out_dim, n_hc,
                             (uint32_t)blocks};
+                        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                            fprintf(stderr,
+                                    "ds4: [trace] matmul_q8_0_hc_expand_add_rows2_bfe "
+                                    "shape=%llux%llu\n",
+                                    (unsigned long long)in_dim,
+                                    (unsigned long long)out_dim);
                         fused_ok = record_simple_shader(
                             "matmul_q8_0_hc_expand_add_rows2_bfe", &pc,
                             sizeof(pc), buffers, 7,

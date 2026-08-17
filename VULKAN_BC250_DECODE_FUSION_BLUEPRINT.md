@@ -2,11 +2,15 @@
 
 ## What is now staged
 
-`DS4_VULKAN_Q8_HC_ADD_FUSE=1` admits
-`matmul_q8_0_hc_expand_add_rows2_bfe.comp` for the common ratio-4 decode
+`DS4_VULKAN_Q8_HC_ADD_FUSE=1` admits an exact artifact-native Wave64 consumer
+(`matmul_q8_0_exec_hc_expand_add_wave64.comp`) for the common ratio-4 decode
 shared-down shape (`4096 -> 4096`, one token, four HC streams). It computes
 the shared Q8 down row, adds `routed_out`, and performs HC post in one
-workgroup. The arithmetic order is the existing order:
+workgroup. When no immutable Q8 artifact is available, the legacy aligned
+consumer remains an opt-in fallback; enabling this fusion must not evict or
+bypass an execution artifact.
+
+The arithmetic order is the existing order:
 
 ```text
 shared = Q8-down reduction in ascending block order
@@ -16,8 +20,11 @@ out_hc = combined * post + ascending comb/residual sum
 
 The established path remains the default. The candidate removes the
 `shared_out` write/read and one separate `hc_expand_add_split` dispatch, but
-it still consumes `routed_out`; it is therefore a prerequisite/measurement
-gate, not the 0.465 ms/layer claim.
+it still performs the ordinary Q8 activation quantization. Its defensible
+upper bound is therefore the avoided 16 KiB intermediate traffic plus one
+small dispatch, not 0.465 ms/layer; expect a low-tens-of-microseconds class
+win unless the production trace proves otherwise. It is a correctness and
+composition gate, not the larger mixed-Q2/Q8 fusion claim.
 
 ## The >=0.465 ms/layer fusion
 

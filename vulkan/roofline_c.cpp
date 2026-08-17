@@ -30,6 +30,16 @@
 #include <unistd.h>
 #endif
 
+/* Keep the production quantize + aligned-artifact stages visible in the
+ * trace instead of hiding them behind the convenience wrapper. */
+extern "C" int ds4_gpu_quantize_q8_0_tensor(
+    ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+    uint64_t in_dim, uint64_t n_tok);
+extern "C" int ds4_gpu_matmul_q8_0_prequant_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x_q8, uint64_t n_tok);
+
 namespace {
 
 constexpr uint32_t kLayer = 4;
@@ -226,20 +236,26 @@ static int run_q8_case(const char *label, uint32_t in_dim, uint32_t out_dim,
     fill_q8_model(model, 4096, out_dim, blocks, row_bytes);
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(uint64_t(in_dim) * sizeof(float));
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(uint64_t(out_dim) * sizeof(float));
-    if (!x || !out || !ds4_gpu_set_model_map(model, model_size)) return 1;
+    ds4_gpu_tensor *q8 = ds4_gpu_tensor_alloc(uint64_t(blocks) * 36u);
+    if (!x || !out || !q8 || !ds4_gpu_set_model_map(model, model_size)) return 1;
     fill_activation(x, in_dim);
     std::printf("roofline_c family=%s in=%u out=%u blocks=%u "
-                "weight_bytes=%llu useful_weight_bytes=%llu dispatches=1\n",
+                "weight_bytes=%llu useful_weight_bytes=%llu "
+                "dispatches=2 math_dispatches=1\n",
                 label, in_dim, out_dim, blocks,
                 (unsigned long long)weight_bytes,
                 (unsigned long long)weight_bytes);
+    std::printf("roofline_c %s path=production_aligned_artifact "
+                "shader=matmul_q8_0_aligned_bfe\n", label);
     uint64_t baseline = 0;
     for (int iter = 0; iter < 2; ++iter) {
         if (!ds4_gpu_begin_commands()) return 1;
         ds4_gpu_timeline_layer_begin(kLayer);
-        const int ok = ds4_gpu_matmul_q8_0_tensor(
-            out, model, model_size, 4096, in_dim, out_dim, x, 1);
-        ds4_gpu_timeline_stage_end(label);
+        const int quant_ok = ds4_gpu_quantize_q8_0_tensor(q8, x, in_dim, 1);
+        ds4_gpu_timeline_stage_end("q8_quantize_input");
+        const int ok = quant_ok && ds4_gpu_matmul_q8_0_prequant_tensor(
+            out, model, model_size, 4096, in_dim, out_dim, q8, 1);
+        ds4_gpu_timeline_stage_end("matmul_q8_0_aligned_bfe");
         if (!ok || !ds4_gpu_end_commands() || !ds4_gpu_synchronize()) return 1;
         ds4_gpu_timeline_layer_end(kLayer);
         uint64_t hash = 0;
@@ -250,6 +266,7 @@ static int run_q8_case(const char *label, uint32_t in_dim, uint32_t out_dim,
                     label,
                     iter, (unsigned long long)hash);
     }
+    ds4_gpu_tensor_free(q8);
     ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(x);
     model_free(model, model_size);

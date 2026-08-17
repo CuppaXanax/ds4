@@ -7786,11 +7786,11 @@ static void ds4gk_routed_input_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
         uint32_t buffer_count) {
-    VkBufferMemoryBarrier barriers[3] = {};
+    VkBufferMemoryBarrier barriers[5] = {};
     uint32_t count = 0;
     auto add = [&](uint32_t binding) {
         if (binding >= buffer_count || buffers[binding].buffer == VK_NULL_HANDLE ||
-            buffers[binding].range == 0 || count >= 2) return;
+            buffers[binding].range == 0 || count >= 5) return;
         VkBufferMemoryBarrier &barrier = barriers[count++];
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
@@ -7815,6 +7815,8 @@ static void ds4gk_routed_input_barrier(
         add(0u);
         add(1u);
         add(7u);
+        add(10u); /* residual HC state */
+        add(11u); /* HC post/combination coefficients */
     } else if (pc.mode == 1u || pc.mode == 3u) {
         add(execution_down ? 4u : (exec_mid ? 5u : (down_reduce ? 2u : 3u)));
     }
@@ -8114,6 +8116,16 @@ static bool ds4gk_routed_common(
         shared_hc_tail->n_embd == 4096u && shared_hc_tail->n_hc == 4u &&
         g_vk.shader_map.find("routed_moe_q2_shared_hc_exec") !=
             g_vk.shader_map.end();
+    /* The caller's REQUIRE switch is a hard admission gate.  Do not let a
+     * missing Q2/Q8 artifact silently return success through the ordinary
+     * routed path: the C graph would then suppress the later shared-down/HC
+     * dispatch and leave out_hc unwritten while believing the fused tail ran.
+     */
+    const bool require_shared_hc_tail =
+        shared_hc_tail &&
+        getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE") != nullptr;
+    if (require_shared_hc_tail && !use_shared_hc_tail)
+        return false;
     if (use_shared_hc_tail) {
         use_shared_hc_tail = shared_hc_tail->out_hc &&
             shared_hc_tail->shared_mid && shared_hc_tail->residual_hc &&

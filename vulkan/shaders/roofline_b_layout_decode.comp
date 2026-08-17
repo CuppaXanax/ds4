@@ -1,0 +1,127 @@
+#version 460 core
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set=0,binding=0) readonly buffer B0 { uint b0[]; };
+layout(set=0,binding=1) readonly buffer B1 { uint b1[]; };
+layout(set=0,binding=2) readonly buffer B2 { uint b2[]; };
+layout(set=0,binding=3) readonly buffer B3 { uint b3[]; };
+layout(set=0,binding=4) buffer B4 { uint b4[]; };
+layout(set=0,binding=5) readonly buffer B5 { uint b5[]; };
+layout(set=0,binding=6) readonly buffer B6 { uint b6[]; };
+layout(set=0,binding=7) readonly buffer B7 { uint b7[]; };
+layout(push_constant) uniform PC { uint mode; uint gate_type; uint down_type; uint in_dim;
+    uint mid_dim; uint out_dim; uint n_tokens; uint n_selected; uint n_total_expert;
+    uint gate_expert_bytes; uint gate_row_bytes; uint down_expert_bytes; uint down_row_bytes;
+    uint q8_blocks; float clamp_value; uint add_enabled; uint q2_words; } pc;
+shared float q8_values[256];
+shared uint iq2_lut[544];
+shared float rank_values[32];
+
+/* Copied from routed_moe.comp (current production source): the following
+ * byte/half/Q8_K and IQ2_XXS helpers preserve its unpack order and ABI. */
+uint weight_byte(uint at,uint total){if(at>=total)return 0u;return (b1[at>>2u]>>((at&3u)*8u))&255u;}
+uint weight_u32(uint at){uint w=at>>2u,s=(at&3u)*8u,lo=b1[w];return s==0u?lo:(lo>>s)|(b1[w+1u]<<(32u-s));}
+int packed_i8(uint w,uint at){return bitfieldExtract(int(w),int((at&3u)*8u),8);}
+void iq2_grid_words(uint i,out uint lo,out uint hi){lo=b5[i*2u];hi=b5[i*2u+1u];}
+uint iq2_sign_mask(uint i){uint w=b5[512u+(i>>2u)];return(w>>((i&3u)*8u))&255u;}
+int input_i8(uint at){return bitfieldExtract(int(b0[at>>2u]),int((at&3u)*8u),8);}
+float f16(uint h){return unpackHalf2x16(h).x;}
+float q8_value(uint tok,uint block,uint i){uint base=(tok*pc.q8_blocks+block)*73u;return uintBitsToFloat(b0[base])*float(input_i8((base+1u)*4u+i));}
+float iq2_block_dot(uint row_byte,uint tok,uint blocks,uint block){
+ uint wb=row_byte+block*66u,xb=(tok*blocks+block)*73u,dw=weight_byte(wb,0xffffffffu)|(weight_byte(wb+1u,0xffffffffu)<<8u);
+ float d=uintBitsToFloat(b0[xb])*f16(dw);int sum=0;
+ for(uint ib=0u;ib<8u;ib++){uint qb=wb+2u+ib*8u,q=weight_byte(qb,0xffffffffu)|(weight_byte(qb+1u,0xffffffffu)<<8u)|(weight_byte(qb+2u,0xffffffffu)<<16u)|(weight_byte(qb+3u,0xffffffffu)<<24u),a=weight_byte(qb+4u,0xffffffffu)|(weight_byte(qb+5u,0xffffffffu)<<8u)|(weight_byte(qb+6u,0xffffffffu)<<16u)|(weight_byte(qb+7u,0xffffffffu)<<24u),ls=2u*(a>>28u)+1u;
+  for(uint pair=0u;pair<2u;pair++){uint s0=(a>>(14u*pair))&127u,s1=(a>>(14u*pair+7u))&127u,g0=(q>>(16u*pair))&255u,g1=(q>>(16u*pair+8u))&255u,gl0,gh0,gl1,gh1;iq2_grid_words(g0,gl0,gh0);iq2_grid_words(g1,gl1,gh1);uint z0=iq2_sign_mask(s0),z1=iq2_sign_mask(s1);
+   for(uint j=0u;j<8u;j++){int v0=packed_i8(j<4u?gl0:gh0,j),v1=packed_i8(j<4u?gl1:gh1,j);if((z0&(1u<<j))!=0u)v0=-v0;if((z1&(1u<<j))!=0u)v1=-v1;sum+=int(ls)*(v0*input_i8((xb+1u)*4u+ib*32u+pair*16u+j)+v1*input_i8((xb+1u)*4u+ib*32u+pair*16u+8u+j));}
+  }
+ }
+ return 0.125*d*float(sum);
+}
+
+const uint GATE_TOP_BYTES = 12976128u;
+const uint Q80_ROWS = 32768u;
+const uint Q80_ROW_BYTES = 1088u;
+
+/* Benchmark B: one production-layout top-6 decode dispatch. The copied
+ * production routines above provide the exact IQ2_XXS/Q2_K/Q8_K unpack order. */
+uint down_byte(uint at) { return (b2[at >> 2u] >> ((at & 3u) * 8u)) & 255u; }
+uint q80_byte(uint at) { return (b6[at >> 2u] >> ((at & 3u) * 8u)) & 255u; }
+float q80_block_dot(uint row,uint block) {
+        uint wb=row*Q80_ROW_BYTES+block*34u;
+        uint h=q80_byte(wb)|(q80_byte(wb+1u)<<8u);
+        /* aligned_bfe prequant ABI: 9 uint words per Q8_0 activation
+         * block (d + 32 signed bytes), not the routed Q8_K 73-word ABI. */
+        uint xb=block*9u;
+        float d=f16(h)*uintBitsToFloat(b7[xb]);
+        float sum=0.0;for(uint j=0u;j<32u;j++) sum += d*float(bitfieldExtract(int(q80_byte(wb+2u+j)),0,8))*float(bitfieldExtract(int(b7[xb+1u+(j>>2u)]),int((j&3u)*8u),8));
+    return sum;
+}
+float q2_down_dot(uint row_byte, uint block) {
+    uint wb = row_byte + block * 84u;
+    uint xb = block * 73u;
+    uint dw = down_byte(wb+80u) | (down_byte(wb+81u)<<8u);
+    uint dmw = down_byte(wb+82u) | (down_byte(wb+83u)<<8u);
+    float dall = uintBitsToFloat(b0[xb]) * f16(dw);
+    float dmin = uintBitsToFloat(b0[xb]) * f16(dmw);
+    int isum=0, summs=0;
+    for(uint j=0u;j<16u;j++){uint raw=b0[xb+65u+(j>>1u)];int bs=int((j&1u)==0u?raw&65535u:raw>>16u);if(bs>=32768)bs-=65536;summs+=bs*int(down_byte(wb+j)>>4u);}
+    for(uint h=0u;h<2u;h++)for(uint j=0u;j<4u;j++){uint sh=j*2u;uint s0=down_byte(wb+h*8u+j*2u)&15u,s1=down_byte(wb+h*8u+j*2u+1u)&15u;for(uint k=0u;k<16u;k++){uint q0=(down_byte(wb+16u+h*32u+k)>>sh)&3u,q1=(down_byte(wb+16u+h*32u+16u+k)>>sh)&3u;uint xb0=(xb+1u)*4u+h*128u+j*32u;isum+=int(s0)*int(q0)*input_i8(xb0+k);isum+=int(s1)*int(q1)*input_i8(xb0+16u+k);}}
+    return dall*float(isum)-dmin*float(summs);
+}
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    if (pc.mode == 0u) {
+        uint row=gl_WorkGroupID.x; if(row>=Q80_ROWS)return;
+        float local=lane<32u?q80_block_dot(row,lane):0.0;
+        q8_values[lane]=local;
+        barrier();
+        if(lane==0u){float sum=0.0;for(uint block=0u;block<32u;block++)sum+=q8_values[block];b4[row]=floatBitsToUint(sum);}
+        return;
+    }
+    uint rank = pc.mode==1u?gl_WorkGroupID.z:0u;
+    if (rank >= pc.n_selected) return;
+    if (pc.mode==2u) {
+        uint slot=lane/8u, slane=lane&7u, rows_per_group=5u;
+        uint row=gl_WorkGroupID.x*rows_per_group+slot/pc.n_selected;
+        rank=slot%pc.n_selected;
+        uint expert=b3[rank];
+        float local=0.0;
+        if(slot<rows_per_group*pc.n_selected && row<pc.out_dim)
+            for(uint block=slane;block<pc.q8_blocks/2u;block+=8u)
+                local+=q2_down_dot(expert*pc.down_expert_bytes+row*pc.down_row_bytes,block);
+        q8_values[lane]=local;barrier();
+        uint base=slot*8u;for(uint stride=4u;stride>0u;stride>>=1u){if(slane<stride)q8_values[base+slane]+=q8_values[base+slane+stride];barrier();}
+        if(slane==0u && slot<rows_per_group*pc.n_selected && row<pc.out_dim)b4[32768u+48u+gl_WorkGroupID.x*32u+slot]=floatBitsToUint(q8_values[base]);
+        return;
+    }
+    uint block=gl_WorkGroupID.x; if(block>=8u)return;
+    uint expert = b3[rank];
+    if (expert >= pc.n_total_expert) return;
+    float local = 0.0;
+    /* Register checksum work: gate and up are dequantized in production row
+     * order, then the dequantized intermediate is consumed by Q2_K down. */
+    if (pc.mode == 1u) for (uint row = block*256u+lane; row < min(pc.mid_dim,block*256u+256u); row += 256u) {
+        uint gb = expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
+        uint ub =  uint(GATE_TOP_BYTES) + expert * pc.gate_expert_bytes + row * pc.gate_row_bytes;
+        float g = 0.0;
+        float u = 0.0;
+        for (uint block = 0u; block < pc.q8_blocks; ++block) {
+            g += iq2_block_dot(gb, 0u, pc.q8_blocks, block);
+            u += iq2_block_dot(ub, 0u, pc.q8_blocks, block);
+        }
+        local += (g / (1.0 + exp(-g))) * u;
+    }
+    if (false) for (uint row = lane; row < pc.out_dim; row += 256u) {
+        uint db = expert * pc.down_expert_bytes + row * pc.down_row_bytes;
+        float d = 0.0;
+        for (uint block = 0u; block < pc.q8_blocks / 2u; ++block)
+            d += q2_down_dot(db, block);
+        local += d;
+    }
+    /* Dense Q8_K activation decode is part of the routed access stream. */
+    for (uint block=0u; block<pc.q8_blocks; ++block)
+        local += q8_value(0u, block, lane & 255u) * 1.0e-6;
+    q8_values[lane] = local;
+    barrier();
+    for (uint stride=128u; stride>0u; stride>>=1u) { if (lane<stride) q8_values[lane]+=q8_values[lane+stride]; barrier(); }
+    if (lane == 0u) b4[32768u+rank*8u+block] = floatBitsToUint(q8_values[0]);
+}

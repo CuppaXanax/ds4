@@ -111,6 +111,19 @@ struct TimelineEvent {
     uint32_t count = 0;
 };
 
+/* Per-command-buffer storage hazards.  The old backend put a global
+ * compute->compute barrier after every dispatch.  Keep the access footprint
+ * of each recorded dispatch instead, and insert a range barrier only when a
+ * later dispatch overlaps an earlier write (RAW/WAR/WAW).  A range is tied
+ * to its VkBuffer and views naturally share that handle; allocation aliases
+ * are treated conservatively as a global dependency (see below). */
+struct HazardAccess {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    bool write = false;
+};
+
 static constexpr uint32_t DS4_VK_COMMAND_RING_SIZE = 4;
 static constexpr uint32_t DS4_VK_TIMELINE_QUERY_COUNT = 2048;
 static constexpr uint64_t DS4_VK_TIMELINE_MAX_DISPATCHES =
@@ -168,6 +181,10 @@ struct VulkanCommandCtx {
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
     bool slice_batch_active = false;
+    std::vector<HazardAccess> hazard_accesses;
+    uint64_t hazard_barriers_emitted = 0;
+    uint64_t hazard_barriers_elided = 0;
+    uint64_t hazard_unknown_dispatches = 0;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
@@ -320,6 +337,191 @@ static struct {
 } g_vk;
 
 static void execution_arena_clear(void);
+static void timeline_barrier(VulkanCommandCtx &ctx, const char *name);
+
+static bool hazard_tracker_enabled(const VulkanCommandCtx &ctx) {
+    const char *env = getenv("DS4_VULKAN_HAZARD_TRACKER");
+    /* Allocation aliases are conservatively recognized when VMA owns both
+     * handles, but the model-wide external buffer is not represented by a
+     * VmaAllocation in this backend.  Keep promotion opt-in until that last
+     * alias class has an explicit identity. */
+    if (!env || strcmp(env, "1") != 0) return false;
+    /* Keep the optimization scoped to the bounded worker/layer graph.  The
+     * legacy path remains unchanged outside an explicit lifetime scope. */
+    return ctx.layer_batch_active || ctx.slice_batch_active;
+}
+
+static uint64_t hazard_all_bindings(uint32_t count) {
+    return count >= 64 ? UINT64_MAX : (count == 0 ? 0 : (1ull << count) - 1ull);
+}
+
+/* Writable storage bindings, derived from the source shader interfaces.  A
+ * missing entry is deliberately conservative: treating every binding as a
+ * write can only retain a barrier, never make a dependency unsafe. */
+static uint64_t hazard_write_mask(const char *name, uint32_t count,
+                                  bool &known) {
+    known = true;
+    const uint64_t all = hazard_all_bindings(count);
+    if (!name || !name[0]) { known = false; return all; }
+    if (!strncmp(name, "routed_moe", 10)) {
+        /* Routed dispatches already carry explicit input/output range
+         * barriers, including host-produced selected IDs. */
+        return 0;
+    }
+    if (!strncmp(name, "attention", 9) ||
+        !strncmp(name, "indexer_scores", 14) ||
+        !strncmp(name, "indexer_topk", 12) ||
+        !strcmp(name, "indexer_qat") || !strcmp(name, "topk_mask"))
+        return 1ull;
+    if (!strcmp(name, "router_select")) return all & 7ull;
+    if (!strcmp(name, "group_copy")) return 1ull << 1;
+    if (!strcmp(name, "add_f32")) return 1ull << 2;
+    if (!strcmp(name, "swiglu")) return 1ull << 2;
+    if (!strcmp(name, "quantize_q8_0_prequant")) return 1ull << 1;
+    if (!strcmp(name, "fill_f32") || !strcmp(name, "fp8_kv_quantize") ||
+        !strcmp(name, "compressor_rope_stride") ||
+        !strcmp(name, "head_rms_norm") ||
+        !strcmp(name, "head_rms_norm_rope_tail") ||
+        !strcmp(name, "rope_tail") || !strcmp(name, "store_raw_kv_f16"))
+        return 1ull;
+    if (!strcmp(name, "compressor_clear") ||
+        !strcmp(name, "compressor_shift_ratio4")) return all;
+    if (!strcmp(name, "compressor_pool") ||
+        !strcmp(name, "compressor_pool_state") ||
+        !strcmp(name, "hc_expand") || !strcmp(name, "hc_weighted_sum") ||
+        !strcmp(name, "output_hc_weights")) return 1ull;
+    if (!strcmp(name, "compressor_set_rows") ||
+        !strcmp(name, "compressor_store") ||
+        !strcmp(name, "hc_split_weighted_sum")) return all & 7ull;
+    if (!strncmp(name, "matmul_q8_0_hc_expand_rows2", 27))
+        return all & ((1ull << 3) | (1ull << 4));
+    if (!strncmp(name, "matmul", 6) ||
+        !strncmp(name, "rms_norm", 8))
+        return count ? 1ull << (count - 1) : 0;
+    /* These are the only shader names not covered by the patterns above in
+     * the current generated shader table.  Keep future additions safe. */
+    known = false;
+    return all;
+}
+
+static VmaAllocation hazard_allocation_for_buffer(VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    for (const auto &[_, header] : g_vk.tensor_headers)
+        if (header && header->buffer == buffer) return header->allocation;
+    for (const auto &[_, value] : g_vk.weight_cache)
+        if (value.buffer == buffer) return value.allocation;
+    for (const auto &[_, value] : g_vk.aligned_cache)
+        if (value.gpu.buffer == buffer) return value.gpu.allocation;
+    for (const auto &[_, value] : g_vk.execution_artifacts)
+        if (value.buffer == buffer) return value.allocation;
+    return VK_NULL_HANDLE;
+}
+
+static bool hazard_buffers_alias(VkBuffer left, VkBuffer right) {
+    if (left == right) return true;
+    const VmaAllocation la = hazard_allocation_for_buffer(left);
+    const VmaAllocation ra = hazard_allocation_for_buffer(right);
+    /* Distinct buffers sharing an allocation are an alias even when their
+     * VkBuffer handles differ.  We conservatively consider the full
+     * allocation overlapping because VMA does not expose a stable per-view
+     * base offset through this ABI. */
+    return la != VK_NULL_HANDLE && la == ra;
+}
+
+static bool hazard_ranges_overlap(const HazardAccess &old_access,
+                                  const VkDescriptorBufferInfo &current) {
+    if (!hazard_buffers_alias(old_access.buffer, current.buffer)) return false;
+    if (old_access.buffer != current.buffer) return true;
+    if (old_access.size == VK_WHOLE_SIZE || current.range == VK_WHOLE_SIZE)
+        return true;
+    if (old_access.offset > UINT64_MAX - old_access.size ||
+        current.offset > UINT64_MAX - current.range) return true;
+    const uint64_t old_end = (uint64_t)old_access.offset + old_access.size;
+    const uint64_t current_end = (uint64_t)current.offset + current.range;
+    return (uint64_t)old_access.offset < current_end &&
+           (uint64_t)current.offset < old_end;
+}
+
+static void hazard_dependency(VulkanCommandCtx &ctx, const char *name,
+                              VkDescriptorBufferInfo *buffers, uint32_t count) {
+    if (!hazard_tracker_enabled(ctx)) return;
+    bool known = false;
+    const uint64_t writes = hazard_write_mask(name, count, known);
+    if (!known) ctx.hazard_unknown_dispatches++;
+    bool needs_barrier = false;
+    bool alias_barrier = false;
+    for (uint32_t i = 0; i < count; i++) {
+        const bool current_write = (writes & (1ull << i)) != 0;
+        for (const HazardAccess &old_access : ctx.hazard_accesses) {
+            if (!hazard_ranges_overlap(old_access, buffers[i])) continue;
+            if (old_access.write && (current_write || !current_write)) {
+                needs_barrier = true;
+                alias_barrier |= old_access.buffer != buffers[i].buffer;
+            } else if (current_write && !old_access.write) {
+                needs_barrier = true;
+                alias_barrier |= old_access.buffer != buffers[i].buffer;
+            }
+        }
+    }
+    if (!needs_barrier) {
+        ctx.hazard_barriers_elided++;
+        return;
+    }
+
+    std::vector<VkBufferMemoryBarrier> barriers;
+    bool global = alias_barrier;
+    for (uint32_t i = 0; i < count && !global; i++) {
+        const bool current_write = (writes & (1ull << i)) != 0;
+        VkAccessFlags src = 0, dst = current_write
+            ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+        for (const HazardAccess &old_access : ctx.hazard_accesses) {
+            if (!hazard_ranges_overlap(old_access, buffers[i])) continue;
+            if (!old_access.write && !current_write) continue;
+            src |= old_access.write ? VK_ACCESS_SHADER_WRITE_BIT
+                                    : VK_ACCESS_SHADER_READ_BIT;
+        }
+        if (src == 0) continue;
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = src;
+        barrier.dstAccessMask = dst;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffers[i].buffer;
+        barrier.offset = buffers[i].offset;
+        barrier.size = buffers[i].range;
+        barriers.push_back(barrier);
+    }
+    timeline_barrier(ctx, "resource_hazard_dependency");
+    if (global || barriers.empty()) {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &barrier, 0, nullptr, 0, nullptr);
+    } else {
+        vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                             nullptr, (uint32_t)barriers.size(), barriers.data(),
+                             0, nullptr);
+    }
+    ctx.hazard_barriers_emitted++;
+}
+
+static void hazard_record(VulkanCommandCtx &ctx, const char *name,
+                          VkDescriptorBufferInfo *buffers, uint32_t count) {
+    if (!hazard_tracker_enabled(ctx)) return;
+    bool known = false;
+    const uint64_t writes = hazard_write_mask(name, count, known);
+    for (uint32_t i = 0; i < count; i++)
+        ctx.hazard_accesses.push_back({buffers[i].buffer, buffers[i].offset,
+                                       buffers[i].range,
+                                       (writes & (1ull << i)) != 0});
+}
 
 const char *ds4_vulkan_gpu_name = "unknown";
 const char *ds4_vulkan_driver_version = "unknown";
@@ -925,6 +1127,7 @@ static void timeline_barrier(VulkanCommandCtx &ctx, const char *name) {
 static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
                               VkDescriptorBufferInfo *buffers, uint32_t count,
                               uint32_t x, uint32_t y, uint32_t z) {
+    hazard_dependency(ctx, name, buffers, count);
     const uint64_t dispatch_index = ctx.timeline_seen_dispatches++;
     const bool capture = ctx.timeline_enabled &&
         dispatch_index >= ctx.timeline_skip_dispatches &&
@@ -934,6 +1137,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
             ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
             timeline_dump(ctx);
         vkCmdDispatch(ctx.cmd, x, y, z);
+        hazard_record(ctx, name, buffers, count);
         return;
     }
     ctx.timeline_collecting = true;
@@ -954,6 +1158,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
         }
     }
     vkCmdDispatch(ctx.cmd, x, y, z);
+    hazard_record(ctx, name, buffers, count);
     if (event) event->host_end_ns = timeline_now_ns();
     if (event && event->first_query != UINT32_MAX)
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1217,6 +1422,10 @@ static int begin_cmd(void) {
     VK_CHECK_BOOL(vkBeginCommandBuffer(c.cmd, &bi));
     c.recording = true;
     c.command_count = 0;
+    c.hazard_accesses.clear();
+    c.hazard_barriers_emitted = 0;
+    c.hazard_barriers_elided = 0;
+    c.hazard_unknown_dispatches = 0;
     c.recording_generation = ++g_vk.cmd_gen;
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] begin_cmd rot=%u gen=%llu\n",
@@ -1243,6 +1452,13 @@ static int end_and_submit(void) {
         c.recording = false;
         return 1;
     }
+    if (getenv("DS4_VULKAN_TRACE_HAZARDS"))
+        fprintf(stderr, "ds4: VULKAN hazard_tracker emitted=%llu elided=%llu "
+                        "unknown=%llu accesses=%zu commands=%u\n",
+                (unsigned long long)c.hazard_barriers_emitted,
+                (unsigned long long)c.hazard_barriers_elided,
+                (unsigned long long)c.hazard_unknown_dispatches,
+                c.hazard_accesses.size(), c.command_count);
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
                 (unsigned)c.command_count, c.cmd_rot_idx,
@@ -3061,9 +3277,13 @@ extern "C" void ds4_gpu_router_overlap_hint(int active) {
 
 static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording,
                                   bool allow_router_defer = false) {
+    const bool tracked = hazard_tracker_enabled(ctx);
     const bool defer_router_dependency =
         allow_router_defer && g_router_overlap_hint && ctx.layer_batch_active;
-    if (!defer_router_dependency) {
+    if (!tracked && !defer_router_dependency) {
+        /* Preserve the known-good legacy path until the tracker is explicitly
+         * enabled.  Once enabled, timeline_dispatch() has already emitted the
+         * narrow RAW/WAR/WAW dependency for this dispatch. */
         VkMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3262,7 +3482,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
     struct { uint32_t n, rows; float eps; } push = {n, rows, eps};
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
-    timeline_dispatch(ctx, "rms_norm_weight_rows", buffers, 3, rows, 1, 1);
+    timeline_dispatch(ctx, "rms_norm", buffers, 2, rows, 1, 1);
     int ok = finish_simple_dispatch(ctx, resume_recording);
     if (!release_simple_descriptors(set)) ok = 0;
     return ok;

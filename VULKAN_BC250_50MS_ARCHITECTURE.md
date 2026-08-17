@@ -49,9 +49,11 @@ with approximately 246.8 GB/s for the same-allocation stream.  The retained
 distinct-weight ledger is approximately 8.9 GiB/token:
 
 ```text
-8.9 GiB / 64 GB/s  ~= 143 ms of traffic-equivalent time
-8.9 GiB / 180 GB/s ~=  50 ms
-8.9 GiB / 246.8 GB/s ~= 36 ms
+8.9 GiB / 64 GB/s    ~= 149 ms of traffic-equivalent time
+8.9 GiB / 180 GB/s   ~=  53 ms
+8.9 GiB / 200 GB/s   ~=  48 ms
+8.9 GiB / 220 GB/s   ~=  43 ms
+8.9 GiB / 246.8 GB/s ~=  39 ms
 ```
 
 The latter two figures are bounds, not achieved results.  They establish that
@@ -85,7 +87,8 @@ and Q-B reach approximately 147 and 226 GB/s respectively in the same family
 of tests.  Those C results are diagnostic, not whole-token results.
 
 The architecture-level gate is not “one IQ2 shader got faster.”  It is a
-production useful-stream target of at least 180 GB/s across the decode-critical
+production useful-stream target of at least 200 GB/s, preferably 220 GB/s,
+across the decode-critical
 weight families.  Reaching that region can remove well over 20 ms/token and is
 the only single-topology change that can plausibly remove most of the current
 139 ms GPU budget.

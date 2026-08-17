@@ -1233,6 +1233,12 @@ static int end_and_submit(void) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     if (!c.recording) return 1;
     if (c.command_count == 0) {
+        /* A validation failure can allocate a descriptor before recording a
+         * dispatch.  It was never submitted, so return it to the reusable
+         * pool instead of carrying a stale generation across begin_cmd. */
+        for (const auto &[_, set] : c.recording_descriptors)
+            recycle_descriptor_set(c, set);
+        c.recording_descriptors.clear();
         VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
         c.recording = false;
         return 1;

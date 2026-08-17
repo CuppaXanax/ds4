@@ -92,3 +92,13 @@ HC post. It retains the routed output write for diagnostics, but no later
 dispatch consumes it. Artifact admission failure leaves the established path
 available unless `REQUIRE` is set. This is a compile/static candidate only
 until the exact full-model gate and sustained decode test run.
+
+The fused tail removes the standalone Q2 down/reduce dispatch's intermediate
+expert-output write/read and the subsequent shared-down projection plus HC
+expand/add dispatches: the production tail is reduced to one dispatch, while
+the existing quantize, IQ2 gate/up/SwiGLU, and shared gate/up dispatches remain.
+The compatibility `routed_out` write is intentionally retained, so this is a
+conservative fusion rather than a claim that every intermediate allocation is
+gone. The `REQUIRE` admission path now fails closed if the Q2 or shared-Q8
+execution artifact is unavailable, and its resource barrier includes the
+GPU-produced mid, route IDs, residual HC state, and HC coefficients.

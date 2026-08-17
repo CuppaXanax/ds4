@@ -303,6 +303,18 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     const struct ds4_gpu_tensor *x_q8,
     uint64_t n_tok);
 
+/* Prebuild an immutable IQ2_XXS execution artifact for a complete expert
+ * matrix.  The GGUF range is only the source; routed consumers bind the
+ * resulting arena planes through the Vulkan backend. */
+int ds4_gpu_cache_iq2_expert_range(
+    const void *model_map,
+    uint64_t model_size,
+    uint64_t weight_offset,
+    uint64_t weight_bytes,
+    uint64_t in_dim,
+    uint64_t out_dim,
+    const char *label);
+
 #ifdef __cplusplus
 }
 #endif

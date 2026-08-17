@@ -116,15 +116,26 @@ and transport. That projection is diagnostic, not a score, but it accounts for
 roughly 92% of the measured 414.94 ms/token and identifies the context cliff as
 the primary lane.
 
-There is currently no performance-qualified LKG across both shallow and 4K
-contexts. Next, run a matched `a2fd02c` versus `8fb6bd9` context ladder with
-exact commit, binary, shader-manifest, fleet, and benchmark identity. The first
-gate is only four 64-token runs: both commits at shallow context and at 4K. If
-both commits reproduce the same context cliff, bracket the 3,588-token handoff
-on the restore point only. This distinguishes a commit regression from a
-bottleneck already present in `a2fd02c` without creating a benchmark matrix. Do
-not select or implement a kernel candidate until that gate confirms both
-commits' actual shader paths.
+The 24-CU ceiling has not been proved. Do not run another `a2fd02c` versus
+`8fb6bd9` context ladder: the retained trace already identifies a production
+path that is both active and actionable. Do not add instrumentation unless it
+is required to prove candidate activation or output correctness.
+
+The current lane is fixed-topology, 24-CU Vulkan decode optimization. The first
+candidate must make the real 512-wide, ratio-4 indexed-attention call use an
+optimized implementation instead of `attention_mixed_online`, or replace that
+fallback with a faster exact implementation. Change one causal mechanism, run
+the existing correctness and activation gates, and then run the canonical score
+gate. A passing candidate becomes the restore point; a failing candidate is
+rolled back before the next dominant production dispatch is addressed.
+
+Do not describe poor end-to-end performance as a 24-CU hardware ceiling merely
+because GPU dispatches account for most token time. A ceiling claim requires
+evidence that the dominant production path is limited by a measured device
+resource envelope rather than shader selection, instruction count, occupancy,
+dispatch structure, synchronization, or avoidable data movement. Proving a
+ceiling does not itself authorize 40 CUs: changing the topology still requires
+the user's explicit approval in the current turn.
 
 Retained evidence:
 

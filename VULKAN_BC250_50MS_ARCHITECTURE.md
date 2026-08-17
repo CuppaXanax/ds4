@@ -231,6 +231,18 @@ artifact tiles, and retains the routed 4096->2048->4096 shape. GLSL, SPIR-V,
 the C graph, and the C++ backend validate. It remains disabled until a
 full-shape fused-vs-unfused HC comparison and full-model exactness gate pass.
 
+### Persistent worker-slice scratch leases
+
+The bounded worker slice now assigns hot decode temporaries stable backing
+storage by `(layer, allocation sequence, memory class)`. Each layer therefore
+keeps distinct Q8/routed scratch while command-ring segments are in flight,
+avoiding unsafe same-size aliasing. Backing storage persists across tokens and
+callers receive non-owning views, so the existing graph no longer returns and
+reacquires those buffers on every token. Shape or call-order mismatches fail
+safe to the established scratch allocator. This is a prerequisite for fully
+persistent descriptors and re-record-free worker graphs; it is not claimed as
+a standalone TPS result.
+
 ## Remaining qualification gates
 
 For each materially different architecture candidate:

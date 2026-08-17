@@ -181,6 +181,14 @@ struct VulkanCommandCtx {
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
     bool slice_batch_active = false;
+    uint32_t slice_active_layer = UINT32_MAX;
+    uint32_t slice_scratch_cursor = 0;
+    struct SliceScratchLease {
+        ds4_gpu_tensor *owner = nullptr;
+        uint64_t bytes = 0;
+        bool device_local = false;
+    };
+    std::unordered_map<uint64_t, SliceScratchLease> slice_scratch_leases;
     std::vector<HazardAccess> hazard_accesses;
     uint64_t hazard_barriers_emitted = 0;
     uint64_t hazard_barriers_elided = 0;
@@ -1733,6 +1741,12 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, c] : g_vk.cmd_ctxs) {
         (void)retire_completed_slots(c, c.last_submit_value);
         timeline_dump(c);
+        /* Lease owners are only lightweight public tensor wrappers.  Their
+         * Vulkan allocations remain registered in tensor_headers and are
+         * destroyed by the common allocation teardown below. */
+        for (auto &[__, lease] : c.slice_scratch_leases)
+            free(lease.owner);
+        c.slice_scratch_leases.clear();
         for (VkQueryPool pool : c.timestamp_pools)
             if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
@@ -1886,6 +1900,64 @@ static bool release_tensor_header(TensorHeader *header) {
 
 static ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_scratch(uint64_t bytes) {
     return alloc_tensor_kind(bytes, true, true);
+}
+
+/* A worker slice records several layers before the output fence.  Returning
+ * ordinary scratch to the size pool during that scope cannot make it reusable:
+ * an earlier command may still consume it.  Give each (layer, allocation
+ * sequence) a persistent backing instead.  The owner remains in the command
+ * context across tokens; callers receive a non-owning tensor wrapper, so their
+ * existing free calls only retire the wrapper.  Stable identities are also a
+ * prerequisite for persistent descriptor/graph reuse.
+ *
+ * A shape/order mismatch deliberately falls back to ordinary scratch rather
+ * than resizing a lease while commands may reference it. */
+static ds4_gpu_tensor *alloc_slice_scratch(uint64_t bytes,
+                                           bool device_local) {
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.slice_batch_active || ctx.slice_active_layer == UINT32_MAX)
+        return alloc_tensor_kind(bytes, device_local, true);
+
+    const uint32_t cursor = ctx.slice_scratch_cursor++;
+    const uint64_t key = (uint64_t(ctx.slice_active_layer) << 32u) |
+                         (uint64_t(device_local ? 1u : 0u) << 31u) |
+                         uint64_t(cursor);
+    auto it = ctx.slice_scratch_leases.find(key);
+    if (it == ctx.slice_scratch_leases.end()) {
+        ds4_gpu_tensor *owner = alloc_tensor_kind(bytes, device_local, false);
+        if (!owner) return nullptr;
+        VulkanCommandCtx::SliceScratchLease lease{};
+        lease.owner = owner;
+        lease.bytes = bytes;
+        lease.device_local = device_local;
+        it = ctx.slice_scratch_leases.emplace(key, lease).first;
+    } else if (it->second.bytes != bytes ||
+               it->second.device_local != device_local) {
+        return alloc_tensor_kind(bytes, device_local, true);
+    }
+
+    ds4_gpu_tensor *view = (ds4_gpu_tensor*)calloc(1, sizeof(ds4_gpu_tensor));
+    if (!view) return nullptr;
+    view->ptr = it->second.owner->ptr;
+    view->bytes = it->second.owner->bytes;
+    view->owner = 0;
+    view->device_id = it->second.owner->device_id;
+    return view;
+}
+
+static ds4_gpu_tensor *ds4_gpu_tensor_alloc_slice_device_scratch(
+        uint64_t bytes) {
+    return alloc_slice_scratch(bytes, true);
+}
+
+static int ds4_gpu_tensor_alloc_slice_host_scratch_in_place(
+        ds4_gpu_tensor *t, uint64_t bytes) {
+    if (!t) return 1;
+    ds4_gpu_tensor *a = alloc_slice_scratch(bytes, false);
+    if (!a) return 2;
+    *t = *a;
+    free(a);
+    return 0;
 }
 
 static int ds4_gpu_tensor_alloc_host_scratch_in_place(ds4_gpu_tensor *t,
@@ -2076,11 +2148,14 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
 }
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
     /* A worker slice owns the enclosing lifetime scope.  Keep the per-layer
      * encoder contract successful without opening a nested retirement scope. */
-    if (ctx.slice_batch_active) return 1;
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = layer;
+        ctx.slice_scratch_cursor = 0;
+        return 1;
+    }
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0) {
         /* Decode records token embedding before opening the first layer
@@ -2104,9 +2179,12 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
 }
 
 extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
-    if (ctx.slice_batch_active) return 1;
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = layer;
+        ctx.slice_scratch_cursor = 0;
+        return 1;
+    }
     if (ctx.layer_batch_active) return 0;
     /* Prefill already owns an ordered layer-major stream.  Attaching the
      * lifetime scope must not submit/wait on the preceding layer; the next
@@ -2126,7 +2204,10 @@ extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
 extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
-    if (ctx.slice_batch_active) return 1;
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = UINT32_MAX;
+        return 1;
+    }
     if (!ctx.layer_batch_active) return 1;
     return retire_layer_batch_span(ctx, false);
 }
@@ -2147,6 +2228,8 @@ extern "C" int ds4_gpu_batch_slice_begin(uint32_t first_layer,
     ctx.layer_batch_in_place_ptrs.reserve(16);
     ctx.layer_batch_active = true;
     ctx.slice_batch_active = true;
+    ctx.slice_active_layer = UINT32_MAX;
+    ctx.slice_scratch_cursor = 0;
     return 1;
 }
 
@@ -2160,6 +2243,7 @@ extern "C" int ds4_gpu_batch_slice_end(uint32_t first_layer,
      * segment belonging to this logical slice before mapped output is read,
      * while retaining the existing descriptor/tensor retirement path. */
     ctx.slice_batch_active = false;
+    ctx.slice_active_layer = UINT32_MAX;
     return retire_layer_batch_span(ctx, false, true);
 }
 
@@ -3657,7 +3741,7 @@ int ds4_gpu_matmul_q8_0_tensor(
          * keeping it device-local removes a per-projection host-visible VMA
          * allocation while the existing synchronous/layer-ring lifetime rules
          * remain unchanged. */
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
             n_tok * n_blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -6278,7 +6362,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         g_vk.caps.max_compute_work_group_size[0] >= 256u &&
         g_vk.caps.max_compute_work_group_invocations >= 256u;
     if (prequant_eligible) {
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
             n_tok * blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -6366,7 +6450,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
             (!g_vk.caps.max_storage_buffer_range ||
              (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
               payload_bytes <= g_vk.caps.max_storage_buffer_range))) {
-            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(q_bytes);
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(q_bytes);
             if (q) {
                 auto &ctx = get_cmd_ctx();
                 const bool resume_recording = ctx.recording;
@@ -8201,7 +8285,7 @@ static bool ds4gk_routed_common(
         compact_mid_q8.device_id = mid->device_id;
     }
     if ((!persistent_q8 &&
-         ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0) ||
+         ds4_gpu_tensor_alloc_slice_host_scratch_in_place(&q8, q8_bytes) != 0) ||
         (validate_selected &&
          ds4_gpu_tensor_alloc_host_scratch_in_place(&invalid,
                                                     sizeof(uint32_t)) != 0)) {
@@ -8379,7 +8463,7 @@ static bool ds4gk_routed_common(
         const uint64_t shared_q8_blocks =
             (shared_hc_tail->shared_in_dim + 31u) / 32u;
         const uint64_t shared_q8_bytes = shared_q8_blocks * 36u;
-        owned.shared_q8 = ds4_gpu_tensor_alloc_device_scratch(shared_q8_bytes);
+        owned.shared_q8 = ds4_gpu_tensor_alloc_slice_device_scratch(shared_q8_bytes);
         if (!owned.shared_q8 ||
             ds4_gpu_quantize_q8_0_tensor(owned.shared_q8,
                                          shared_hc_tail->shared_mid,
@@ -8998,7 +9082,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
             if (execution_available &&
                 g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
                 exec_shader_it != g_vk.shader_map.end()) {
-                ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+                ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
                     blocks * 36u);
                 if (q) {
                     auto &ctx = get_cmd_ctx();
@@ -9081,7 +9165,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
              (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
               payload_bytes <= g_vk.caps.max_storage_buffer_range));
         if (aligned_ok) {
-            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(q_bytes);
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(q_bytes);
             if (q) {
                 auto &ctx = get_cmd_ctx();
                 const bool resume_recording = ctx.recording;

@@ -145,6 +145,10 @@ int ds4_gpu_cache_q2_execution_range(const void *model_map, uint64_t model_size,
                                      uint64_t offset, uint64_t bytes,
                                      uint64_t in_dim, uint64_t out_dim,
                                      const char *label);
+#ifdef DS4_VULKAN_BUILD
+/* Emit strict execution-artifact hit/fallback counters after startup caching. */
+void ds4_gpu_execution_artifact_report(void);
+#endif
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD

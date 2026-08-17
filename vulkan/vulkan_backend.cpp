@@ -179,6 +179,8 @@ struct TensorHeader {
     fprintf(stderr, "ds4: VULKAN error %d at %s:%d\n", _r, __FILE__, __LINE__); return; } } while(0)
 
 /* Global state */
+enum ExecutionArtifactKind : uint32_t { ExecQ8 = 0, ExecIQ2 = 1, ExecQ2 = 2 };
+
 static struct {
     VkInstance          instance       = VK_NULL_HANDLE;
     VkPhysicalDevice    phys_device    = VK_NULL_HANDLE;
@@ -244,6 +246,13 @@ static struct {
         uint32_t source_blocks_per_tile = 0;
     };
     std::unordered_map<uint64_t, ExecutionArtifactEntry> execution_artifacts;
+    struct ExecutionArtifactStats {
+        uint64_t cache_calls = 0;
+        uint64_t artifact_hits = 0;
+        uint64_t fallbacks = 0;
+        uint64_t unsupported = 0;
+        uint64_t failures = 0;
+    } execution_artifact_stats[3];
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
     std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache; /* source offset -> artifact */
     /* Model tensor ranges registered by cache_model_range (metadata only). */
@@ -2679,9 +2688,61 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     return ok;
 }
 
+static bool execution_artifact_required(uint32_t kind) {
+    const char *name = kind == ExecQ8
+        ? "DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8"
+        : kind == ExecIQ2
+            ? "DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2"
+            : nullptr;
+    if (name && getenv(name)) return true;
+    return kind == ExecQ2 &&
+        (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION") ||
+         getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q2"));
+}
+
+static void execution_artifact_failure(uint32_t kind, const char *label,
+                                       const char *reason) {
+    const char *name = kind == ExecQ8 ? "Q8" :
+                       kind == ExecIQ2 ? "IQ2" : "Q2";
+    fprintf(stderr, "ds4: required %s execution artifact unavailable (%s)%s%s\n",
+            name, reason ? reason : "unknown", label ? " for " : "",
+            label ? label : "");
+}
+
+static void execution_artifact_count_fallback(uint32_t kind, const char *label) {
+    g_vk.execution_artifact_stats[kind].fallbacks++;
+    if (getenv("DS4_VULKAN_TRACE_KERNELS")) {
+        const char *name = kind == ExecQ8 ? "Q8" :
+                           kind == ExecIQ2 ? "IQ2" : "Q2";
+        fprintf(stderr, "ds4: [trace] %s execution artifact fallback%s%s\n",
+                name, label ? " for " : "", label ? label : "");
+    }
+}
+
+extern "C" void ds4_gpu_execution_artifact_report(void) {
+    const bool report = getenv("DS4_VULKAN_TRACE_KERNELS") ||
+        execution_artifact_required(ExecQ8) ||
+        execution_artifact_required(ExecIQ2) ||
+        execution_artifact_required(ExecQ2);
+    if (!report) return;
+    static const char *names[] = {"Q8", "IQ2", "Q2"};
+    fprintf(stderr, "ds4: execution artifacts live=%llu\n",
+            (unsigned long long)g_vk.execution_artifacts.size());
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto &s = g_vk.execution_artifact_stats[i];
+        fprintf(stderr, "ds4: execution artifact %s cache_calls=%llu hits=%llu "
+                       "fallbacks=%llu unsupported=%llu failures=%llu%s\n",
+                names[i], (unsigned long long)s.cache_calls,
+                (unsigned long long)s.artifact_hits,
+                (unsigned long long)s.fallbacks,
+                (unsigned long long)s.unsupported,
+                (unsigned long long)s.failures,
+                execution_artifact_required(i) ? " required=1" : "");
+    }
+}
+
 int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes,
                                  uint64_t idim, uint64_t odim, const char *label) {
-    (void)label;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off || idim == 0 || odim == 0)
         return 0;
     const uint64_t blocks = (idim + 31u) / 32u;
@@ -2690,15 +2751,36 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
     set_model_map_identity(m, s);
     const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
     const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
-    if (g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
+    auto &stats = g_vk.execution_artifact_stats[ExecQ8];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecQ8);
+    const bool candidate = g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
         idim % 256u == 0u && odim % 4u == 0u &&
         !(exec_env && strcmp(exec_env, "0") == 0) &&
-        !(q8_mode && strcmp(q8_mode, "exact") == 0)) {
-        decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
-        if (ensure_execution_q8_artifact(m, s, off, idim, odim, execution))
-            return 1;
-        if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8")) return 0;
+        !(q8_mode && strcmp(q8_mode, "exact") == 0);
+    if (!candidate) stats.unsupported++;
+    if (required && !candidate) {
+        stats.failures++;
+        execution_artifact_failure(ExecQ8, label, "shape/mode/shader");
+        return 0;
     }
+    if (candidate) {
+        decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
+        if (ensure_execution_q8_artifact(m, s, off, idim, odim, execution)) {
+            stats.artifact_hits++;
+            if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                fprintf(stderr, "ds4: [trace] Q8 execution artifact hit off=%llu shape=%llux%llu%s%s\n",
+                        (unsigned long long)off, (unsigned long long)idim,
+                        (unsigned long long)odim, label ? " " : "", label ? label : "");
+            return 1;
+        }
+        stats.failures++;
+        if (required) {
+            execution_artifact_failure(ExecQ8, label, "build/upload");
+            return 0;
+        }
+    }
+    if (!required) execution_artifact_count_fallback(ExecQ8, label);
     decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
     return ensure_aligned_weight(m, s, off, idim, odim, entry) || ensure_weight(off, bytes);
 }
@@ -2706,7 +2788,6 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
 int ds4_gpu_cache_iq2_expert_range(const void *m, uint64_t s, uint64_t off,
                                    uint64_t bytes, uint64_t idim, uint64_t odim,
                                    const char *label) {
-    (void)label;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off ||
         idim == 0 || odim == 0 || idim % 256u != 0 ||
         odim > UINT64_MAX / (idim / 256u) ||
@@ -2715,26 +2796,43 @@ int ds4_gpu_cache_iq2_expert_range(const void *m, uint64_t s, uint64_t off,
         return 0;
     set_model_map_identity(m, s);
     const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
-    if (g_vk.shader_map.find("routed_moe_fused_mid_exec") == g_vk.shader_map.end() ||
-        (exec_env && strcmp(exec_env, "0") == 0))
+    auto &stats = g_vk.execution_artifact_stats[ExecIQ2];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecIQ2);
+    const bool candidate = g_vk.shader_map.find("routed_moe_fused_mid_exec") != g_vk.shader_map.end() &&
+        !(exec_env && strcmp(exec_env, "0") == 0);
+    if (!candidate) {
+        stats.unsupported++;
+        if (required) {
+            stats.failures++;
+            execution_artifact_failure(ExecIQ2, label, "mode/shader");
+            return 0;
+        }
+        execution_artifact_count_fallback(ExecIQ2, label);
         return ensure_weight(off, bytes);
+    }
     decltype(g_vk.execution_artifacts)::mapped_type *entry = nullptr;
     if (ensure_execution_iq2_artifact(m, s, off, idim, odim, entry)) {
+        stats.artifact_hits++;
         if (getenv("DS4_VULKAN_TRACE_KERNELS"))
             fprintf(stderr,
-                    "ds4: [trace] routed IQ2 execution artifact off=%llu in=%llu out=%llu\n",
+                    "ds4: [trace] routed IQ2 execution artifact hit off=%llu in=%llu out=%llu%s%s\n",
                     (unsigned long long)off, (unsigned long long)idim,
-                    (unsigned long long)odim);
+                    (unsigned long long)odim, label ? " " : "", label ? label : "");
         return 1;
     }
-    if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2")) return 0;
+    stats.failures++;
+    if (required) {
+        execution_artifact_failure(ExecIQ2, label, "build/upload");
+        return 0;
+    }
+    execution_artifact_count_fallback(ExecIQ2, label);
     return ensure_weight(off, bytes);
 }
 
 int ds4_gpu_cache_q2_execution_range(const void *m, uint64_t s, uint64_t off,
                                      uint64_t bytes, uint64_t idim, uint64_t odim,
                                      const char *label) {
-    (void)label;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off ||
         idim == 0 || odim == 0 || idim % 256u != 0 ||
         odim > UINT64_MAX / (idim / 256u) ||
@@ -2745,15 +2843,37 @@ int ds4_gpu_cache_q2_execution_range(const void *m, uint64_t s, uint64_t off,
     const char *enabled = getenv("DS4_VULKAN_ROUTED_Q2_EXECUTION");
     const char *mode = getenv("DS4_VULKAN_Q2_MODE");
     const char *down = getenv("DS4_VULKAN_ROUTED_DOWN_REDUCE");
-    if ((enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N')) ||
+    auto &stats = g_vk.execution_artifact_stats[ExecQ2];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecQ2);
+    const bool candidate = !((enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N')) ||
         (mode && strcmp(mode, "exact") == 0) ||
-        (down && (*down == '0' || *down == 'n' || *down == 'N')))
+        (down && (*down == '0' || *down == 'n' || *down == 'N')));
+    if (!candidate || g_vk.shader_map.find("routed_moe_down_reduce_q2_exec") == g_vk.shader_map.end()) {
+        stats.unsupported++;
+        if (required) {
+            stats.failures++;
+            execution_artifact_failure(ExecQ2, label, "mode/shader");
+            return 0;
+        }
+        execution_artifact_count_fallback(ExecQ2, label);
         return ensure_weight(off, bytes);
-    if (g_vk.shader_map.find("routed_moe_down_reduce_q2_exec") == g_vk.shader_map.end())
-        return ensure_weight(off, bytes);
+    }
     decltype(g_vk.execution_artifacts)::mapped_type *entry = nullptr;
-    if (ensure_execution_q2_down_artifact(m, s, off, idim, odim, entry)) return 1;
-    if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION")) return 0;
+    if (ensure_execution_q2_down_artifact(m, s, off, idim, odim, entry)) {
+        stats.artifact_hits++;
+        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+            fprintf(stderr, "ds4: [trace] Q2 execution artifact hit off=%llu in=%llu out=%llu%s%s\n",
+                    (unsigned long long)off, (unsigned long long)idim,
+                    (unsigned long long)odim, label ? " " : "", label ? label : "");
+        return 1;
+    }
+    stats.failures++;
+    if (required) {
+        execution_artifact_failure(ExecQ2, label, "build/upload");
+        return 0;
+    }
+    execution_artifact_count_fallback(ExecQ2, label);
     return ensure_weight(off, bytes);
 }
 
@@ -3475,10 +3595,11 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,
                 (unsigned long long)in_dim, (unsigned long long)out_dim);
-    if (!use_execution && getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8") &&
-        n_tok == 1u && in_dim <= 8192u && blocks <= 256u &&
-        (in_dim % 256u) == 0u && (out_dim % 4u) == 0u)
+    if (!use_execution && execution_artifact_required(ExecQ8)) {
+        g_vk.execution_artifact_stats[ExecQ8].failures++;
+        execution_artifact_failure(ExecQ8, nullptr, "runtime dispatch");
         return 0;
+    }
     bool use_aligned = !use_execution &&
         ensure_aligned_weight(model_map, model_size, weight_offset,
                               in_dim, out_dim, aligned);
@@ -7619,6 +7740,11 @@ static bool ds4gk_routed_common(
             down_execution = &found->second;
             fused_down_reduce = true;
         }
+    }
+    if (!use_down_execution && execution_artifact_required(ExecQ2)) {
+        g_vk.execution_artifact_stats[ExecQ2].failures++;
+        execution_artifact_failure(ExecQ2, nullptr, "runtime dispatch");
+        return false;
     }
     if (!use_down_execution &&
         !ds4gk_routed_model(down_offset, down_bytes, down_model))

@@ -3035,7 +3035,10 @@ static int record_simple_shader(const char *name, const void *push, uint32_t pus
         vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, push_size, push);
     timeline_dispatch(ctx, name, buffers, count, gx, gy, gz);
-    ctx.command_count++;
+    /* finish_simple_dispatch accounts for this dispatch and applies the
+     * dependency barrier.  Do not increment here as well: the duplicate
+     * count halves the command-ring batch size and creates avoidable submit /
+     * host-flush boundaries in a worker slice. */
     int ok = finish_simple_dispatch(ctx, resume_recording);
     if (!release_or_defer_simple_descriptors(ctx, set)) ok = 0;
     return ok;

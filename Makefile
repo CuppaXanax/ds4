@@ -66,7 +66,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan vulkan-roofline-a
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -200,6 +200,12 @@ vulkan:
 		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK="$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK_LIBS="$(VULKAN_LDLIBS)"
+
+vulkan-roofline-a:
+	cd vulkan/shaders && python3 compile.py
+	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD \
+		vulkan/benchmarks/roofline_a.cpp vulkan/vulkan_backend.cpp \
+		vulkan/q8_aligned_artifact.cpp -o $@ $(VULKAN_LDLIBS)
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)

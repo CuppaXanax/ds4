@@ -1,0 +1,41 @@
+#version 460 core
+
+/* Benchmark A: checksum-only read of already-resident packed weights.
+ *
+ * One invocation owns one 32-bit word.  Workgroup XOR reduction leaves one
+ * value per workgroup in the output buffer; this makes every load observable
+ * without atomics on the hot path.  The host supplies spans in production
+ * decode order, so dispatches preserve the dense/routed visitation sequence.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) readonly buffer WeightBuf { uint words[]; } weights;
+layout(set = 0, binding = 1) buffer ChecksumBuf { uint sums[]; } checksums;
+
+layout(push_constant) uniform PC {
+    uint word_count;
+    uint output_base;
+    uint total_invocations;
+} pc;
+
+shared uint partial[256];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint value = 0u;
+    /* A small fixed grid keeps the checksum overhead bounded while each lane
+     * streams a long register-resident sequence.  The first iteration of all
+     * lanes is contiguous/coalesced; subsequent iterations walk the same
+     * stride until every word in this packed span has been loaded. */
+    for (uint index = gl_GlobalInvocationID.x; index < pc.word_count;
+         index += pc.total_invocations) {
+        uint loaded = weights.words[index];
+        value ^= loaded ^ (0x9e3779b9u + index * 0x85ebca6bu);
+    }
+    partial[lane] = value;
+    barrier();
+    for (uint stride = 128u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] ^= partial[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) checksums.sums[pc.output_base + gl_WorkGroupID.x] = partial[0];
+}

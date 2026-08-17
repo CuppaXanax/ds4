@@ -539,6 +539,7 @@ static int load_all_shaders(void) {
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
+        {"roofline_weight_stream", 12, 2}, /* checksum-only resident weight read */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -1366,6 +1367,48 @@ static int dispatch_shader(const char *name,
     /* Reset descriptor pool periodically (simplified: reset each time) */
     /* In production, use multiple pools or recycle sets */
     maybe_submit();
+    return 0;
+}
+
+/* Benchmark-only dispatch path.  Inputs are read-only and checksum outputs
+ * occupy disjoint ranges, so no pipeline barriers or command-ring splitting
+ * are needed between dispatches.  Descriptor sets are retained by the caller
+ * until the single timed submission has completed. */
+static int dispatch_shader_roofline(
+        const char *name, const void *push, uint32_t push_size,
+        VkDescriptorBufferInfo *bufs, uint32_t n_bufs,
+        uint32_t gx, uint32_t gy, uint32_t gz,
+        std::vector<VkDescriptorSet> &owned_sets) {
+    auto it = g_vk.shader_map.find(name);
+    if (it == g_vk.shader_map.end()) return -1;
+    auto &e = g_vk.shaders[it->second];
+    auto &c = get_cmd_ctx();
+    VkDescriptorSetAllocateInfo dai{};
+    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dai.descriptorPool = g_vk.desc_pool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &e.desc_layout;
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return -1;
+    std::vector<VkWriteDescriptorSet> writes(n_bufs);
+    for (uint32_t i = 0; i < n_bufs; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = ds; writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufs[i];
+    }
+    if (n_bufs) vkUpdateDescriptorSets(g_vk.device, n_bufs, writes.data(), 0, nullptr);
+    mark_bound_weight_buffers(bufs, n_bufs, c.recording_generation);
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e.pipeline);
+    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            e.layout, 0, 1, &ds, 0, nullptr);
+    if (push && push_size)
+        vkCmdPushConstants(c.cmd, e.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, push_size, push);
+    vkCmdDispatch(c.cmd, gx, gy, gz);
+    c.command_count++;
+    owned_sets.push_back(ds);
     return 0;
 }
 
@@ -8979,4 +9022,207 @@ static bool find_model_buffer(uint64_t offset, uint64_t bytes,
         }
     }
     return false;
+}
+
+/* -------------------------------------------------------------------------
+ * Benchmark A: resident packed-weight stream roofline.
+ *
+ * This deliberately lives beside the production weight-cache lookup rather
+ * than in the test fixture layer.  Callers provide spans in decode visitation
+ * order (dense rows followed by selected expert gate/up/down ranges).  The
+ * first pass only calls ensure_weight(), proving that every byte was uploaded
+ * into the same cache used by production.  Timed passes bind those resident
+ * VkBuffers to the checksum-only shader; no activation tensors, quant math,
+ * or inter-kernel orchestration are involved.
+ * ------------------------------------------------------------------------- */
+extern "C" int ds4_vulkan_roofline_weight_stream(
+        const void *model_map, uint64_t model_size,
+        const ds4_vulkan_roofline_span *spans, uint32_t span_count,
+        uint32_t repeats, ds4_vulkan_roofline_result *result) {
+    if (!g_vk.initialized || !model_map || model_size == 0 || !spans ||
+        span_count == 0 || repeats == 0 || !result) return 0;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.recording) {
+        fprintf(stderr, "ds4: roofline A requires an idle command context\n");
+        return 0;
+    }
+
+    struct ResidentSpan {
+        ds4_vulkan_roofline_span spec{};
+        VkDescriptorBufferInfo weight{};
+        uint32_t words = 0;
+        uint32_t groups = 0;
+        uint32_t output_base = 0;
+    };
+    std::vector<ResidentSpan> resident;
+    resident.reserve(span_count);
+    uint64_t useful_bytes = 0;
+    uint64_t family_bytes[3] = {};
+    uint64_t warm_upload_bytes = 0;
+    const uint64_t warm_start = timeline_now_ns();
+    set_model_map_identity(model_map, model_size);
+
+    for (uint32_t i = 0; i < span_count; i++) {
+        const ds4_vulkan_roofline_span &s = spans[i];
+        if (s.bytes == 0 || s.offset > model_size ||
+            s.bytes > model_size - s.offset || (s.bytes & 3u) != 0 ||
+            s.bytes / 4u > UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: roofline A invalid span[%u] offset=%llu bytes=%llu "
+                    "(requires an in-range 32-bit-word span)\n", i,
+                    (unsigned long long)s.offset,
+                    (unsigned long long)s.bytes);
+            return 0;
+        }
+
+        bool was_resident = false;
+        for (const auto &[base, entry] : g_vk.weight_cache) {
+            if (s.offset >= base && s.offset - base <= entry.size &&
+                s.bytes <= entry.size - (s.offset - base)) {
+                was_resident = true;
+                break;
+            }
+        }
+        if (!ensure_weight(s.offset, s.bytes)) return 0;
+        if (!was_resident) warm_upload_bytes += s.bytes;
+
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize buffer_offset = 0, range = 0;
+        if (!find_model_buffer(s.offset, s.bytes, buffer, buffer_offset, range))
+            return 0;
+        ResidentSpan r;
+        r.spec = s;
+        r.weight = {buffer, buffer_offset, range};
+        r.words = (uint32_t)(s.bytes / 4u);
+        /* Four workgroups per CU is enough to hide memory latency on the
+         * BC-250 while keeping the terminal checksum reduction negligible. */
+        const uint32_t saturated_groups = 96u;
+        const uint32_t stream_words_per_lane = 16u;
+        const uint64_t needed_groups =
+            ((uint64_t)r.words + 256u * stream_words_per_lane - 1u) /
+            (256u * stream_words_per_lane);
+        r.groups = (uint32_t)std::min<uint64_t>(saturated_groups,
+                                                std::max<uint64_t>(1u, needed_groups));
+        if (useful_bytes > UINT64_MAX - s.bytes) return 0;
+        useful_bytes += s.bytes;
+        if (s.family < 3) {
+            if (family_bytes[s.family] > UINT64_MAX - s.bytes) return 0;
+            family_bytes[s.family] += s.bytes;
+        }
+        resident.push_back(r);
+    }
+    const uint64_t warm_upload_ns = timeline_now_ns() - warm_start;
+
+    uint64_t total_groups64 = 0;
+    for (auto &r : resident) {
+        if (total_groups64 > UINT32_MAX - r.groups) return 0;
+        r.output_base = (uint32_t)total_groups64;
+        total_groups64 += r.groups;
+    }
+    if (total_groups64 == 0 || total_groups64 > UINT64_MAX / sizeof(uint32_t)) return 0;
+    ds4_gpu_tensor *checksums = ds4_gpu_tensor_alloc(total_groups64 * sizeof(uint32_t));
+    if (!checksums) return 0;
+    VkBuffer checksum_buffer = VK_NULL_HANDLE;
+    VkDeviceSize checksum_offset = 0;
+    if (!find_tensor_buffer(checksums, checksum_buffer, checksum_offset)) {
+        ds4_gpu_tensor_free(checksums);
+        return 0;
+    }
+    VkDescriptorBufferInfo checksum_info = {
+        checksum_buffer, checksum_offset, total_groups64 * sizeof(uint32_t)};
+
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    VkQueryPoolCreateInfo qpci{};
+    qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = 2;
+    if (vkCreateQueryPool(g_vk.device, &qpci, nullptr, &query_pool) != VK_SUCCESS) {
+        ds4_gpu_tensor_free(checksums);
+        return 0;
+    }
+    vkResetQueryPool(g_vk.device, query_pool, 0, 2);
+    if (!begin_cmd()) {
+        vkDestroyQueryPool(g_vk.device, query_pool, nullptr);
+        ds4_gpu_tensor_free(checksums);
+        return 0;
+    }
+    vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        query_pool, 0);
+    uint32_t dispatches = 0;
+    std::vector<VkDescriptorSet> owned_sets;
+    owned_sets.reserve((size_t)span_count * repeats);
+    for (uint32_t pass = 0; pass < repeats; pass++) {
+        for (const ResidentSpan &r : resident) {
+            struct {
+                uint32_t word_count;
+                uint32_t output_base;
+                uint32_t total_invocations;
+            } push{r.words, r.output_base, r.groups * 256u};
+            VkDescriptorBufferInfo bufs[2] = {r.weight, checksum_info};
+            if (dispatch_shader_roofline("roofline_weight_stream", &push, sizeof(push),
+                                         bufs, 2, r.groups, 1, 1, owned_sets) != 0) {
+                (void)end_and_submit();
+                (void)wait_cmd();
+                for (VkDescriptorSet set : owned_sets)
+                    vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+                vkDestroyQueryPool(g_vk.device, query_pool, nullptr);
+                ds4_gpu_tensor_free(checksums);
+                return 0;
+            }
+            dispatches++;
+        }
+    }
+    vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        query_pool, 1);
+    const int submitted = submit_and_wait_force();
+    if (!submitted) {
+        for (VkDescriptorSet set : owned_sets)
+            vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+        vkDestroyQueryPool(g_vk.device, query_pool, nullptr);
+        ds4_gpu_tensor_free(checksums);
+        return 0;
+    }
+
+    uint64_t ticks[2] = {};
+    const VkResult qr = vkGetQueryPoolResults(
+        g_vk.device, query_pool, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    uint64_t gpu_ns = 0;
+    uint32_t timestamp_valid = 0;
+    if (qr == VK_SUCCESS) {
+        const uint64_t mask = g_vk.timestamp_valid_bits >= 64
+            ? UINT64_MAX : ((1ull << g_vk.timestamp_valid_bits) - 1ull);
+        const uint64_t elapsed = (ticks[1] - ticks[0]) & mask;
+        gpu_ns = (uint64_t)((double)elapsed * g_vk.timestamp_period_ns);
+        timestamp_valid = gpu_ns != 0;
+    }
+
+    uint64_t checksum = 0;
+    const uint32_t *sum_words = (const uint32_t *)ds4_gpu_tensor_contents(checksums);
+    if (sum_words) {
+        for (uint64_t i = 0; i < total_groups64; i++) checksum ^= sum_words[i];
+    }
+    memset(result, 0, sizeof(*result));
+    result->useful_bytes_per_pass = useful_bytes;
+    result->family_bytes_per_pass[0] = family_bytes[0];
+    result->family_bytes_per_pass[1] = family_bytes[1];
+    result->family_bytes_per_pass[2] = family_bytes[2];
+    result->warm_upload_bytes = warm_upload_bytes;
+    result->checksum = checksum;
+    result->gpu_ns = gpu_ns;
+    result->warm_upload_ns = warm_upload_ns;
+    result->dispatches_per_pass = resident.empty() ? 0 : dispatches / repeats;
+    result->repeats = repeats;
+    result->timestamp_valid = timestamp_valid;
+    if (gpu_ns != 0) {
+        const double bytes = (double)useful_bytes * (double)repeats;
+        result->effective_gb_s = bytes / (double)gpu_ns;
+        result->effective_gib_s = bytes * 1.0e9 /
+            ((double)gpu_ns * (double)(1ull << 30));
+    }
+    for (VkDescriptorSet set : owned_sets)
+        vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+    vkDestroyQueryPool(g_vk.device, query_pool, nullptr);
+    ds4_gpu_tensor_free(checksums);
+    return timestamp_valid ? 1 : 0;
 }

@@ -270,6 +270,41 @@ void ds4_vulkan_get_caps(ds4_vulkan_caps *caps);
 int  ds4_vulkan_init(void);
 void ds4_vulkan_cleanup(void);
 
+/* Weight-stream roofline diagnostic.  Each span is a file-backed weight
+ * range in the exact order a decode path would visit it (dense projection
+ * rows or one selected routed expert).  The backend uploads all spans before
+ * timing, then runs a checksum-only shader over resident buffers. */
+typedef struct ds4_vulkan_roofline_span {
+    uint64_t offset;
+    uint64_t bytes;
+    uint32_t family;       /* caller label: dense=0, IQ2 gate/up=1, Q2 down=2 */
+    uint32_t layer;
+    uint32_t expert;
+} ds4_vulkan_roofline_span;
+
+typedef struct ds4_vulkan_roofline_result {
+    uint64_t useful_bytes_per_pass;
+    uint64_t family_bytes_per_pass[3]; /* non-expert, IQ2 gate/up, Q2 down */
+    uint64_t warm_upload_bytes;
+    uint64_t checksum;
+    uint64_t gpu_ns;
+    uint64_t warm_upload_ns;
+    uint32_t dispatches_per_pass;
+    uint32_t repeats;
+    uint32_t timestamp_valid;
+    uint32_t reserved;
+    double effective_gb_s;
+    double effective_gib_s;
+} ds4_vulkan_roofline_result;
+
+int ds4_vulkan_roofline_weight_stream(
+    const void *model_map,
+    uint64_t model_size,
+    const ds4_vulkan_roofline_span *spans,
+    uint32_t span_count,
+    uint32_t repeats,
+    ds4_vulkan_roofline_result *result);
+
 /* Shader compilation helper (called during init for each kernel) */
 int  ds4_vulkan_compile_shaders(void);
 

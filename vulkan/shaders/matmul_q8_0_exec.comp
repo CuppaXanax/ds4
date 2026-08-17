@@ -3,7 +3,15 @@
  * rows per tile) and groups eight GGUF Q8 blocks into one 256-element tile.
  * Each lane owns one source block, so every weight word is consumed by a
  * consecutive lane and the row loop reuses the load across four outputs. */
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#ifndef DS4_EXEC_Q8_LOCAL128
+#define DS4_EXEC_Q8_LOCAL128 0
+#endif
+#if DS4_EXEC_Q8_LOCAL128
+#define DS4_EXEC_Q8_LANES 128
+#else
+#define DS4_EXEC_Q8_LANES 256
+#endif
+layout(local_size_x = DS4_EXEC_Q8_LANES, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer XBuf { uint x_q8_buf[]; };
 layout(set = 0, binding = 1) buffer ScaleBuf { uint scale_buf[]; };
 layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
@@ -16,8 +24,8 @@ layout(push_constant) uniform PC {
     uint source_blocks_per_tile;
 } pc;
 
-shared float block_scale_products[4][256];
-shared int block_dots[4][256];
+shared float block_scale_products[4][DS4_EXEC_Q8_LANES];
+shared int block_dots[4][DS4_EXEC_Q8_LANES];
 
 float f16tof32(uint h) {
     uint s = h & 0x8000u;
@@ -63,7 +71,7 @@ void main() {
             weight_scale = f16tof32(scale_bits);
             activation_scale = uintBitsToFloat(x_q8_buf[x_off]);
         }
-        if (lane < 256u) {
+        if (lane < DS4_EXEC_Q8_LANES) {
             block_scale_products[row_in_tile][lane] = weight_scale * activation_scale;
             block_dots[row_in_tile][lane] = block_dot;
         }

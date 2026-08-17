@@ -97,16 +97,23 @@ static int test_routed_q2_execution_artifact(void) {
     setenv("DS4_VULKAN_TEST_ROUTED_DOWN_REDUCE", "1", 1);
     setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "0", 1);
     if (!run()) return cleanup();
+    /* Retire the baseline before reading it or replacing its raw weight
+     * range. The command-ring overlap guard otherwise keeps the raw cache and
+     * the required artifact replay has nothing to bind. */
+    if (!ds4_gpu_synchronize()) return cleanup();
     std::vector<float> baseline(out_dim);
     if (!ds4_gpu_tensor_read(out, 0, baseline.data(), baseline.size() * sizeof(float)))
         return cleanup();
+    /* The cache API honors ROUTED_Q2_EXECUTION=0 by selecting raw fallback;
+     * enable and require the artifact before building it so a failed replace
+     * cannot be mistaken for a successful gate. */
+    setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "1", 1);
+    setenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION", "1", 1);
     if (!ds4_gpu_cache_q2_execution_range(
             model.data(), model.size(), down_offset, down_bytes,
             mid_dim, (uint64_t)n_total * out_dim, "routed-q2-exec-test"))
         return cleanup();
     std::memset(model.data() + down_offset, 0, (size_t)down_bytes);
-    setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "1", 1);
-    setenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION", "1", 1);
     if (!run()) return cleanup();
     std::vector<float> got(out_dim);
     if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))

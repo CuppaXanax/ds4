@@ -57642,11 +57642,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
         load_layer_start = opt->distributed.layers.start;
         load_layer_end = opt->distributed.layers.end;
         load_output = opt->distributed.layers.has_output;
-        /* A coordinator may need to apply the output head locally when the
-         * last worker advertises N:M rather than N:output. Bind it when the
-         * local GGUF contains it, without requiring split GGUFs to do so. */
+        /* The normal distributed topology assigns the output head to the
+         * final worker.  Mapping it on the coordinator duplicates more than
+         * half a GiB in unified memory.  Retain the old fallback only as an
+         * explicit escape hatch for unusual N:M routes. */
+        const char *local_output = getenv("DS4_DIST_COORDINATOR_LOCAL_OUTPUT");
         load_output_optional =
-            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+            local_output && strcmp(local_output, "0") != 0;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);

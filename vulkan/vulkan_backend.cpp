@@ -33,6 +33,10 @@
 #include <thread>
 #include <algorithm>
 #include <chrono>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 /* =====================================================================
  * PART 1: Vulkan Device State & Infrastructure
@@ -2514,6 +2518,32 @@ static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
 static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset);
 static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes);
 
+static void discard_execution_artifact_source_pages(
+        const void *model_map, uint64_t model_size,
+        uint64_t source_offset, uint64_t source_bytes) {
+#ifndef _WIN32
+    if (!model_map || source_offset >= model_size || source_bytes == 0) return;
+    const uint64_t end_offset =
+        source_bytes > model_size - source_offset ? model_size
+                                                  : source_offset + source_bytes;
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) return;
+    const uintptr_t page_size = static_cast<uintptr_t>(page_size_long);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(model_map) + source_offset;
+    const uintptr_t end = reinterpret_cast<uintptr_t>(model_map) + end_offset;
+    const uintptr_t aligned_begin = begin & ~(page_size - 1u);
+    const uintptr_t aligned_end = (end + page_size - 1u) & ~(page_size - 1u);
+    if (aligned_end > aligned_begin)
+        (void)madvise(reinterpret_cast<void *>(aligned_begin),
+                     aligned_end - aligned_begin, MADV_DONTNEED);
+#else
+    (void)model_map;
+    (void)model_size;
+    (void)source_offset;
+    (void)source_bytes;
+#endif
+}
+
 static bool ensure_execution_artifact(
         const void *model_map, uint64_t model_size, uint64_t source_offset,
         uint64_t in_dim, uint64_t out_dim, uint32_t format,
@@ -2535,6 +2565,15 @@ static bool ensure_execution_artifact(
             format,
             g_vk.caps.min_storage_buffer_offset_alignment))
         return false;
+    /* During upload UMA simultaneously holds the packed CPU buffer, staging
+     * buffer, and final device buffer. Refuse an artifact whose transient
+     * footprint cannot fit inside the configured weight envelope. */
+    if (artifact.bytes > UINT64_MAX / 3u ||
+        artifact.bytes * 3u > g_vk.weight_budget ||
+        g_vk.weight_used > g_vk.weight_budget - artifact.bytes * 3u) {
+        ds4_vulkan_execution_artifact_free(&artifact);
+        return false;
+    }
     if (g_vk.caps.max_storage_buffer_range != 0) {
         for (uint32_t p = 0; p < artifact.plane_count; ++p)
             if (artifact.plane_bytes[p] > g_vk.caps.max_storage_buffer_range) {
@@ -2577,6 +2616,8 @@ static bool ensure_execution_artifact(
     g_vk.execution_artifacts[source_offset] = value;
     g_vk.weight_used += artifact.bytes;
     entry = &g_vk.execution_artifacts.find(source_offset)->second;
+    discard_execution_artifact_source_pages(
+        model_map, model_size, source_offset, artifact.source_bytes);
     ds4_vulkan_execution_artifact_free(&artifact);
     return true;
 }
@@ -10285,9 +10326,17 @@ extern "C" int ds4_gpu_build_derived_artifacts(
 
 extern "C" int ds4_gpu_model_range_replaced(
         const void *model_map, uint64_t offset, uint64_t bytes) {
-    (void)model_map;
-    (void)offset;
-    (void)bytes;
+    if (!model_map || model_map != g_vk.model_map || bytes == 0 ||
+        offset > UINT64_MAX - bytes)
+        return 0;
+    const uint64_t end = offset + bytes;
+    for (const auto &item : g_vk.execution_artifacts) {
+        const auto &artifact = item.second;
+        if (artifact.source_offset <= offset &&
+            artifact.source_bytes <= UINT64_MAX - artifact.source_offset &&
+            end <= artifact.source_offset + artifact.source_bytes)
+            return 1;
+    }
     return 0;
 }
 

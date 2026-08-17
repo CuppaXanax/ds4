@@ -2639,6 +2639,7 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
         decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
         if (ensure_execution_q8_artifact(m, s, off, idim, odim, execution))
             return 1;
+        if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8")) return 0;
     }
     decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
     return ensure_aligned_weight(m, s, off, idim, odim, entry) || ensure_weight(off, bytes);
@@ -3362,6 +3363,10 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,
                 (unsigned long long)in_dim, (unsigned long long)out_dim);
+    if (!use_execution && getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8") &&
+        n_tok == 1u && in_dim <= 8192u && blocks <= 256u &&
+        (in_dim % 256u) == 0u && (out_dim % 4u) == 0u)
+        return 0;
     bool use_aligned = !use_execution &&
         ensure_aligned_weight(model_map, model_size, weight_offset,
                               in_dim, out_dim, aligned);

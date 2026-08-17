@@ -5,6 +5,11 @@ This repository is an appliance-performance project. The current objective is
 topology, without MTP, speculative decoding, topology changes, quantization
 changes, or output drift.
 
+The 24-CU topology is a hard experimental invariant, not merely the current
+inventory. Do not enable, test, stage, or deploy the BC-250 40-CU unlock until
+the user explicitly changes this invariant in the current turn. Kernel and ROCm
+work must prove the 24-CU ceiling first.
+
 These rules are mandatory for every agent and override any urge to “keep
 trying” after a failed gate.
 

@@ -3,9 +3,15 @@
 #ifndef DS4_ROUTED_WAVE64
 #define DS4_ROUTED_WAVE64 0
 #endif
+#ifndef DS4_ROUTED_IQ2_COOP
+#define DS4_ROUTED_IQ2_COOP 0
+#endif
 #if DS4_ROUTED_WAVE64
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+#if DS4_ROUTED_IQ2_COOP && !DS4_ROUTED_WAVE64
+#error "DS4_ROUTED_IQ2_COOP requires Wave64 subgroup operations"
 #endif
 
 /* Exact Flash IQ2 gate/up + SwiGLU -> Q8_K appliance. One workgroup owns one
@@ -165,13 +171,90 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
     up = 0.125 * up_scale * float(up_sum);
 }
 
+#if DS4_ROUTED_IQ2_COOP
+/* Each 16-lane row group reads one IQ2 block's 16 payload words in order.
+ * Even lanes fetch q, odd lanes fetch aux; a single shuffle supplies the
+ * partner word, so both IQ2 pairs are decoded in parallel without barriers. */
+void iq2_block_dot_pair_coop(uint row_byte, uint block, uint q8_block,
+                             uint row_lane, out int gate_sum,
+                             out int up_sum) {
+    uint wb = row_byte + block * 66u;
+    uint ib = row_lane >> 1u;
+    uint pair = row_lane & 1u;
+    uint qbase = wb + 2u + ib * 8u;
+    uint gate_packed = weight_u32(qbase + pair * 4u);
+    uint up_packed = up_weight_u32(qbase + pair * 4u);
+    uint gate_q = pair == 0u ? gate_packed : subgroupShuffleXor(gate_packed, 1u);
+    uint gate_aux = pair == 1u ? gate_packed : subgroupShuffleXor(gate_packed, 1u);
+    uint up_q = pair == 0u ? up_packed : subgroupShuffleXor(up_packed, 1u);
+    uint up_aux = pair == 1u ? up_packed : subgroupShuffleXor(up_packed, 1u);
+    uint q8_word = q8_block * 73u + 1u + ib * 8u + pair * 4u;
+    uint q80_lo = q8_cache[q8_word];
+    uint q80_hi = q8_cache[q8_word + 1u];
+    uint q81_lo = q8_cache[q8_word + 2u];
+    uint q81_hi = q8_cache[q8_word + 3u];
+
+    uint gate_s0 = (gate_aux >> (14u * pair)) & 127u;
+    uint gate_s1 = (gate_aux >> (14u * pair + 7u)) & 127u;
+    uint gate_g0 = (gate_q >> (16u * pair)) & 255u;
+    uint gate_g1 = (gate_q >> (16u * pair + 8u)) & 255u;
+    uint gate_grid0_lo, gate_grid0_hi, gate_grid1_lo, gate_grid1_hi;
+    iq2_grid_words(gate_g0, gate_grid0_lo, gate_grid0_hi);
+    iq2_grid_words(gate_g1, gate_grid1_lo, gate_grid1_hi);
+    uint gate_signs0 = iq2_sign_mask(gate_s0);
+    uint gate_signs1 = iq2_sign_mask(gate_s1);
+
+    uint up_s0 = (up_aux >> (14u * pair)) & 127u;
+    uint up_s1 = (up_aux >> (14u * pair + 7u)) & 127u;
+    uint up_g0 = (up_q >> (16u * pair)) & 255u;
+    uint up_g1 = (up_q >> (16u * pair + 8u)) & 255u;
+    uint up_grid0_lo, up_grid0_hi, up_grid1_lo, up_grid1_hi;
+    iq2_grid_words(up_g0, up_grid0_lo, up_grid0_hi);
+    iq2_grid_words(up_g1, up_grid1_lo, up_grid1_hi);
+    uint up_signs0 = iq2_sign_mask(up_s0);
+    uint up_signs1 = iq2_sign_mask(up_s1);
+
+    gate_sum = 0;
+    up_sum = 0;
+    for (uint j = 0u; j < 8u; ++j) {
+        int q80 = packed_i8(j < 4u ? q80_lo : q80_hi, j);
+        int q81 = packed_i8(j < 4u ? q81_lo : q81_hi, j);
+        int gv0 = packed_i8(j < 4u ? gate_grid0_lo : gate_grid0_hi, j);
+        int gv1 = packed_i8(j < 4u ? gate_grid1_lo : gate_grid1_hi, j);
+        int uv0 = packed_i8(j < 4u ? up_grid0_lo : up_grid0_hi, j);
+        int uv1 = packed_i8(j < 4u ? up_grid1_lo : up_grid1_hi, j);
+        if ((gate_signs0 & (1u << j)) != 0u) gv0 = -gv0;
+        if ((gate_signs1 & (1u << j)) != 0u) gv1 = -gv1;
+        if ((up_signs0 & (1u << j)) != 0u) uv0 = -uv0;
+        if ((up_signs1 & (1u << j)) != 0u) uv1 = -uv1;
+        gate_sum += gv0 * q80 + gv1 * q81;
+        up_sum += uv0 * q80 + uv1 * q81;
+    }
+    gate_sum *= int(2u * (gate_aux >> 28u) + 1u);
+    up_sum *= int(2u * (up_aux >> 28u) + 1u);
+}
+
+int iq2_reduce_i16(int value, uint row_lane) {
+    for (uint stride = 8u; stride != 0u; stride >>= 1u) {
+        int other = subgroupShuffleXor(value, stride);
+        if (row_lane < stride) value += other;
+    }
+    return value;
+}
+#endif
+
 void reduce_pair(float gate, float up, uint lanes_per_row,
                  out float gate_total, out float up_total) {
 #if DS4_ROUTED_WAVE64
     /* Row groups occupy the low four bits of a Wave64 lane ID. XOR masks
      * therefore stay inside one row and reproduce the old FP32 tree without
      * four full-workgroup barriers per tile. */
-    uint lane = gl_SubgroupInvocationID & 15u;
+    uint lane = gl_SubgroupInvocationID &
+#if DS4_ROUTED_IQ2_COOP
+                63u;
+#else
+                15u;
+#endif
     for (uint stride = 8u; stride != 0u; stride >>= 1u) {
         float gate_pair = subgroupShuffleXor(gate, stride);
         float up_pair = subgroupShuffleXor(up, stride);
@@ -253,8 +336,18 @@ void main() {
     uint token = gl_WorkGroupID.y;
     uint rank = gl_WorkGroupID.z;
     uint output_block = gl_WorkGroupID.x;
-    const uint lanes_per_row = 16u;
-    const uint rows_per_tile = 16u;
+    const uint lanes_per_row =
+#if DS4_ROUTED_IQ2_COOP
+        64u;
+#else
+        16u;
+#endif
+    const uint rows_per_tile =
+#if DS4_ROUTED_IQ2_COOP
+        4u;
+#else
+        16u;
+#endif
 #if DS4_ROUTED_WAVE64
     /* Runtime admission requires four contiguous Wave64 subgroups.  Use the
      * logical subgroup coordinate so shuffle partners and row ownership
@@ -279,9 +372,72 @@ void main() {
     for (uint i = lid; i < 544u; i += 256u) iq2_lut[i] = b6[i];
     barrier();
 
-    for (uint tile = 0u; tile < 16u; ++tile) {
+    for (uint tile = 0u;
+#if DS4_ROUTED_IQ2_COOP
+                 tile < 64u;
+#else
+                 tile < 16u;
+#endif
+                 ++tile) {
         uint local_row = tile * rows_per_tile + row_in_tile;
         uint row = output_block * 256u + local_row;
+#if DS4_ROUTED_IQ2_COOP
+        float gate_partial = 0.0;
+        float up_partial = 0.0;
+        if (expert < pc.n_total_expert) {
+            uint row_byte = expert * pc.gate_expert_bytes +
+                            row * pc.gate_row_bytes;
+            uint row_group = lane >> 4u;
+            uint row_lane = lane & 15u;
+            uint row_base = gl_SubgroupInvocationID & ~63u;
+            for (uint iter = 0u; iter < 4u; ++iter) {
+                uint block = row_group + iter * 4u;
+                int gate_sum, up_sum;
+                iq2_block_dot_pair_coop(row_byte, block, block, row_lane,
+                                        gate_sum, up_sum);
+                int gate_total = iq2_reduce_i16(gate_sum, row_lane);
+                int up_total = iq2_reduce_i16(up_sum, row_lane);
+                float gate_value = 0.0;
+                float up_value = 0.0;
+                if (row_lane == 0u) {
+                    uint wb = row_byte + block * 66u;
+                    float input_scale = uintBitsToFloat(q8_cache[block * 73u]);
+                    float gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
+                    float up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
+                    gate_value = 0.125 * gate_scale * float(gate_total);
+                    up_value = 0.125 * up_scale * float(up_total);
+                }
+                /* Broadcast the block result and let its block-numbered lane
+                 * retain it in a register.  This is equivalent to the old
+                 * 16-lane FP32 tree but needs no LDS staging or barrier. */
+                float gate_b0 = subgroupShuffle(gate_value, row_base + 0u);
+                float gate_b1 = subgroupShuffle(gate_value, row_base + 16u);
+                float gate_b2 = subgroupShuffle(gate_value, row_base + 32u);
+                float gate_b3 = subgroupShuffle(gate_value, row_base + 48u);
+                float up_b0 = subgroupShuffle(up_value, row_base + 0u);
+                float up_b1 = subgroupShuffle(up_value, row_base + 16u);
+                float up_b2 = subgroupShuffle(up_value, row_base + 32u);
+                float up_b3 = subgroupShuffle(up_value, row_base + 48u);
+                if (row_group == 0u) {
+                    uint base_block = iter * 4u;
+                    if (lane == base_block + 0u) {
+                        gate_partial = gate_b0; up_partial = up_b0;
+                    } else if (lane == base_block + 1u) {
+                        gate_partial = gate_b1; up_partial = up_b1;
+                    } else if (lane == base_block + 2u) {
+                        gate_partial = gate_b2; up_partial = up_b2;
+                    } else if (lane == base_block + 3u) {
+                        gate_partial = gate_b3; up_partial = up_b3;
+                    }
+                }
+            }
+        } else {
+            gate_partial = 0.0;
+            up_partial = 0.0;
+        }
+        float gate, up;
+        reduce_pair(gate_partial, up_partial, lanes_per_row, gate, up);
+#else
         float gate_partial = 0.0;
         float up_partial = 0.0;
         if (expert < pc.n_total_expert) {
@@ -295,6 +451,7 @@ void main() {
         }
         float gate, up;
         reduce_pair(gate_partial, up_partial, lanes_per_row, gate, up);
+#endif
         if (lane == 0u) {
             if (expert >= pc.n_total_expert) {
                 mid_values[local_row] = 0.0;

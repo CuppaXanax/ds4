@@ -537,6 +537,7 @@ static int load_all_shaders(void) {
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
+        {"routed_moe_fused_mid_iq2_coop_wave64", 68, 7}, /* opt-in cooperative IQ2 */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
         {"roofline_weight_stream", 12, 2}, /* checksum-only resident weight read */
@@ -6817,6 +6818,25 @@ static const char *ds4gk_routed_shape_shader(const char *ordinary,
         g_vk.shader_map.find(wave64) != g_vk.shader_map.end() ? wave64 : ordinary;
 }
 
+/* Experimental cooperative IQ2 gate/up candidate.  It is deliberately
+ * limited to the production Flash decode appliance: its row/block mapping is
+ * fixed at 256 rows x 16 IQ2 blocks, while every other shape keeps the
+ * established fused shader as an exact fallback. */
+static bool ds4gk_routed_iq2_coop_enabled(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_IQ2_COOP");
+    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+        return false;
+    return ds4gk_routed_wave64_enabled() && get_cmd_ctx().layer_batch_active &&
+        g_vk.shader_map.find("routed_moe_fused_mid_iq2_coop_wave64") !=
+            g_vk.shader_map.end() && n_tokens == 1u && gate_type == 16u &&
+        down_type == 10u && expert_in_dim == 4096u &&
+        expert_mid_dim == 2048u && out_dim == 4096u &&
+        n_total_expert == 256u && n_expert == 6u;
+}
+
 /* The production Flash decode appliance already keeps router IDs and route
  * weights on the device for the whole layer command batch. On that narrow
  * shape a compact fused shader writes Q8 mid directly; gate/up/f32-mid
@@ -6929,7 +6949,8 @@ static void ds4gk_routed_input_barrier(
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
         add(7);                                 /* fused weights */
     if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid") == 0 ||
-                        strcmp(shader_name, "routed_moe_fused_mid_wave64") == 0))
+                        strcmp(shader_name, "routed_moe_fused_mid_wave64") == 0 ||
+                        strcmp(shader_name, "routed_moe_fused_mid_iq2_coop_wave64") == 0))
         add(5);                                 /* compact fused weights */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_input_dependency");
@@ -7036,6 +7057,9 @@ static bool ds4gk_routed_common(
         down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
     const bool mid_only = ds4gk_routed_mid_only_appliance(
+        gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert, n_tokens);
+    const bool iq2_coop = mid_only && ds4gk_routed_iq2_coop_enabled(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
     if (mid_is_f16) *mid_is_f16 = false;
@@ -7263,8 +7287,10 @@ static bool ds4gk_routed_common(
                 q8_info, gate_model, up_model, selected_info,
                 compact_mid_q8_info,
                 weights_info, iq2_lut_info};
-            const char *fused_mid_shader = ds4gk_routed_shape_shader(
-                "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
+            const char *fused_mid_shader = iq2_coop
+                ? "routed_moe_fused_mid_iq2_coop_wave64"
+                : ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
             ok = ds4gk_routed_dispatch_shader(
                 fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
                 fused_buffers, 7,

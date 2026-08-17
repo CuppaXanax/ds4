@@ -2,6 +2,7 @@
 #include "../../../ds4_gpu.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -96,10 +97,12 @@ static int test_routed_q2_execution_artifact(void) {
     };
     setenv("DS4_VULKAN_TEST_ROUTED_DOWN_REDUCE", "1", 1);
     setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "0", 1);
-    if (!run()) return cleanup();
+    if (!run()) { std::fprintf(stderr, "q2_exec: baseline run failed\\n"); return cleanup(); }
     std::vector<float> baseline(out_dim);
-    if (!ds4_gpu_tensor_read(out, 0, baseline.data(), baseline.size() * sizeof(float)))
+    if (!ds4_gpu_tensor_read(out, 0, baseline.data(), baseline.size() * sizeof(float))) {
+        std::fprintf(stderr, "q2_exec: baseline read failed\\n");
         return cleanup();
+    }
     /* Build the execution artifact while the execution path is enabled.  The
      * cache API intentionally honors DS4_VULKAN_ROUTED_Q2_EXECUTION=0 by
      * taking the raw fallback, so calling it in the baseline mode would leave
@@ -108,15 +111,20 @@ static int test_routed_q2_execution_artifact(void) {
     if (!ds4_gpu_cache_q2_execution_range(
             model.data(), model.size(), down_offset, down_bytes,
             mid_dim, (uint64_t)n_total * out_dim, "routed-q2-exec-test"))
+        std::fprintf(stderr, "q2_exec: artifact cache failed\\n");
         return cleanup();
     std::memset(model.data() + down_offset, 0, (size_t)down_bytes);
     setenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION", "1", 1);
-    if (!run()) return cleanup();
+    if (!run()) { std::fprintf(stderr, "q2_exec: artifact run failed\\n"); return cleanup(); }
     std::vector<float> got(out_dim);
-    if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))
+    if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float))) {
+        std::fprintf(stderr, "q2_exec: artifact read failed\\n");
         return cleanup();
-    if (std::memcmp(got.data(), baseline.data(), got.size() * sizeof(float)) != 0)
+    }
+    if (std::memcmp(got.data(), baseline.data(), got.size() * sizeof(float)) != 0) {
+        std::fprintf(stderr, "q2_exec: mismatch\\n");
         return cleanup();
+    }
     result = 0;
     return cleanup();
 }

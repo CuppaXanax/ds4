@@ -538,6 +538,7 @@ static int load_all_shaders(void) {
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
         {"routed_moe_iq2_project_wave64", 68, 7}, /* opt-in IQ2 projection-only candidate */
+        {"routed_moe_iq2_project_one_wave64", 68, 5}, /* split gate/up projection candidate */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
         {"roofline_weight_stream", 12, 2}, /* checksum-only resident weight read */
@@ -6875,6 +6876,20 @@ static bool ds4gk_routed_iq2_projection_appliance(
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
 }
 
+static bool ds4gk_routed_iq2_split_appliance(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_IQ2_SPLIT");
+    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+        return false;
+    return ds4gk_routed_wave64_enabled() &&
+        g_vk.shader_map.find("routed_moe_iq2_project_one_wave64") != g_vk.shader_map.end() &&
+        n_tokens == 1u && gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
+}
+
 /* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
  * while the generic fused gate/up shader additionally writes b5 and b6. The
  * compact mid-only shader writes b4; the compact Q2 appliance writes b3
@@ -6911,6 +6926,8 @@ static void ds4gk_routed_output_barrier(
     }
     if (shader_name && strcmp(shader_name, "routed_moe_iq2_project_wave64") == 0)
         add(5); /* projection writes gate (b4) and up (b5) */
+    if (shader_name && strcmp(shader_name, "routed_moe_iq2_project_one_wave64") == 0)
+        add(3); /* split projection writes its sole output at b3 */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_output_dependency");
     vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -7060,9 +7077,13 @@ static bool ds4gk_routed_common(
     const bool mid_only = ds4gk_routed_mid_only_appliance(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
-    const bool projection_only = mid_only && ds4gk_routed_iq2_projection_appliance(
+    const bool projection_split = mid_only && ds4gk_routed_iq2_split_appliance(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
+    const bool projection_only = projection_split ||
+        (mid_only && ds4gk_routed_iq2_projection_appliance(
+            gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+            n_total_expert, n_expert, n_tokens));
     if (mid_is_f16) *mid_is_f16 = false;
     if (!out || !mid || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
@@ -7294,7 +7315,27 @@ static bool ds4gk_routed_common(
         pc.q2_words = iq2_words ? 1u : 0u;
         fused_gate_up = !projection_only && iq2_words && (mid_only ||
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
-        if (projection_only) {
+        if (projection_split) {
+            VkDescriptorBufferInfo gate_project_buffers[5] = {
+                q8_info, gate_model, selected_info, gate_info, iq2_lut_info};
+            pc.add_enabled = 0;
+            ok = ds4gk_routed_dispatch_shader(
+                "routed_moe_iq2_project_one_wave64", "gate_iq2_project_split", pc,
+                gate_project_buffers, 5,
+                (expert_mid_dim + 7u) / 8u,
+                n_tokens, n_expert, sets);
+            if (ok) {
+                VkDescriptorBufferInfo up_project_buffers[5] = {
+                    q8_info, up_model, selected_info, up_info, iq2_lut_info};
+                pc.add_enabled = 1;
+                ok = ds4gk_routed_dispatch_shader(
+                    "routed_moe_iq2_project_one_wave64", "up_iq2_project_split", pc,
+                    up_project_buffers, 5,
+                    (expert_mid_dim + 7u) / 8u,
+                    n_tokens, n_expert, sets);
+                pc.add_enabled = 0;
+            }
+        } else if (projection_only) {
             VkDescriptorBufferInfo project_buffers[7] = {
                 q8_info, gate_model, up_model, selected_info,
                 gate_info, up_info, iq2_lut_info};

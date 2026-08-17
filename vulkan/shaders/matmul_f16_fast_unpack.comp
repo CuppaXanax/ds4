@@ -1,0 +1,52 @@
+#version 460 core
+
+/* Exact matmul_f16_fast reduction with native IEEE-half unpack.
+ *
+ * The work assignment, FP64 lane dots, float lane boundary, contiguous
+ * 16-lane FP64 chunks, and final FP64 sum are identical to
+ * matmul_f16_fast.comp.  Only half decoding changes from scalar bitfield math
+ * plus exp2 to Vulkan's defined unpackHalf2x16 conversion.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf { float x_buf[]; };
+layout(set = 0, binding = 1) buffer WBuf { uint w_buf[]; };
+layout(set = 0, binding = 2) buffer OutBuf { float out_buf[]; };
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; uint n_tok; } pc;
+
+shared float lane_sums[256];
+shared uvec2 chunk_bits[16];
+
+void main() {
+    const uint col = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint lid = gl_LocalInvocationIndex;
+    if (col >= pc.out_dim || tok >= pc.n_tok) return;
+
+    const uint xo = tok * pc.in_dim;
+    const uint wo = col * pc.in_dim;
+    double sum = 0.0;
+    for (uint i = lid; i < pc.in_dim; i += 256u) {
+        const uint e = wo + i;
+        const vec2 pair = unpackHalf2x16(w_buf[e >> 1u]);
+        const float weight = (e & 1u) == 0u ? pair.x : pair.y;
+        sum += double(x_buf[xo + i]) * double(weight);
+    }
+    lane_sums[lid] = float(sum);
+    barrier();
+
+    if (lid < 16u) {
+        double chunk = 0.0;
+        const uint begin = lid * 16u;
+        for (uint i = begin; i < begin + 16u; ++i)
+            chunk += double(lane_sums[i]);
+        chunk_bits[lid] = unpackDouble2x32(chunk);
+    }
+    barrier();
+
+    if (lid == 0u) {
+        double final = 0.0;
+        for (uint i = 0u; i < 16u; ++i)
+            final += packDouble2x32(chunk_bits[i]);
+        out_buf[tok * pc.out_dim + col] = float(final);
+    }
+}

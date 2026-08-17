@@ -1,0 +1,93 @@
+#version 460 core
+
+/* Exact production grouped output-A projection for 4096-wide group rows.
+ *
+ * One Wave64 owns two output rows, so a 256-lane workgroup emits eight rows.
+ * Each lane computes blocks lane and lane+64.  Block dot order and the final
+ * ascending 128-block float reduction exactly match
+ * matmul_q8_0_group_rows_bfe; the rewrite only removes the second wave per
+ * row and doubles activation reuse.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_groups;
+    uint blocks_per_row;
+    uint rows_per_workgroup;
+} pc;
+
+shared uint x_q8_shared[1152];
+shared float block_scale_products[1024];
+shared int block_dots[1024];
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(payload_buf[word]), int(byte_index * 8u), 8);
+}
+
+int x_i8(uint word, uint byte_index) {
+    return bitfieldExtract(int(x_q8_shared[word]), int(byte_index * 8u), 8);
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint lane = lid & 63u;
+    const uint wave = lid >> 6u;
+    const uint group = gl_WorkGroupID.y;
+    const uint row0 = gl_WorkGroupID.x * 8u;
+    const bool shape_ok = pc.blocks_per_row == 128u &&
+        pc.rows_per_workgroup == 8u && pc.in_dim == 4096u;
+
+    for (uint i = lid; i < 1152u; i += 256u)
+        x_q8_shared[i] = group < pc.n_groups ?
+            x_q8_buf[group * 1152u + i] : 0u;
+    barrier();
+
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        const uint row_slot = wave + pass * 4u;
+        const uint row = row0 + row_slot;
+        const bool valid_row = shape_ok && group < pc.n_groups && row < pc.out_dim;
+        for (uint part = 0u; part < 2u; ++part) {
+            const uint block = lane + part * 64u;
+            float scale_product = 0.0;
+            int block_dot = 0;
+            if (valid_row) {
+                const uint weight_row = group * pc.out_dim + row;
+                const uint record = weight_row * 128u + block;
+                const uint scale_word = scale_buf[record >> 1u];
+                const vec2 scale_pair = unpackHalf2x16(scale_word);
+                const float weight_scale = (record & 1u) == 0u ?
+                    scale_pair.x : scale_pair.y;
+                const uint x_off = block * 9u;
+                for (uint i = 0u; i < 32u; ++i)
+                    block_dot += i8_at(record * 8u + (i >> 2u), i & 3u) *
+                                 x_i8(x_off + 1u + (i >> 2u), i & 3u);
+                scale_product = weight_scale *
+                    uintBitsToFloat(x_q8_shared[x_off]);
+            }
+            const uint partial = row_slot * 128u + block;
+            block_scale_products[partial] = scale_product;
+            block_dots[partial] = block_dot;
+        }
+    }
+    barrier();
+
+    if (lane == 0u && shape_ok && group < pc.n_groups) {
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            const uint row_slot = wave + pass * 4u;
+            const uint row = row0 + row_slot;
+            if (row >= pc.out_dim) continue;
+            float sum = 0.0;
+            const uint base = row_slot * 128u;
+            for (uint block = 0u; block < 128u; ++block)
+                sum += block_scale_products[base + block] *
+                       float(block_dots[base + block]);
+            out_buf[group * pc.out_dim + row] = sum;
+        }
+    }
+}

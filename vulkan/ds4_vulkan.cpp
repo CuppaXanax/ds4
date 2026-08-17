@@ -1097,6 +1097,8 @@ int ds4_gpu_embed_tokens_hc_tensor(
 int ds4_gpu_indexer_score_one_tensor(...) { return -1; }
 int ds4_gpu_indexer_scores_prefill_tensor(...) { return -1; }
 int ds4_gpu_indexer_scores_decode_batch_tensor(...) { return -1; }
+int ds4_gpu_indexer_select_decode_wave64_tensor(...) { return -1; }
+int ds4_gpu_indexer_select_decode_wave64_used(void) { return 0; }
 int ds4_gpu_indexer_topk_tensor(...) { return -1; }
 int ds4_gpu_argmax_tensor(...) { return -1; }
 int ds4_gpu_dsv4_topk_mask_tensor(...) { return -1; }
@@ -1112,12 +1114,14 @@ int ds4_gpu_matmul_q8_0_tensor(
     (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
     return -1;
 }
+int ds4_gpu_q8_wave64_unpack_used(void) { return 0; }
 
 /* All other matmul variants -- return -1 for CPU fallback */
 int ds4_gpu_matmul_q8_0_pair_tensor(...) { return -1; }
 int ds4_gpu_matmul_q8_0_f16_out_tensor(...) { return -1; }
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(...) { return -1; }
 int ds4_gpu_matmul_f16_tensor(...) { return -1; }
+int ds4_gpu_matmul_f16_unpack_used(void) { return 0; }
 int ds4_gpu_matmul_f16_pair_tensor(...) { return -1; }
 int ds4_gpu_matmul_f32_tensor(...) { return -1; }
 
@@ -1183,6 +1187,7 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(...) { return -1; }
 int ds4_gpu_attention_output_q8_batch_tensor(...) { return -1; }
 int ds4_gpu_attention_output_q8_batch_f16_tensor(...) { return -1; }
 int ds4_gpu_attention_output_low_q8_tensor(...) { return -1; }
+int ds4_gpu_q8_group_wave64_rows8_used(void) { return 0; }
 
 /* ---- Router & MoE ---- */
 

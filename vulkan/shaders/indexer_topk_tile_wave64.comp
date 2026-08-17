@@ -1,0 +1,66 @@
+#version 460 core
+
+/* First exact hierarchical-selection level for the 128K path.  Every
+ * disjoint 4096-row tile emits its ordered top 512 score/index records.  Any
+ * global top-512 row must occur in that union. */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Candidates { uint candidates[]; };
+layout(set = 0, binding = 1) readonly buffer Scores { float scores[]; };
+layout(push_constant) uniform PC { uint n_comp; uint tile_count; uint top_k; } pc;
+
+const uint TILE = 4096u;
+shared float sort_score[TILE];
+shared uint sort_index[TILE];
+
+bool score_better(float av, uint ai, float bv, uint bi) {
+    if (isnan(av)) return isnan(bv) && ai < bi;
+    if (isnan(bv)) return true;
+    return av > bv || (av == bv && ai < bi);
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    const uint tile = gl_WorkGroupID.x;
+    if (tile >= pc.tile_count || pc.top_k != 512u) return;
+    const uint row0 = tile * TILE;
+
+    for (uint i = lane; i < TILE; i += 256u) {
+        const uint row = row0 + i;
+        sort_score[i] = row < pc.n_comp
+            ? scores[row]
+            : uintBitsToFloat(0x7fc00000u);
+        sort_index[i] = row < pc.n_comp ? row : 0xffffffffu;
+    }
+    barrier();
+
+    for (uint span = 2u; span <= TILE; span <<= 1u) {
+        for (uint stride = span >> 1u; stride != 0u; stride >>= 1u) {
+            for (uint i = lane; i < TILE; i += 256u) {
+                const uint other = i ^ stride;
+                if (other > i) {
+                    const float av = sort_score[i];
+                    const uint ai = sort_index[i];
+                    const float bv = sort_score[other];
+                    const uint bi = sort_index[other];
+                    const bool descending = (i & span) == 0u;
+                    const bool swap = descending
+                        ? score_better(bv, bi, av, ai)
+                        : score_better(av, ai, bv, bi);
+                    if (swap) {
+                        sort_score[i] = bv;
+                        sort_index[i] = bi;
+                        sort_score[other] = av;
+                        sort_index[other] = ai;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    const uint out0 = tile * 1024u;
+    for (uint k = lane; k < 512u; k += 256u) {
+        candidates[out0 + 2u * k] = floatBitsToUint(sort_score[k]);
+        candidates[out0 + 2u * k + 1u] = sort_index[k];
+    }
+}

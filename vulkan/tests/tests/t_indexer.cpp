@@ -241,6 +241,15 @@ static void ref_topk_row(const float *row, uint32_t n_comp, uint32_t top_k,
     for (uint32_t k = 0; k < top_k; k++) out[k] = idx[k];
 }
 
+static void set_indexer_select_wave64_env(const char *value) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_INDEXER_SELECT_WAVE64", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_INDEXER_SELECT_WAVE64", value, 1);
+    else unsetenv("DS4_VULKAN_INDEXER_SELECT_WAVE64");
+#endif
+}
+
 static int test_indexer_topk(void) {
     const uint32_t n_comp = 8, n_tokens = 2, top_k = 3;
     /* Row 0: tie at 2.5 (idx 1 and 3 -> idx 1 first), -INF masked row. */
@@ -411,6 +420,198 @@ done:
     return rc;
 }
 REGISTER_TEST(indexer_end_to_end, test_indexer_end_to_end);
+
+/* Production-only fused selector gate.  The inputs make the score of row c
+ * an exactly representable positive integer, while the odd permutation keeps
+ * every visible row unique.  This isolates selector ordering from floating
+ * tolerance and also lets the 32768-row gate avoid a 268M-op CPU reference. */
+static int run_indexer_select_wave64_case(uint32_t n_comp, uint32_t pos0,
+                                          bool compare_legacy,
+                                          bool benchmark,
+                                          bool disabled_fallback = false) {
+    const uint32_t n_head = 64u, head_dim = 128u, ratio = 4u, top_k = 512u;
+    const uint32_t visible = std::min(n_comp, (pos0 + 1u) / ratio);
+    std::vector<float> q((size_t)n_head * head_dim, 0.0f);
+    std::vector<float> weights(n_head, 0.0f);
+    std::vector<float> index_comp((size_t)n_comp * head_dim, 0.0f);
+    std::vector<float> reference_scores(n_comp, -INFINITY);
+    std::vector<uint32_t> reference(top_k), candidate(top_k), legacy(top_k);
+    q[0] = 1.0f;
+    weights[0] = 1.0f;
+    for (uint32_t c = 0; c < n_comp; c++) {
+        const float score = (float)(((uint64_t)c * 4051u) % n_comp + 1u);
+        index_comp[(size_t)c * head_dim] = score;
+        if (c < visible) reference_scores[c] = score;
+    }
+    ref_topk_row(reference_scores.data(), n_comp, top_k, reference.data());
+
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q.size() * sizeof(float));
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(weights.size() * sizeof(float));
+    ds4_gpu_tensor *kt = ds4_gpu_tensor_alloc(index_comp.size() * sizeof(float));
+    ds4_gpu_tensor *legacy_selected = compare_legacy
+        ? ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t)) : nullptr;
+    ds4_gpu_tensor *legacy_scores = compare_legacy
+        ? ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float)) : nullptr;
+    const char *saved = std::getenv("DS4_VULKAN_INDEXER_SELECT_WAVE64");
+    const bool had_saved = saved != nullptr;
+    const std::string saved_value = saved ? saved : "";
+    int rc = 1;
+    if (!selected || !scores || !scratch || !qt || !wt || !kt ||
+        (compare_legacy && (!legacy_selected || !legacy_scores))) goto done;
+    if (!ds4_gpu_tensor_write(qt, 0, q.data(), q.size() * sizeof(float)) ||
+        !ds4_gpu_tensor_write(wt, 0, weights.data(), weights.size() * sizeof(float)) ||
+        !ds4_gpu_tensor_write(kt, 0, index_comp.data(),
+                              index_comp.size() * sizeof(float))) goto done;
+
+    if (disabled_fallback) {
+        set_indexer_select_wave64_env("0");
+        if (ds4_gpu_indexer_select_decode_wave64_tensor(
+                selected, scores, scratch, qt, wt, kt, n_comp, 1u, pos0,
+                n_head, head_dim, ratio, top_k, 1.0f) != 0 ||
+            ds4_gpu_indexer_select_decode_wave64_used() != 0 ||
+            !ds4_gpu_indexer_scores_decode_batch_tensor(
+                legacy_scores, qt, wt, kt, n_comp, 1u, pos0, n_head,
+                head_dim, ratio, 1.0f) ||
+            !ds4_gpu_indexer_topk_tensor(legacy_selected, legacy_scores,
+                                         n_comp, 1u, top_k) ||
+            !ds4_gpu_tensor_read(legacy_selected, 0, legacy.data(),
+                                 legacy.size() * sizeof(uint32_t)) ||
+            legacy != reference) {
+            fprintf(stderr,
+                    "indexer_select_wave64: forced-disable fallback failed\n");
+            goto done;
+        }
+        rc = 0;
+        goto done;
+    }
+
+    set_indexer_select_wave64_env("1");
+    if (!ds4_gpu_indexer_select_decode_wave64_tensor(
+            selected, scores, scratch, qt, wt, kt, n_comp, 1u, pos0,
+            n_head, head_dim, ratio, top_k, 1.0f) ||
+        ds4_gpu_indexer_select_decode_wave64_used() != 1) {
+        rc = std::getenv("DS4_TEST_REQUIRE_INDEXER_SELECT_WAVE64") ? 1 : 0;
+        goto done;
+    }
+    if (!ds4_gpu_tensor_read(selected, 0, candidate.data(),
+                             candidate.size() * sizeof(uint32_t))) goto done;
+    if (candidate != reference) {
+        for (uint32_t k = 0; k < top_k; k++) {
+            if (candidate[k] != reference[k]) {
+                fprintf(stderr,
+                        "indexer_select_wave64: n_comp=%u k=%u got=%u want=%u\n",
+                        n_comp, k, candidate[k], reference[k]);
+                break;
+            }
+        }
+        goto done;
+    }
+
+    if (compare_legacy) {
+        if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                legacy_scores, qt, wt, kt, n_comp, 1u, pos0, n_head,
+                head_dim, ratio, 1.0f) ||
+            !ds4_gpu_indexer_topk_tensor(legacy_selected, legacy_scores,
+                                         n_comp, 1u, top_k) ||
+            !ds4_gpu_tensor_read(legacy_selected, 0, legacy.data(),
+                                 legacy.size() * sizeof(uint32_t)) ||
+            legacy != candidate) {
+            fprintf(stderr, "indexer_select_wave64: legacy A/B mismatch n_comp=%u\n",
+                    n_comp);
+            goto done;
+        }
+    }
+
+    if (benchmark) {
+        const uint32_t warmups = 3u, rounds = 12u;
+        for (uint32_t i = 0; i < warmups; i++) {
+            if (compare_legacy &&
+                (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                    legacy_scores, qt, wt, kt, n_comp, 1u, pos0, n_head,
+                    head_dim, ratio, 1.0f) ||
+                 !ds4_gpu_indexer_topk_tensor(legacy_selected, legacy_scores,
+                                              n_comp, 1u, top_k))) goto done;
+            if (!ds4_gpu_indexer_select_decode_wave64_tensor(
+                    selected, scores, scratch, qt, wt, kt, n_comp, 1u, pos0,
+                    n_head, head_dim, ratio, top_k, 1.0f)) goto done;
+        }
+        const auto old_begin = std::chrono::steady_clock::now();
+        if (compare_legacy) {
+            for (uint32_t i = 0; i < rounds; i++) {
+                if (!ds4_gpu_indexer_scores_decode_batch_tensor(
+                        legacy_scores, qt, wt, kt, n_comp, 1u, pos0, n_head,
+                        head_dim, ratio, 1.0f) ||
+                    !ds4_gpu_indexer_topk_tensor(legacy_selected, legacy_scores,
+                                                 n_comp, 1u, top_k)) goto done;
+            }
+        }
+        const auto old_end = std::chrono::steady_clock::now();
+        const auto new_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < rounds; i++) {
+            if (!ds4_gpu_indexer_select_decode_wave64_tensor(
+                    selected, scores, scratch, qt, wt, kt, n_comp, 1u, pos0,
+                    n_head, head_dim, ratio, top_k, 1.0f)) goto done;
+        }
+        const auto new_end = std::chrono::steady_clock::now();
+        const double old_ms = std::chrono::duration<double, std::milli>(
+            old_end - old_begin).count() / rounds;
+        const double new_ms = std::chrono::duration<double, std::milli>(
+            new_end - new_begin).count() / rounds;
+        fprintf(stderr,
+                "indexer_select_wave64_bench: n_comp=%u visible=%u "
+                "legacy_ms=%.3f candidate_ms=%.3f speedup=%.3fx\n",
+                n_comp, visible, old_ms, new_ms,
+                new_ms != 0.0 ? old_ms / new_ms : 0.0);
+    }
+    rc = 0;
+done:
+    if (had_saved) set_indexer_select_wave64_env(saved_value.c_str());
+    else set_indexer_select_wave64_env(nullptr);
+    if (legacy_scores) ds4_gpu_tensor_free(legacy_scores);
+    if (legacy_selected) ds4_gpu_tensor_free(legacy_selected);
+    if (kt) ds4_gpu_tensor_free(kt);
+    if (wt) ds4_gpu_tensor_free(wt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (scratch) ds4_gpu_tensor_free(scratch);
+    if (scores) ds4_gpu_tensor_free(scores);
+    if (selected) ds4_gpu_tensor_free(selected);
+    return rc;
+}
+
+static int test_indexer_select_wave64_exact_ab(void) {
+    return run_indexer_select_wave64_case(1024u, 4095u, true, false);
+}
+REGISTER_TEST(indexer_select_wave64_exact_ab,
+              test_indexer_select_wave64_exact_ab);
+
+static int test_indexer_select_wave64_disabled_fallback(void) {
+    return run_indexer_select_wave64_case(1024u, 4095u, true, false, true);
+}
+REGISTER_TEST(indexer_select_wave64_disabled_fallback,
+              test_indexer_select_wave64_disabled_fallback);
+
+static int test_indexer_select_wave64_causal(void) {
+    return run_indexer_select_wave64_case(1024u, 1599u, true, false);
+}
+REGISTER_TEST(indexer_select_wave64_causal,
+              test_indexer_select_wave64_causal);
+
+static int test_indexer_select_wave64_32768(void) {
+    if (!std::getenv("DS4_TEST_INDEXER_SELECT_32768")) return 0;
+    return run_indexer_select_wave64_case(32768u, 131071u, false, false);
+}
+REGISTER_TEST(indexer_select_wave64_32768,
+              test_indexer_select_wave64_32768);
+
+static int test_indexer_select_wave64_bench(void) {
+    if (!std::getenv("DS4_TEST_BENCH_INDEXER_SELECT")) return 0;
+    return run_indexer_select_wave64_case(1088u, 4351u, true, true);
+}
+REGISTER_TEST(indexer_select_wave64_bench,
+              test_indexer_select_wave64_bench);
 
 static int test_indexed_attention_causal_filler(void) {
     const uint32_t tokens = 2, heads = 1, dim = 4, raw_cap = 4, n_raw = 2;

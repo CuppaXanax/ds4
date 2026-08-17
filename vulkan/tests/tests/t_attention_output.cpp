@@ -21,7 +21,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
+#include <string>
+#include <chrono>
 
 /* ---- f16 helpers (same decode as ds4.c f16_to_f32) ---- */
 static uint16_t f32_to_f16(float f) {
@@ -368,3 +371,130 @@ static int test_attention_output_q8_batch(void) {
     return rc;
 }
 REGISTER_TEST(attention_output_q8_batch, test_attention_output_q8_batch);
+
+static void set_q8_group_wave64_rows8_env(const char *value) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_Q8_GROUP_WAVE64_ROWS8", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_Q8_GROUP_WAVE64_ROWS8", value, 1);
+    else unsetenv("DS4_VULKAN_Q8_GROUP_WAVE64_ROWS8");
+#endif
+}
+
+static int run_q8_group_wave64_rows8(bool benchmark) {
+    if (benchmark && !std::getenv("DS4_TEST_BENCH_Q8_GROUP_WAVE64_ROWS8")) return 0;
+    const uint32_t n_groups = 8u;
+    const uint64_t group_dim = 4096u, rank = 1024u;
+    const uint64_t blocks = 128u, row_bytes = blocks * 34u;
+    const uint64_t total_rows = (uint64_t)n_groups * rank;
+    const uint64_t weight_offset = 4096u;
+    const uint64_t model_size = weight_offset + total_rows * row_bytes;
+    std::vector<unsigned char> model(model_size, 0u);
+    for (uint64_t record = 0; record < total_rows * blocks; record++) {
+        unsigned char *block = model.data() + weight_offset + record * 34u;
+        const float scale = (float)((record % 7u) + 1u) * (1.0f / 1024.0f);
+        const uint16_t scale_bits = f32_to_f16(scale);
+        std::memcpy(block, &scale_bits, sizeof(scale_bits));
+        int8_t *payload = reinterpret_cast<int8_t *>(block + 2u);
+        for (uint32_t i = 0; i < 32u; i++)
+            payload[i] = (int8_t)((int)((record * 13u + i * 7u) % 255u) - 127);
+    }
+    std::vector<float> heads((size_t)n_groups * group_dim);
+    for (size_t i = 0; i < heads.size(); i++)
+        heads[i] = (float)((int)(i % 61u) - 30) * (1.0f / 64.0f);
+    std::vector<float> reference(total_rows), candidate(total_rows);
+    ds4_gpu_tensor *heads_tensor = ds4_gpu_tensor_alloc(heads.size() * sizeof(float));
+    ds4_gpu_tensor *low = ds4_gpu_tensor_alloc(total_rows * sizeof(float));
+    const char *saved = std::getenv("DS4_VULKAN_Q8_GROUP_WAVE64_ROWS8");
+    const bool had_saved = saved != nullptr;
+    const std::string saved_value = saved ? saved : "";
+    int rc = 1;
+    if (!heads_tensor || !low ||
+        !ds4_gpu_set_model_map(model.data(), model.size()) ||
+        !ds4_gpu_tensor_write(heads_tensor, 0, heads.data(),
+                              heads.size() * sizeof(float))) goto done;
+
+    set_q8_group_wave64_rows8_env("0");
+    if (!ds4_gpu_attention_output_low_q8_tensor(
+            low, model.data(), model.size(), weight_offset,
+            group_dim, rank, n_groups, heads_tensor) ||
+        ds4_gpu_q8_group_wave64_rows8_used() != 0 ||
+        !ds4_gpu_tensor_read(low, 0, reference.data(),
+                             reference.size() * sizeof(float))) goto done;
+    set_q8_group_wave64_rows8_env("1");
+    if (!ds4_gpu_attention_output_low_q8_tensor(
+            low, model.data(), model.size(), weight_offset,
+            group_dim, rank, n_groups, heads_tensor) ||
+        ds4_gpu_q8_group_wave64_rows8_used() != 1 ||
+        !ds4_gpu_tensor_read(low, 0, candidate.data(),
+                             candidate.size() * sizeof(float))) goto done;
+    if (std::memcmp(reference.data(), candidate.data(),
+                    reference.size() * sizeof(float)) != 0) {
+        for (uint64_t i = 0; i < total_rows; i++) {
+            if (reference[i] != candidate[i]) {
+                fprintf(stderr,
+                        "q8_group_wave64_rows8: i=%llu reference=%a candidate=%a\n",
+                        (unsigned long long)i, reference[i], candidate[i]);
+                break;
+            }
+        }
+        goto done;
+    }
+
+    if (benchmark) {
+        const uint32_t warmups = 3u, rounds = 12u;
+        for (uint32_t i = 0; i < warmups; i++) {
+            set_q8_group_wave64_rows8_env("0");
+            if (!ds4_gpu_attention_output_low_q8_tensor(
+                    low, model.data(), model.size(), weight_offset,
+                    group_dim, rank, n_groups, heads_tensor)) goto done;
+            set_q8_group_wave64_rows8_env("1");
+            if (!ds4_gpu_attention_output_low_q8_tensor(
+                    low, model.data(), model.size(), weight_offset,
+                    group_dim, rank, n_groups, heads_tensor)) goto done;
+        }
+        set_q8_group_wave64_rows8_env("0");
+        const auto base_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < rounds; i++)
+            if (!ds4_gpu_attention_output_low_q8_tensor(
+                    low, model.data(), model.size(), weight_offset,
+                    group_dim, rank, n_groups, heads_tensor)) goto done;
+        const auto base_end = std::chrono::steady_clock::now();
+        set_q8_group_wave64_rows8_env("1");
+        const auto candidate_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < rounds; i++)
+            if (!ds4_gpu_attention_output_low_q8_tensor(
+                    low, model.data(), model.size(), weight_offset,
+                    group_dim, rank, n_groups, heads_tensor)) goto done;
+        const auto candidate_end = std::chrono::steady_clock::now();
+        const double base_ms = std::chrono::duration<double, std::milli>(
+            base_end - base_begin).count() / rounds;
+        const double candidate_ms = std::chrono::duration<double, std::milli>(
+            candidate_end - candidate_begin).count() / rounds;
+        fprintf(stderr,
+                "q8_group_wave64_rows8_bench: groups=%u shape=%llux%llu "
+                "base_ms=%.3f candidate_ms=%.3f speedup=%.3fx\n",
+                n_groups, (unsigned long long)rank,
+                (unsigned long long)group_dim, base_ms, candidate_ms,
+                candidate_ms != 0.0 ? base_ms / candidate_ms : 0.0);
+    }
+    rc = 0;
+done:
+    if (had_saved) set_q8_group_wave64_rows8_env(saved_value.c_str());
+    else set_q8_group_wave64_rows8_env(nullptr);
+    if (low) ds4_gpu_tensor_free(low);
+    if (heads_tensor) ds4_gpu_tensor_free(heads_tensor);
+    return rc;
+}
+
+static int test_q8_group_wave64_rows8_exact_ab(void) {
+    return run_q8_group_wave64_rows8(false);
+}
+REGISTER_TEST(q8_group_wave64_rows8_exact_ab,
+              test_q8_group_wave64_rows8_exact_ab);
+
+static int test_q8_group_wave64_rows8_bench(void) {
+    return run_q8_group_wave64_rows8(true);
+}
+REGISTER_TEST(q8_group_wave64_rows8_bench,
+              test_q8_group_wave64_rows8_bench);

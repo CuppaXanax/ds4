@@ -1,0 +1,95 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/*
+ * Exact Wave64 Q8_0 GEMV for the Flash attention-output B projection.
+ *
+ * This is deliberately identical to matmul_q8_0_wave64_bfe except for the
+ * F16 weight-scale decode: unpackHalf2x16 replaces the scalar bitfield/exp2
+ * implementation.  Integer dot products and the final ascending 256-block
+ * FP32 reduction are unchanged, so the production arithmetic order remains
+ * bit-for-bit comparable with the established Wave64 path.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks_per_row;
+    uint y_scale;
+} pc;
+
+shared float block_terms[256];
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(word), int(byte_index * 8u), 8);
+}
+
+int packed_dot8(uint w0, uint w1, uint x0, uint x1) {
+    int sum = 0;
+    sum += i8_at(w0, 0u) * i8_at(x0, 0u);
+    sum += i8_at(w0, 1u) * i8_at(x0, 1u);
+    sum += i8_at(w0, 2u) * i8_at(x0, 2u);
+    sum += i8_at(w0, 3u) * i8_at(x0, 3u);
+    sum += i8_at(w1, 0u) * i8_at(x1, 0u);
+    sum += i8_at(w1, 1u) * i8_at(x1, 1u);
+    sum += i8_at(w1, 2u) * i8_at(x1, 2u);
+    sum += i8_at(w1, 3u) * i8_at(x1, 3u);
+    return sum;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    uint row = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.z;
+    uint block_slot = lid >> 2u;
+    uint word_slot = lid & 3u;
+    uint lane_base = block_slot << 2u;
+    float sum = 0.0;
+
+    if (pc.blocks_per_row != 256u || pc.in_dim != 8192u ||
+        pc.n_tok == 0u || token >= pc.n_tok || row >= pc.out_dim) {
+        return;
+    }
+
+    for (uint tile = 0u; tile < 16u; tile++) {
+        uint block = tile * 16u + block_slot;
+        uint record = row * pc.blocks_per_row + block;
+        uint weight_word = record * 8u + word_slot * 2u;
+        uint x_word = token * pc.blocks_per_row * 9u + block * 9u +
+                      1u + word_slot * 2u;
+        int partial = packed_dot8(payload_buf[weight_word],
+                                  payload_buf[weight_word + 1u],
+                                  x_q8_buf[x_word], x_q8_buf[x_word + 1u]);
+
+        int p0 = subgroupShuffle(partial, lane_base + 0u);
+        int p1 = subgroupShuffle(partial, lane_base + 1u);
+        int p2 = subgroupShuffle(partial, lane_base + 2u);
+        int p3 = subgroupShuffle(partial, lane_base + 3u);
+        if (word_slot == 0u) {
+            int block_dot = p0 + p1 + p2 + p3;
+            uint scale_word = scale_buf[record >> 1u];
+            vec2 scale_pair = unpackHalf2x16(scale_word);
+            float weight_scale = (record & 1u) == 0u ?
+                scale_pair.x : scale_pair.y;
+            uint x_scale_word = token * pc.blocks_per_row * 9u + block * 9u;
+            float scale_product = weight_scale *
+                                   uintBitsToFloat(x_q8_buf[x_scale_word]);
+            block_terms[block] = scale_product * float(block_dot);
+        }
+    }
+
+    barrier();
+    if (lid == 0u) {
+        for (uint block = 0u; block < 256u; block++)
+            sum += block_terms[block];
+        out_buf[token * pc.out_dim + row] = sum;
+    }
+}

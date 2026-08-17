@@ -7,10 +7,9 @@
 extern "C" {
 #endif
 
-/* Execution layout for IQ2_XXS rows.  Each row contains, in order,
- * nb scale words, 8*nb transposed q words, and 8*nb transposed aux words.
- * The row stride is storage-alignment padded; source GGUF bytes are never
- * exposed to the shader. */
+/* Execution layout for IQ2_XXS 16-row tiles. Each tile contains scale words
+ * followed by q/aux fields ordered [ib][row-in-tile][block], so one Wave64
+ * spans four rows and reads a contiguous 64-word segment. */
 struct ds4_vulkan_iq2_repacked_artifact {
     uint8_t *data;
     uint64_t bytes;

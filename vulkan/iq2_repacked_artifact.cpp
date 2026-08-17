@@ -19,12 +19,14 @@ int ds4_vulkan_iq2_repacked_build(
         in_dim % 256u != 0) return 0;
     const uint64_t blocks = in_dim / 256u;
     if (blocks > UINT64_MAX / 68u) return 0;
-    const uint64_t payload = blocks * 68u;
+    constexpr uint64_t tile_rows = 16u;
+    const uint64_t payload = blocks * tile_rows * 68u;
     const uint64_t alignment = std::max<uint64_t>(256u,
                                                    min_storage_buffer_offset_alignment);
     const uint64_t row_bytes = align_up(payload, alignment);
-    if (row_bytes < payload || out_dim > UINT64_MAX / row_bytes) return 0;
-    const uint64_t expert_bytes = out_dim * row_bytes;
+    const uint64_t tiles = (out_dim + tile_rows - 1u) / tile_rows;
+    if (row_bytes < payload || tiles > UINT64_MAX / row_bytes) return 0;
+    const uint64_t expert_bytes = tiles * row_bytes;
     if (experts > UINT64_MAX / expert_bytes) return 0;
     const uint64_t total = experts * expert_bytes;
     const uint64_t raw_expert_bytes = out_dim * raw_row_bytes;
@@ -38,24 +40,28 @@ int ds4_vulkan_iq2_repacked_build(
     if (!data) return 0;
     const uint8_t *raw = static_cast<const uint8_t *>(model_map) + source_offset;
     for (uint64_t expert = 0; expert < experts; ++expert) {
-        for (uint64_t row = 0; row < out_dim; ++row) {
-            uint8_t *dst = data + expert * expert_bytes + row * row_bytes;
-            const uint8_t *src = raw + expert * raw_expert_bytes + row * raw_row_bytes;
-            /* [scale][q0..q7][aux0..aux7], with each field transposed across
-             * blocks so Wave64 lanes issue contiguous words for every ib. */
-            for (uint64_t block = 0; block < blocks; ++block) {
-                const uint8_t *rb = src + block * 66u;
-                uint32_t scale = 0;
-                std::memcpy(&scale, rb, sizeof(uint16_t));
-                std::memcpy(dst + block * 4u, &scale, sizeof(scale));
-                for (uint64_t ib = 0; ib < 8; ++ib) {
-                    uint32_t q = 0, aux = 0;
-                    std::memcpy(&q, rb + 2u + ib * 8u, sizeof(q));
-                    std::memcpy(&aux, rb + 6u + ib * 8u, sizeof(aux));
-                    std::memcpy(dst + (blocks + ib * blocks + block) * 4u,
-                                &q, sizeof(q));
-                    std::memcpy(dst + (9u * blocks + ib * blocks + block) * 4u,
-                                &aux, sizeof(aux));
+        for (uint64_t tile = 0; tile < tiles; ++tile) {
+            uint8_t *dst = data + expert * expert_bytes + tile * row_bytes;
+            for (uint64_t local = 0; local < tile_rows; ++local) {
+                const uint64_t row = tile * tile_rows + local;
+                if (row >= out_dim) continue;
+                const uint8_t *src = raw + expert * raw_expert_bytes + row * raw_row_bytes;
+                for (uint64_t block = 0; block < blocks; ++block) {
+                    const uint8_t *rb = src + block * 66u;
+                    uint32_t scale = 0;
+                    std::memcpy(&scale, rb, sizeof(uint16_t));
+                    std::memcpy(dst + (local * blocks + block) * 4u,
+                                &scale, sizeof(scale));
+                    for (uint64_t ib = 0; ib < 8; ++ib) {
+                        uint32_t q = 0, aux = 0;
+                        std::memcpy(&q, rb + 2u + ib * 8u, sizeof(q));
+                        std::memcpy(&aux, rb + 6u + ib * 8u, sizeof(aux));
+                        const uint64_t lane_word = local * blocks + block;
+                        std::memcpy(dst + (16u * blocks + ib * 16u * blocks + lane_word) * 4u,
+                                    &q, sizeof(q));
+                        std::memcpy(dst + (9u * 16u * blocks + ib * 16u * blocks + lane_word) * 4u,
+                                    &aux, sizeof(aux));
+                    }
                 }
             }
         }

@@ -73,23 +73,27 @@ uint up_weight_u32(uint byte_idx) {
     return (lo >> shift) | (b2[word_idx + 1u] << (32u - shift));
 }
 #else
-/* Repacked rows are 4-byte aligned and transposed by IQ2 field.  For each
- * ib, Wave64 lanes 0..15 therefore issue consecutive q/aux word loads. */
-uint repacked_q_word(uint row_byte, uint block, uint ib) {
+/* Repacked 16-row tiles are ordered [ib][row][block].  The four Wave64s in
+ * the workgroup consequently issue one contiguous 64-word segment each. */
+uint repacked_q_word(uint row_byte, uint row_in_tile, uint block, uint ib) {
     uint row_word = row_byte >> 2u;
-    return b1[row_word + pc.q8_blocks + ib * pc.q8_blocks + block];
+    uint lane_word = row_in_tile * pc.q8_blocks + block;
+    return b1[row_word + 16u * pc.q8_blocks + ib * 16u * pc.q8_blocks + lane_word];
 }
-uint repacked_aux_word(uint row_byte, uint block, uint ib) {
+uint repacked_aux_word(uint row_byte, uint row_in_tile, uint block, uint ib) {
     uint row_word = row_byte >> 2u;
-    return b1[row_word + 9u * pc.q8_blocks + ib * pc.q8_blocks + block];
+    uint lane_word = row_in_tile * pc.q8_blocks + block;
+    return b1[row_word + 9u * 16u * pc.q8_blocks + ib * 16u * pc.q8_blocks + lane_word];
 }
-uint repacked_up_q_word(uint row_byte, uint block, uint ib) {
+uint repacked_up_q_word(uint row_byte, uint row_in_tile, uint block, uint ib) {
     uint row_word = row_byte >> 2u;
-    return b2[row_word + pc.q8_blocks + ib * pc.q8_blocks + block];
+    uint lane_word = row_in_tile * pc.q8_blocks + block;
+    return b2[row_word + 16u * pc.q8_blocks + ib * 16u * pc.q8_blocks + lane_word];
 }
-uint repacked_up_aux_word(uint row_byte, uint block, uint ib) {
+uint repacked_up_aux_word(uint row_byte, uint row_in_tile, uint block, uint ib) {
     uint row_word = row_byte >> 2u;
-    return b2[row_word + 9u * pc.q8_blocks + ib * pc.q8_blocks + block];
+    uint lane_word = row_in_tile * pc.q8_blocks + block;
+    return b2[row_word + 9u * 16u * pc.q8_blocks + ib * 16u * pc.q8_blocks + lane_word];
 }
 #endif
 
@@ -112,7 +116,8 @@ uint iq2_sign_mask(uint index) {
 }
 
 void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
-                        uint block, out float gate, out float up) {
+                        uint block, uint row_in_tile,
+                        out float gate, out float up) {
 #if DS4_ROUTED_IQ2_REPACKED
     uint row_word = row_byte >> 2u;
 #else
@@ -125,8 +130,8 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
     float input_scale = uintBitsToFloat(b0[xb]);
 #endif
 #if DS4_ROUTED_IQ2_REPACKED
-    float gate_scale = input_scale * f16(b1[row_word + block] & 0xffffu);
-    float up_scale = input_scale * f16(b2[row_word + block] & 0xffffu);
+    float gate_scale = input_scale * f16(b1[row_word + row_in_tile * pc.q8_blocks + block] & 0xffffu);
+    float up_scale = input_scale * f16(b2[row_word + row_in_tile * pc.q8_blocks + block] & 0xffffu);
 #else
     float gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
     float up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
@@ -135,10 +140,10 @@ void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
     int up_sum = 0;
     for (uint ib = 0u; ib < 8u; ++ib) {
 #if DS4_ROUTED_IQ2_REPACKED
-        uint gate_q = repacked_q_word(row_byte, block, ib);
-        uint gate_aux = repacked_aux_word(row_byte, block, ib);
-        uint up_q = repacked_up_q_word(row_byte, block, ib);
-        uint up_aux = repacked_up_aux_word(row_byte, block, ib);
+        uint gate_q = repacked_q_word(row_byte, row_in_tile, block, ib);
+        uint gate_aux = repacked_aux_word(row_byte, row_in_tile, block, ib);
+        uint up_q = repacked_up_q_word(row_byte, row_in_tile, block, ib);
+        uint up_aux = repacked_up_aux_word(row_byte, row_in_tile, block, ib);
 #else
         uint qbase = wb + 2u + ib * 8u;
         uint gate_q = weight_u32(qbase);
@@ -325,10 +330,15 @@ void main() {
         float gate_partial = 0.0;
         float up_partial = 0.0;
         if (expert < pc.n_total_expert) {
+#if DS4_ROUTED_IQ2_REPACKED
+            uint row_byte = expert * pc.gate_expert_bytes +
+                            (output_block * 16u + tile) * pc.gate_row_bytes;
+#else
             uint row_byte = expert * pc.gate_expert_bytes +
                             row * pc.gate_row_bytes;
+#endif
             float gate_block, up_block;
-            iq2_block_dot_pair(row_byte, token, pc.q8_blocks, lane,
+            iq2_block_dot_pair(row_byte, token, pc.q8_blocks, lane, row_in_tile,
                                gate_block, up_block);
             gate_partial += gate_block;
             up_partial += up_block;

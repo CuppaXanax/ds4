@@ -3,7 +3,8 @@
 /* Opt-in BC-250 decode tail appliance.
  *
  * This is deliberately bounded to the production Flash shape: six routed
- * Q2 ranks, 2048-value routed mid, 4096 output, and a four-stream HC tail.
+ * Q2 ranks, 2048-value routed/shared mids, 4096 output, and a four-stream HC
+ * tail.
  * One workgroup owns five output rows.  The eight-lane rank slots preserve
  * the existing Q2 block dot/reduction and rank-ascending FP32 sum; rank zero
  * then performs the shared Q8 down reduction in ascending block order and
@@ -40,10 +41,10 @@ layout(push_constant) uniform PC {
     uint add_enabled; uint q2_words;
 } pc;
 
-const uint SHARED_BLOCKS = 128u;
+const uint SHARED_BLOCKS = 64u;
 const uint N_HC = 4u;
 const uint Q2_ARTIFACT_BLOCKS = 8u;
-const uint Q8_ARTIFACT_BLOCKS = 16u;
+const uint Q8_ARTIFACT_BLOCKS = 8u;
 
 shared float dot_values[256];
 shared float rank_values[32];

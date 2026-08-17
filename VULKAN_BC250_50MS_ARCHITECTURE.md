@@ -219,11 +219,14 @@ freeing it, and the sequenced full suite is clean.  This is a correctness gate,
 not a production performance claim.
 
 The branch also contains an opt-in production-shape fusion for routed Q2 down,
-shared Q8 down, routed/shared addition, and HC post-processing.  Static review
-closed a fail-open admission bug and added explicit residual/split hazards; the
-shader and full Vulkan build validate.  Its API intentionally admits only the
-real 4096->2048->4096, 256-expert/6-selected shape, so a valid standalone gate
-requires roughly a 1.9 GiB synthetic model map.  It remains disabled until a
+shared Q8 down, routed/shared addition, and HC post-processing. Static review
+closed a fail-open admission bug and added explicit residual/split hazards.
+A later call-graph audit found a more fundamental reachability defect: the
+host, backend, and shader assumed a 4096-wide shared intermediate, while the
+Flash model's shared intermediate is 2048 wide. The corrected path now admits
+the real shared 2048->4096 matrix, consumes 64 Q8_0 source blocks/eight packed
+artifact tiles, and retains the routed 4096->2048->4096 shape. GLSL, SPIR-V,
+the C graph, and the C++ backend validate. It remains disabled until a
 full-shape fused-vs-unfused HC comparison and full-model exactness gate pass.
 
 ## Remaining qualification gates

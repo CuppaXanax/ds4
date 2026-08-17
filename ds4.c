@@ -24952,7 +24952,7 @@ static bool metal_graph_encode_decode_layer_phase(
         layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
         DS4_N_EXPERT == 256u && DS4_N_EXPERT_USED == 6u &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u &&
-        routed_out_dim == 4096u && shared_dim == 4096u;
+        routed_out_dim == 4096u && shared_dim == 2048u;
     if (ok && !tp_fold_ffn && !cuda_tp_moe && routed_shared_hc_candidate) {
         ok = ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
                 metal_graph_after_ffn_hc(g), metal_graph_routed_out(g),

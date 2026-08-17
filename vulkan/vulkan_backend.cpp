@@ -8111,11 +8111,20 @@ static bool ds4gk_routed_common(
         gate_type == 16u && down_type == 10u &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u &&
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u &&
-        shared_hc_tail->shared_in_dim == 4096u &&
+        shared_hc_tail->shared_in_dim == 2048u &&
         shared_hc_tail->shared_out_dim == 4096u &&
         shared_hc_tail->n_embd == 4096u && shared_hc_tail->n_hc == 4u &&
         g_vk.shader_map.find("routed_moe_q2_shared_hc_exec") !=
             g_vk.shader_map.end();
+    if (getenv("DS4_VULKAN_TRACE_KERNELS") && shared_hc_tail) {
+        fprintf(stderr,
+                "ds4: [trace] mixed routed/shared HC candidate admitted=%u "
+                "shared=%u->%u routed=%u->%u->%u selected=%u\n",
+                use_shared_hc_tail ? 1u : 0u,
+                shared_hc_tail->shared_in_dim,
+                shared_hc_tail->shared_out_dim,
+                expert_in_dim, expert_mid_dim, out_dim, n_expert);
+    }
     /* The caller's REQUIRE switch is a hard admission gate.  Do not let a
      * missing Q2/Q8 artifact silently return success through the ordinary
      * routed path: the C graph would then suppress the later shared-down/HC
@@ -8130,13 +8139,13 @@ static bool ds4gk_routed_common(
         use_shared_hc_tail = shared_hc_tail->out_hc &&
             shared_hc_tail->shared_mid && shared_hc_tail->residual_hc &&
             shared_hc_tail->split &&
-            shared_hc_tail->shared_mid->bytes >= 4096u * sizeof(float) &&
+            shared_hc_tail->shared_mid->bytes >= 2048u * sizeof(float) &&
             shared_hc_tail->out_hc->bytes >= 4096u * 4u * sizeof(float) &&
             shared_hc_tail->residual_hc->bytes >= 4096u * 4u * sizeof(float) &&
             shared_hc_tail->split->bytes >= 32u * sizeof(float) &&
             ensure_execution_q8_artifact(
                 model_map, model_size, shared_hc_tail->shared_weight_offset,
-                4096u, 4096u, shared_execution);
+                2048u, 4096u, shared_execution);
         if (!use_shared_hc_tail && getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE"))
             return false;
     }
@@ -8362,12 +8371,15 @@ static bool ds4gk_routed_common(
         pc.q8_blocks = (uint32_t)mid_blocks;
     }
     if (ok && use_shared_hc_tail) {
-        const uint64_t shared_q8_bytes = 128u * 36u;
+        const uint64_t shared_q8_blocks =
+            (shared_hc_tail->shared_in_dim + 31u) / 32u;
+        const uint64_t shared_q8_bytes = shared_q8_blocks * 36u;
         owned.shared_q8 = ds4_gpu_tensor_alloc_device_scratch(shared_q8_bytes);
         if (!owned.shared_q8 ||
             ds4_gpu_quantize_q8_0_tensor(owned.shared_q8,
                                          shared_hc_tail->shared_mid,
-                                         4096u, 1u) == 0) {
+                                         shared_hc_tail->shared_in_dim,
+                                         1u) == 0) {
             ds4_gpu_tensor_free(owned.shared_q8);
             owned.shared_q8 = nullptr;
             use_shared_hc_tail = false;

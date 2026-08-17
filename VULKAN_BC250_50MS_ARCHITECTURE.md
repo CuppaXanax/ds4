@@ -7,7 +7,7 @@
 
 Date: 2026-08-17  
 Reference baseline: `origin/pr-557-merge` at `8fb6bd9`  
-Integrated execution-artifact candidate: `951c666` (not promoted and not a TPS result)
+Integrated streaming candidate: `4262c43` (not promoted and not a TPS result)
 
 ## Target and authoritative budget
 
@@ -143,7 +143,7 @@ as an achieved forecast; their overlap must be measured on the same binary.
 
 ## Achieved substrate evidence
 
-The integrated candidate through `951c666` now losslessly repacks and consumes
+The integrated candidate through `4262c43` now losslessly repacks and consumes
 all three hot quantized weight families:
 
 - dense Q8 through `matmul_q8_0_exec`;
@@ -178,15 +178,15 @@ For common 4096-input Q8 projections, a validated 128-lane variant replaces the
 
 These results prove the representation, GPU consumers, and startup memory
 shape.  They are not a production layer timing, a full-model exactness result,
-or a TPS claim.  `951c666` remains a candidate branch and has not replaced the
+or a TPS claim.  `4262c43` remains a candidate branch and has not replaced the
 `8fb6bd9` deployment baseline.
 
 ### Composed streaming infrastructure review
 
 The execution-artifact substrate was composed with the persistent descriptor
-cache and the resource hazard tracker in the clean integration branch
-`codex/integrated-streaming-substrate-review`.  The combined Vulkan build
-passes with all 67 shader variants.  Descriptor sets remain live through their
+cache and the resource hazard tracker on
+`codex/execution-artifact-substrate`.  The combined Vulkan build passes with
+72 compiled shader variants.  Descriptor sets remain live through their
 command-ring retirement epoch, are recycled only after completion, and are
 never rewritten while a submitted command buffer can reference them.  The
 recording-generation key prevents reuse across command-buffer generations and
@@ -197,8 +197,20 @@ also requires an active layer or worker-slice batch.  Outside that explicit
 scope the established blanket-barrier path is unchanged.  Unknown shader
 interfaces and allocation aliases are conservative; routed dispatches retain
 their existing explicit input/output barriers.  This branch is therefore
-ready for a focused exactness and sustained-TPS gate, but it is not itself a
-production performance claim.
+passed the complete BC-250 Vulkan harness on `.53`: 89 tests passed and zero
+failed with hazard tracking enabled.  The earlier router-select failure was a
+test-lifetime defect: the Q2 artifact test freed its synthetic model without
+retiring the backend model identity.  The test now retires that identity before
+freeing it, and the sequenced full suite is clean.  This is a correctness gate,
+not a production performance claim.
+
+The branch also contains an opt-in production-shape fusion for routed Q2 down,
+shared Q8 down, routed/shared addition, and HC post-processing.  Static review
+closed a fail-open admission bug and added explicit residual/split hazards; the
+shader and full Vulkan build validate.  Its API intentionally admits only the
+real 4096->2048->4096, 256-expert/6-selected shape, so a valid standalone gate
+requires roughly a 1.9 GiB synthetic model map.  It remains disabled until a
+full-shape fused-vs-unfused HC comparison and full-model exactness gate pass.
 
 ## Remaining qualification gates
 

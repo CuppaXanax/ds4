@@ -70,6 +70,26 @@ else:
                             (result.stdout.strip(), result.stderr.strip()) if part)
     print(f"FAIL {q8_exec.name} local128: {diagnostics}", file=sys.stderr)
 
+# The tile-major artifact payload is already word-contiguous inside each
+# 256-element tile. On a proven Wave64 device, use one lane per payload word
+# so each load instruction sees consecutive words instead of one lane per
+# whole 32-byte Q8 block. The ordinary artifact variants remain available
+# for non-Wave64 devices.
+q8_exec_wave64 = SRC_DIR / "matmul_q8_0_exec_wave64.comp"
+q8_exec_wave64_spv = OUT_DIR / "matmul_q8_0_exec_wave64.spv"
+result = subprocess.run(
+    [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+     str(q8_exec_wave64), "-o", str(q8_exec_wave64_spv)],
+    capture_output=True, text=True
+)
+if result.returncode == 0:
+    compiled += 1
+else:
+    failed += 1
+    diagnostics = "\n".join(part for part in
+                            (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"FAIL {q8_exec_wave64.name}: {diagnostics}", file=sys.stderr)
+
 # BC-250's GFX1013 path has Wave64 subgroups.  These variants preserve the
 # scalar arithmetic and reduction order but replace repeated workgroup
 # barriers with subgroup shuffles; the runtime admits them only on a proven

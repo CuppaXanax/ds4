@@ -181,6 +181,25 @@ shape.  They are not a production layer timing, a full-model exactness result,
 or a TPS claim.  `951c666` remains a candidate branch and has not replaced the
 `8fb6bd9` deployment baseline.
 
+### Composed streaming infrastructure review
+
+The execution-artifact substrate was composed with the persistent descriptor
+cache and the resource hazard tracker in the clean integration branch
+`codex/integrated-streaming-substrate-review`.  The combined Vulkan build
+passes with all 67 shader variants.  Descriptor sets remain live through their
+command-ring retirement epoch, are recycled only after completion, and are
+never rewritten while a submitted command buffer can reference them.  The
+recording-generation key prevents reuse across command-buffer generations and
+unsubmitted validation allocations are returned safely.
+
+The hazard tracker is deliberately opt-in (`DS4_VULKAN_HAZARD_TRACKER=1`) and
+also requires an active layer or worker-slice batch.  Outside that explicit
+scope the established blanket-barrier path is unchanged.  Unknown shader
+interfaces and allocation aliases are conservative; routed dispatches retain
+their existing explicit input/output barriers.  This branch is therefore
+ready for a focused exactness and sustained-TPS gate, but it is not itself a
+production performance claim.
+
 ## Remaining qualification gates
 
 For each materially different architecture candidate:

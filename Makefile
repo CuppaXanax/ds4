@@ -66,7 +66,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan vulkan-roofline-a
+.PHONY: all help clean test test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan vulkan-roofline-a vulkan-roofline-c
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -364,6 +364,9 @@ ds4_vulkan.o: vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.h vulkan/shad
 
 vulkan/q8_aligned_artifact.o: vulkan/q8_aligned_artifact.cpp vulkan/q8_aligned_artifact.h
 	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -c -o $@ vulkan/q8_aligned_artifact.cpp
+
+vulkan-roofline-c: vulkan/roofline_c.cpp vulkan/vulkan_backend.cpp vulkan/q8_aligned_artifact.cpp
+	$(VULKAN_CXX) $(VULKAN_CXXFLAGS) -DDS4_VULKAN_BUILD -o $@ $^ $(VULKAN_LDLIBS)
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)

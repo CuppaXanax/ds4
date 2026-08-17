@@ -98,17 +98,16 @@ static int test_routed_q2_execution_artifact(void) {
     setenv("DS4_VULKAN_TEST_ROUTED_DOWN_REDUCE", "1", 1);
     setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "0", 1);
     if (!run()) { std::fprintf(stderr, "q2_exec: baseline run failed\n"); return cleanup(); }
+    /* Retire the baseline before reading it or replacing its raw weight
+     * range.  A command-ring read can otherwise observe the old mapped
+     * contents and leave the overlap guard unable to remove the raw cache. */
+    if (!ds4_gpu_synchronize()) {
+        std::fprintf(stderr, "q2_exec: baseline synchronize failed\n");
+        return cleanup();
+    }
     std::vector<float> baseline(out_dim);
     if (!ds4_gpu_tensor_read(out, 0, baseline.data(), baseline.size() * sizeof(float))) {
         std::fprintf(stderr, "q2_exec: baseline read failed\n");
-        return cleanup();
-    }
-    /* The baseline dispatch may still be in the command-ring recording
-     * window.  The artifact builder must be allowed to retire the raw range
-     * before it replaces it, otherwise the overlap guard deliberately falls
-     * back to raw storage and the required replay has nothing to bind. */
-    if (!ds4_gpu_synchronize()) {
-        std::fprintf(stderr, "q2_exec: baseline synchronize failed\n");
         return cleanup();
     }
     /* Build the execution artifact while the execution path is enabled.  The

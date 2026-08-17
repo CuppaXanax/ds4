@@ -4067,7 +4067,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,
                 (unsigned long long)in_dim, (unsigned long long)out_dim);
-    if (!use_execution && execution_artifact_required(ExecQ8)) {
+    /* The execution artifact consumer is deliberately the decode (n_tok=1)
+     * stream. Prefill still uses its token-batched Q8 path; requiring the
+     * decode artifact must not make that separate path fail closed before a
+     * decode token is reached. Keep counting the prefill fallback so coverage
+     * remains visible, but enforce strictness on the intended decode shape. */
+    if (!use_execution && n_tok == 1u && execution_artifact_required(ExecQ8)) {
         g_vk.execution_artifact_stats[ExecQ8].failures++;
         execution_artifact_failure(ExecQ8, nullptr, "runtime dispatch");
         return 0;

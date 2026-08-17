@@ -56,9 +56,24 @@ distinct-weight ledger is approximately 8.9 GiB/token:
 8.9 GiB / 246.8 GB/s ~=  39 ms
 ```
 
-The latter two figures are bounds, not achieved results.  They establish that
-the production graph must approach the streaming layout while keeping all
-quantized arithmetic and dependency overhead inside the remaining budget.
+The latter two figures are bounds, not achieved results.  Two hundred GB/s is
+an intermediate gate, not a sufficient final target: approximately 48 ms of
+weight traffic leaves essentially no budget for quantized arithmetic,
+attention state, graph overhead, transport, or the output head.  The credible
+production target is at least 220 GB/s useful traffic or a materially smaller
+execution byte count.
+
+The hard 50 ms allocation is:
+
+| Category | Token budget | Per layer |
+|---|---:|---:|
+| Weight stream plus quantized arithmetic | <=43.5 ms | <=1.01 ms |
+| Attention/projection non-weight work | <=2.0 ms | <=0.047 ms |
+| Routed/shared-MoE non-weight work | <=1.5 ms | <=0.035 ms |
+| KV/output/other GPU work | <=0.5 ms | <=0.012 ms |
+| CPU/Vulkan graph/fence overhead | <=2.0 ms | <=0.047 ms |
+| Transport/coordinator handoff | <=0.5 ms | <=0.012 ms |
+| Headroom | 0.0-0.5 ms | -- |
 
 Transport is not a credible primary explanation: the retained worker-hop
 measurement is approximately 0.08-0.13 ms/hop.  Warm decode also recorded 76
@@ -87,8 +102,7 @@ and Q-B reach approximately 147 and 226 GB/s respectively in the same family
 of tests.  Those C results are diagnostic, not whole-token results.
 
 The architecture-level gate is not “one IQ2 shader got faster.”  It is a
-production useful-stream target of at least 200 GB/s, preferably 220 GB/s,
-across the decode-critical
+production useful-stream target of at least 220 GB/s across the decode-critical
 weight families.  Reaching that region can remove well over 20 ms/token and is
 the only single-topology change that can plausibly remove most of the current
 139 ms GPU budget.

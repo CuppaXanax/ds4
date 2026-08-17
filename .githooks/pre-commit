@@ -11,8 +11,8 @@ fi
 extra_branches="$(git for-each-ref --format='%(refname:short)' refs/heads/ |
     grep -Ev '^(main|pr-557-merge)$' || true)"
 extra_count="$(printf '%s\n' "$extra_branches" | grep -c . || true)"
-if [ "$extra_count" -gt 1 ]; then
-    echo "Refusing commit with more than one candidate branch:" >&2
+if [ "$extra_count" -ne 0 ]; then
+    echo "Refusing commit with candidate branches; use one disposable scored checkout:" >&2
     echo "$extra_branches" >&2
     exit 1
 fi
@@ -31,7 +31,7 @@ if [ "${DS4_USER_APPROVED_PROMOTION:-}" != "1" ]; then
     echo "Refusing runtime commit directly to pr-557-merge." >&2
     echo "Staged runtime paths:" >&2
     echo "$outside_system" >&2
-    echo "Only the user may set DS4_USER_APPROVED_PROMOTION=1 after reviewing qualifying evidence." >&2
+    echo "Set DS4_USER_APPROVED_PROMOTION=1 only after explicit user approval of qualifying evidence." >&2
     exit 1
 fi
 

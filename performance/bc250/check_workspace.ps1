@@ -1,8 +1,7 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [switch]$AllowDirtyEngineeringSystem,
-    [string]$CandidateBranch
+    [switch]$AllowDirtyEngineeringSystem
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,9 +37,8 @@ Push-Location $repoPath
 try {
     $branch = (Invoke-GitChecked branch --show-current | Select-Object -First 1).Trim()
     $isBaselineBranch = $branch -eq $manifest.runtime_lkg.branch
-    $isCandidateBranch = $CandidateBranch -and $branch -eq $CandidateBranch
-    if (-not $isBaselineBranch -and -not $isCandidateBranch) {
-        throw "Expected branch $($manifest.runtime_lkg.branch) or explicit -CandidateBranch; found $branch"
+    if (-not $isBaselineBranch) {
+        throw "Expected runtime branch $($manifest.runtime_lkg.branch); found $branch"
     }
 
     & git cat-file -e "$baselineCommit^{commit}" 2>$null
@@ -64,9 +62,6 @@ try {
     }
 
     $allowedBranches = @("main", [string]$manifest.runtime_lkg.branch)
-    if ($CandidateBranch) {
-        $allowedBranches += $CandidateBranch
-    }
     $localBranches = @(Invoke-GitChecked for-each-ref --format="%(refname:short)" refs/heads/)
     $unexpectedBranches = @($localBranches | Where-Object { $_ -notin $allowedBranches })
     if ($unexpectedBranches.Count -ne 0) {
@@ -79,7 +74,7 @@ try {
         Invoke-GitChecked ls-files --others --exclude-standard
     ) | Sort-Object -Unique
     $runtimeChanges = @($changedFromLkg | Where-Object { $_ -notmatch $allowedPattern })
-    if ($runtimeChanges.Count -ne 0 -and $isBaselineBranch) {
+    if ($runtimeChanges.Count -ne 0) {
         throw "Runtime tree differs from LKG outside the engineering system: $($runtimeChanges -join ', ')"
     }
 
@@ -126,7 +121,7 @@ try {
     [pscustomobject]@{
         verdict = "PASS"
         branch = $branch
-        mode = $(if ($isBaselineBranch) { "baseline" } else { "candidate" })
+        mode = "baseline"
         head = (Invoke-GitChecked rev-parse HEAD | Select-Object -First 1).Trim()
         runtime_lkg = $baselineCommit
         runtime_tree = $baselineTree

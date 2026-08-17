@@ -58,21 +58,18 @@ python3 performance/bc250/score.py \
 ```
 
 `promote_eligible` still requires the user's decision. Hooks reject direct
-runtime commits to `pr-557-merge` and reject every push without explicit human
-approval.
+runtime commits to `pr-557-merge` without that approval and reject every push
+without separate explicit human approval.
 
-For a candidate, the user creates one branch and names it explicitly when
-checking the workspace:
-
-```powershell
-.\performance\bc250\check_workspace.ps1 -CandidateBranch perf/iq2-layout
-```
-
-The capture script scores the runtime commit named by `DS4_EXPECTED_COMMIT`.
-This lets the baseline remain the pinned LKG even though the current branch has
-an engineering-system-only descendant commit. A candidate sets the variable to
-its own clean commit; if its build adds a shader, it also sets
-`DS4_EXPECTED_SHADER_COUNT` to the reviewed count.
+Candidates do not get branches or worktrees. Build each candidate as a clean,
+deterministic commit in a disposable checkout rooted at the exact runtime LKG.
+Record its base commit, patch SHA-256, commit/tree, binaries, and shader
+manifest in the ignored evidence directory. Set `DS4_EXPECTED_COMMIT` to that
+disposable commit when capturing its three canonical runs; if its build adds a
+shader, also set `DS4_EXPECTED_SHADER_COUNT` and
+`DS4_EXPECTED_SHADER_MANIFEST` to the reviewed values. After scoring, delete
+the disposable checkout. A promoted patch is applied once to
+`pr-557-merge`; no candidate ref survives.
 
 ## Current technical lane
 

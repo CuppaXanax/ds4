@@ -19,16 +19,22 @@ trying” after a failed gate.
   rebuild, deploy, reboot, or reconfigure any blade without explicit approval
   in the current turn.
 - Do not create subagents unless the user explicitly requests them.
-- Do not create a branch or worktree unless the user explicitly requests it.
-- Keep at most one candidate branch. Never create per-hypothesis branches.
+- Do not create candidate branches or worktrees. Runtime candidates are clean,
+  disposable checkouts under `/tmp`, identified by the LKG base commit, exact
+  patch SHA-256, candidate commit/tree, binaries, and shader manifest. Delete
+  the checkout after scoring or rejection; retain the ignored evidence record.
+- The only local branches are `main` and the runtime LKG branch declared in
+  `performance/bc250/lkg.json`.
 - Never commit runtime changes directly to `pr-557-merge` without explicit
   user approval and qualifying evidence from `performance/bc250/score.py`.
   User-requested engineering-system-only commits are permitted. Those paths
   are `AGENTS.md`, `.gitattributes`, `.gitignore`, `.githooks/`, and
   `performance/bc250/`.
 - Never push any ref without explicit user approval in the current turn.
-- Never set `DS4_USER_APPROVED_PROMOTION` or `DS4_USER_APPROVED_PUSH`; those
-  variables are human authorization gates.
+- Never infer promotion or push approval. An agent may set
+  `DS4_USER_APPROVED_PROMOTION=1` only when the user explicitly approved
+  promotion of the exact scored candidate in the current turn. Never set
+  `DS4_USER_APPROVED_PUSH`; the user must separately authorize every push.
 - Do not store experiment patches, generated logs, or benchmark output in the
   source tree. Use `performance/bc250/evidence/`, which is ignored.
 
@@ -75,10 +81,13 @@ For a GPU candidate, retain evidence for:
 Change one causal unit per scored candidate. Do not combine unrelated kernel,
 scheduler, allocator, and deployment changes in one performance verdict.
 
-A scored runtime candidate must be a clean commit on the single user-created
-candidate branch. The user supplies that branch name with
-`check_workspace.ps1 -CandidateBranch NAME`; agents do not create it
-themselves.
+A scored runtime candidate must be a clean deterministic commit in a disposable
+checkout rooted at the exact runtime LKG. Its evidence must bind the LKG base,
+patch hash, candidate commit/tree, binaries, shader manifest, exactness
+artifacts, activation proof, and scores. It never gets a persistent branch.
+After a `promote_eligible` verdict and explicit user approval, apply that exact
+patch once to the runtime LKG branch, commit it, update `lkg.json`, and delete
+the disposable checkout. Do not ask the user to name internal Git objects.
 
 ## Promotion and stopping
 

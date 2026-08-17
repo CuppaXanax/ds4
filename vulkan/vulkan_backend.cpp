@@ -2565,15 +2565,6 @@ static bool ensure_execution_artifact(
             format,
             g_vk.caps.min_storage_buffer_offset_alignment))
         return false;
-    /* During upload UMA simultaneously holds the packed CPU buffer, staging
-     * buffer, and final device buffer. Refuse an artifact whose transient
-     * footprint cannot fit inside the configured weight envelope. */
-    if (artifact.bytes > UINT64_MAX / 3u ||
-        artifact.bytes * 3u > g_vk.weight_budget ||
-        g_vk.weight_used > g_vk.weight_budget - artifact.bytes * 3u) {
-        ds4_vulkan_execution_artifact_free(&artifact);
-        return false;
-    }
     if (g_vk.caps.max_storage_buffer_range != 0) {
         for (uint32_t p = 0; p < artifact.plane_count; ++p)
             if (artifact.plane_bytes[p] > g_vk.caps.max_storage_buffer_range) {

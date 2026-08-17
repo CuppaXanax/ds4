@@ -7,7 +7,7 @@
 
 Date: 2026-08-17  
 Reference baseline: `origin/pr-557-merge` at `8fb6bd9`  
-Execution-artifact candidate: `a7d639c` (not deployed and not a TPS result)
+Integrated execution-artifact candidate: `c793c4e` (not promoted and not a TPS result)
 
 ## Target and authoritative budget
 
@@ -143,16 +143,33 @@ as an achieved forecast; their overlap must be measured on the same binary.
 
 ## Achieved substrate evidence
 
-`a7d639c` adds the execution-artifact consumer to the Vulkan test build and a
-strict synthetic Q8 GPU gate in
-`vulkan/tests/tests/t_matmul_q8_0_exec.cpp`.  The gate requires the immutable
-Q8 artifact, zeroes the source model range after artifact construction, and
-then dispatches through the artifact-backed path.  This proves the test can
-catch accidental fallback to raw GGUF bytes.
+The integrated candidate through `c793c4e` now losslessly repacks and consumes
+all three hot quantized weight families:
 
-This is focused Q8 substrate evidence only.  It is not a production layer
-measurement, not an IQ2 or Q2 result, and not a TPS claim.  `a7d639c` is a
-candidate branch and has not replaced the `8fb6bd9` deployment baseline.
+- dense Q8 through `matmul_q8_0_exec`;
+- routed IQ2 gate/up through the fused-mid execution variants;
+- routed Q2 down/reduce through `routed_moe_down_reduce_q2_exec`.
+
+Each artifact uses exact-size immutable device-local buffers with separately
+addressable metadata and payload planes.  The host-side packed copy is released
+after upload, the artifact replaces overlapping raw/aligned cache ranges, and
+every descriptor plane is checked against `maxStorageBufferRange`.  The Q8,
+IQ2, and Q2 registered GPU gates all passed on blade `.53`.  Each gate requires
+the artifact path, invalidates or removes the raw source as appropriate, and
+compares against the established reference path; the IQ2 and Q2 gates compare
+raw and artifact results bit-for-bit.
+
+A strict two-layer production-shaped startup also succeeded on `.53` with 66
+shaders.  It prepared the worker's 4.21 GiB model span in 6.556 seconds, reported
+the expected 7.19 GiB total planned footprint at 128K context, and did not
+recreate the rejected multi-gigabyte host mirror or transient arena resize.
+The blade was then restored to the published `8fb6bd9` LKG binary and its
+verified hash.  The coordinator was not touched.
+
+These results prove the representation, GPU consumers, and startup memory
+shape.  They are not a production layer timing, a full-model exactness result,
+or a TPS claim.  `c793c4e` remains a candidate branch and has not replaced the
+`8fb6bd9` deployment baseline.
 
 ## Remaining qualification gates
 
@@ -168,11 +185,12 @@ For each materially different architecture candidate:
    qualifies as TPS evidence.
 7. Promote only reproducible end-to-end gains and delete rejected experiments.
 
-IQ2 and Q2 artifacts still require production-shaped GPU timing and exactness.
-The full packed stream and weight-pass fusion require a no-upload warm decode
-trace and a continuous worker timeline.  Until those gates pass, the only
-defensible statement is that the architecture is plausible, not that 50 ms or
-20 TPS has been achieved.
+The integrated artifact still requires full-model exactness and
+production-shaped GPU timing.  The full packed stream and weight-pass fusion
+require a no-upload warm decode trace and a continuous worker timeline.  Until
+those gates pass, the only defensible statement is that the architecture is
+implemented and GPU-correct on its focused gates, not that 50 ms or 20 TPS has
+been achieved.
 
 ## Evidence limits
 

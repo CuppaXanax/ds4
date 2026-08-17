@@ -5,3 +5,4 @@ gguf-tools/quality-testing/data/*/continuations/*.txt -diff
 /.githooks/* text eol=lf
 /performance/bc250/*.sh text eol=lf
 /performance/bc250/*.py text eol=lf
+/tests/long_context_story_prompt.txt text eol=lf

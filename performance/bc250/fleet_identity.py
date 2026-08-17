@@ -23,6 +23,7 @@ def validate(
     expected_commit: str,
     expected_binary: str,
     expected_shader_count: int,
+    expected_shader_manifest: str,
     *,
     now: float | None = None,
 ) -> dict[str, Any]:
@@ -71,11 +72,12 @@ def validate(
             "layers": layers,
             "ctx": str(manifest["benchmark"]["ctx_alloc"]),
             "weight_budget_gib": str(manifest["benchmark"]["weight_budget_gib"]),
+            "shader_count": str(expected_shader_count),
+            "shader_manifest_sha256": expected_shader_manifest,
             "model": manifest["model"]["default_path"],
         }
         if role == "worker":
             checks["commit"] = expected_commit
-            checks["shader_count"] = str(expected_shader_count)
             worker_envs.add(row.get("env_sha256", ""))
         for key, wanted in checks.items():
             if row.get(key) != wanted:
@@ -107,6 +109,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-binary", required=True)
     parser.add_argument("--expected-shader-count", type=int, required=True)
+    parser.add_argument("--expected-shader-manifest", required=True)
     return parser.parse_args(argv)
 
 
@@ -119,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         args.expected_commit,
         args.expected_binary,
         args.expected_shader_count,
+        args.expected_shader_manifest,
     )
     print(result["identity_sha256"])
     print(result["topology_sha256"])

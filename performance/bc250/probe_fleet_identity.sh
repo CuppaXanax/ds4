@@ -22,11 +22,13 @@ esac
 
 cd "$repo"
 commit="$(git rev-parse HEAD)"
-if git diff --quiet -- . && git diff --cached --quiet -- .; then
-    source_clean=1
-else
-    source_clean=0
-fi
+non_shader_status="$(git status --porcelain --untracked-files=all |
+    grep -vE '^.. vulkan/shaders/spv/[^/]+\.spv$' || true)"
+[[ -z "$non_shader_status" ]] && source_clean=1 || source_clean=0
+shader_list="$(find vulkan/shaders/spv -maxdepth 1 -type f -name '*.spv' -print0 |
+    sort -z | xargs -0 sha256sum)"
+disk_shader_count="$(printf '%s\n' "$shader_list" | sed '/^$/d' | wc -l)"
+shader_manifest="$(printf '%s\n' "$shader_list" | sha256sum | awk '{print tolower($1)}')"
 
 mapfile -t pids < <(pgrep -x ds4 || true)
 if [[ "$octet" == 42 ]]; then
@@ -40,7 +42,7 @@ if [[ "$octet" == 42 ]]; then
     layers="$expected_layers"
     ctx=128000
     weight_budget=11
-    shader_count=unloaded
+    shader_count="$disk_shader_count"
     model=/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
     env_hash=coordinator-managed
 else
@@ -76,8 +78,12 @@ else
     shader_count="$(grep -Eo 'VULKAN loaded [0-9]+ shaders' /tmp/ds4-worker.log 2>/dev/null |
         tail -n1 | awk '{print $3}')"
     [[ -n "$shader_count" ]] || { echo "missing shader count on $ip" >&2; exit 7; }
+    [[ "$shader_count" == "$disk_shader_count" ]] || {
+        echo "loaded/disk shader count mismatch on $ip: $shader_count/$disk_shader_count" >&2
+        exit 8
+    }
 fi
 
-printf 'BC250_IDENTITY|host=%s|commit=%s|binary_sha256=%s|source_clean=%s|role=%s|layers=%s|ctx=%s|weight_budget_gib=%s|shader_count=%s|model=%s|env_sha256=%s\n' \
+printf 'BC250_IDENTITY|host=%s|commit=%s|binary_sha256=%s|source_clean=%s|role=%s|layers=%s|ctx=%s|weight_budget_gib=%s|shader_count=%s|shader_manifest_sha256=%s|model=%s|env_sha256=%s\n' \
     "$ip" "$commit" "$binary_hash" "$source_clean" "$role" "$layers" "$ctx" \
-    "$weight_budget" "$shader_count" "$model" "$env_hash"
+    "$weight_budget" "$shader_count" "$shader_manifest" "$model" "$env_hash"

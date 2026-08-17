@@ -46,6 +46,9 @@ class ScoreTests(unittest.TestCase):
                 if shader_count is None
                 else shader_count
             ),
+            "runtime_shader_manifest_sha256": self.manifest["runtime_lkg"][
+                "runtime_shader_manifest_sha256"
+            ],
             "model_sha256": "a" * 64,
             "prompt_sha256": bench["prompt_sha256"],
             "ctx_start": bench["ctx_start"],
@@ -182,6 +185,20 @@ class ScoreTests(unittest.TestCase):
         verdict = json.loads(output.read_text())
         self.assertEqual(verdict["verdict"], "reject")
         self.assertFalse(verdict["exactness"]["match"])
+
+    def test_baseline_shader_manifest_mismatch_fails_closed(self):
+        lkg = self.manifest["runtime_lkg"]["commit"]
+        baseline = self.make_group("b", lkg, "b", [5.0, 5.1, 5.2])
+        meta_path = baseline[0] / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        meta["runtime_shader_manifest_sha256"] = "0" * 64
+        meta_path.write_text(json.dumps(meta))
+        argv = ["--manifest", str(self.manifest_path)]
+        for run in baseline:
+            argv += ["--baseline-run", str(run)]
+        argv += ["--output", str(self.root / "verdict.json")]
+        with self.assertRaisesRegex(ValueError, "mixed runtime identity"):
+            self.invoke_score(argv)
 
 
 if __name__ == "__main__":

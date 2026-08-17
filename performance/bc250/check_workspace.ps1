@@ -18,6 +18,17 @@ function Invoke-GitChecked {
     return @($output)
 }
 
+function Get-LfNormalizedSha256 {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $text = $utf8.GetString([IO.File]::ReadAllBytes($LiteralPath))
+    $normalized = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $bytes = $utf8.GetBytes($normalized)
+    return [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($bytes)
+    ).ToLowerInvariant()
+}
+
 $repoPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $manifestPath = Join-Path $PSScriptRoot "lkg.json"
 $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
@@ -89,7 +100,9 @@ try {
     if (-not (Test-Path -LiteralPath $promptPath -PathType Leaf)) {
         throw "Missing canonical prompt: $promptPath"
     }
-    $promptHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $promptPath).Hash.ToLowerInvariant()
+    # The prompt is declared `eol=lf`. Hash that canonical form so a Windows
+    # CRLF working copy and the Linux runtime checkout prove the same bytes.
+    $promptHash = Get-LfNormalizedSha256 -LiteralPath $promptPath
     if ($promptHash -ne ([string]$manifest.benchmark.prompt_sha256).ToLowerInvariant()) {
         throw "Canonical prompt hash mismatch: $promptHash"
     }

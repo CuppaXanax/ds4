@@ -6,8 +6,24 @@
     "tree": "1076b98610160e25f3e6ffe12bc63cf6086ec380",
     "fleet_binary_sha256": "f0d32af04aade31505ecb698514d703a2569c772fe1c98258e29d525455bb028",
     "runtime_shader_count": 62,
-    "historical_decode_tps_range": [5.1, 5.5],
-    "canonical_baseline_score": null
+    "runtime_shader_manifest_sha256": "9bf6778944c194ef59fa1c1dbc37c3cad0fc87fe1bcb3ec7dcdc729844c39e10",
+    "performance_qualification": "restore_point_only_context_regression_open",
+    "historical_short_prompt": {
+      "commit": "a2fd02c4627028dfc4cc13b141b49c4a887d25a2",
+      "prompt_tokens": [17, 12],
+      "generated_tokens": 16,
+      "decode_tps_samples": [5.58, 5.5],
+      "status": "diagnostic_only"
+    },
+    "canonical_baseline_score": 2.41,
+    "known_context_regression": {
+      "status": "open",
+      "ratio4_sparse_threshold_rows": 896,
+      "first_indexed_token_approx": 3588,
+      "model_attention_head_dim": 512,
+      "promoted_indexed_wave64_required_head_dim": 128,
+      "promoted_indexed_wave64_reachable": false
+    }
   },
   "model": {
     "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
@@ -34,7 +50,7 @@
   "benchmark": {
     "tool": "ds4-bench",
     "prompt_path": "tests/long_context_story_prompt.txt",
-    "prompt_sha256": "3b2b09a2403a8a255632bf82f364264fb670fccee9fcd4b57739219c1a3c24ad",
+    "prompt_sha256": "29363eab21bbbccaeea8e13f669e7ce05e8eafc48e31fcf9b725edabb2058666",
     "ctx_start": 4096,
     "ctx_max": 4096,
     "ctx_alloc": 128000,

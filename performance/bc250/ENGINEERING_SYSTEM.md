@@ -2,14 +2,16 @@
 
 ## Scoreboard
 
-- Runtime LKG: `8fb6bd9`
-- Canonical score: not yet recorded
-- Historical short-run range: approximately 5.1-5.5 TPS
+- Runtime restore point: `8fb6bd9` (operational reference only; its 4K
+  performance is regressed and it is not a performance-qualified LKG)
+- Canonical score: **2.41 sustained decode TPS / 414.94 ms per token**
+- Canonical samples: `2.40`, `2.41`, `2.42` TPS
+- Historical `a2fd02c` short-prompt samples: `5.58`, `5.50` TPS (diagnostic
+  only; incompatible with the canonical 4K/128K denominator)
+- User-observed interactive start: approximately 5.0 TPS followed by session
+  degradation (open reproduction target)
 - First milestone: 10 sustained TPS
 - Target: 20 sustained TPS / 50 ms per token
-
-The first action is to record three LKG runs with the canonical harness. Until
-that exists, no new optimization has a valid denominator.
 
 The canonical score is the median `gen_steady_tps` from three 512-token,
 greedy, non-EOS `ds4-bench` runs at a 4K frontier while allocating the real
@@ -74,8 +76,55 @@ its own clean commit; if its build adds a shader, it also sets
 
 ## Current technical lane
 
-The next decode lane is routed IQ2 gate/up, not fleet scheduling or a retain-all
-artifact architecture.
+Treat the gap between the historical 5.0-5.58 TPS interactive results and the
+2.41 TPS canonical score as a severe context-scaling regression until it is
+removed. The historical `a2fd02c` gate used 17- and 12-token prompts and only
+16 generated tokens. It is valid evidence of shallow-context performance, not
+evidence of sustained performance after a session grows.
+
+The first actionable long-context attribution is now known:
+
+- Flash has 512-wide attention heads, a 128-row raw window, and compression
+  ratio 4 on even layers from layer 2 onward.
+- Vulkan's dense attention score array holds 1,024 rows. The runtime therefore
+  switches a ratio-4 layer to indexed attention after 896 compressed rows. The
+  first indexed token is approximately token 3,588.
+- The indexed Wave64 shader promoted by `f85a909` requires `head_dim == 128`.
+  The real Flash call passes `head_dim == 512`, so the promoted shader cannot
+  activate for this model. Its focused exactness and timing tests also used
+  128-wide heads.
+- At the 4K frontier, the trace proves that the ratio-4 layer falls back to
+  `attention_mixed_online`: 6.0346 ms for that dispatch alone. Indexer score
+  and top-k add 1.7747 ms and 0.6060 ms.
+
+The final timeline JSON must not be reported as one 18.50 ms layer. With
+`DS4_VULKAN_TIMELINE_LAYER_NO_WAIT=1`, dispatch capture remains enabled after
+the selected layer ends and stops only at token completion. The JSON therefore
+contains two consecutive local layer bodies:
+
+- target layer 2, ratio-4 indexed path, recording generations 366+367:
+  13.3202 ms dispatch sum (11.4741 ms attention/indexer, 1.6191 ms MoE,
+  0.2270 ms other);
+- following layer 3, ratio-128 non-indexed path, generation 368: 5.1775 ms
+  dispatch sum (3.0616 ms attention, 1.8929 ms MoE, 0.2231 ms other).
+
+Their 18.4978 ms combined dispatch sum is useful as a consecutive even/odd
+layer-pair sample, but it is neither one-layer latency nor a critical-path
+measurement. Repeating that pair shape across layers 2-41 and adding layer 42
+projects about 383 ms of GPU dispatch work before layers 0-1, output, runtime,
+and transport. That projection is diagnostic, not a score, but it accounts for
+roughly 92% of the measured 414.94 ms/token and identifies the context cliff as
+the primary lane.
+
+There is currently no performance-qualified LKG across both shallow and 4K
+contexts. Next, run a matched `a2fd02c` versus `8fb6bd9` context ladder with
+exact commit, binary, shader-manifest, fleet, and benchmark identity. The first
+gate is only four 64-token runs: both commits at shallow context and at 4K. If
+both commits reproduce the same context cliff, bracket the 3,588-token handoff
+on the restore point only. This distinguishes a commit regression from a
+bottleneck already present in `a2fd02c` without creating a benchmark matrix. Do
+not select or implement a kernel candidate until that gate confirms both
+commits' actual shader paths.
 
 Retained evidence:
 
@@ -83,15 +132,10 @@ Retained evidence:
 - same-allocation stream: roughly 246.8 GB/s;
 - routed IQ2 gate/up: roughly 54.9 GB/s;
 - canonical routed shader: roughly 64 VGPR and 6,671 VALU instructions;
-- steady decode GPU idle: roughly 0.06-0.10 ms/layer;
 - warm uploads and evictions: zero.
 
-The next candidate must therefore change routed IQ2's instruction/data layout
-at its real production shape. Before implementation it must prove generated
-ISA, Wave64 behavior, occupancy/live state, exact accumulation semantics, and
-a bounded memory representation. Scheduler, governor, 40-CU, ROCm, prefill,
-and whole-model artifact work are out of scope unless the user changes the
-lane.
+Scheduler, governor, 40-CU, ROCm, prefill, and whole-model artifact work remain
+out of scope unless the user changes the lane.
 
 ## Candidate record
 

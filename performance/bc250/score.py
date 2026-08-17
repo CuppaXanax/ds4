@@ -105,6 +105,7 @@ def load_run(path: Path, manifest: dict[str, Any]) -> Run:
         "fleet_topology_sha256",
         "fleet_env_sha256",
         "model_sha256",
+        "runtime_shader_manifest_sha256",
     ):
         value = str(meta.get(key, ""))
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
@@ -126,6 +127,7 @@ def validate_group(name: str, runs: list[Run], expected_count: int) -> None:
         "fleet_env_sha256",
         "fleet_node_count",
         "runtime_shader_count",
+        "runtime_shader_manifest_sha256",
         "model_sha256",
         "prompt_sha256",
         "ctx_alloc",
@@ -193,6 +195,13 @@ def main(argv: list[str] | None = None) -> int:
             f"{baseline[0].meta.get('runtime_shader_count')!r} does not match LKG "
             f"{lkg_shader_count}"
         )
+    lkg_shader_manifest = str(
+        manifest["runtime_lkg"]["runtime_shader_manifest_sha256"]
+    ).lower()
+    if str(
+        baseline[0].meta.get("runtime_shader_manifest_sha256", "")
+    ).lower() != lkg_shader_manifest:
+        fail("baseline runtime shader manifest does not match the LKG")
     lkg_binary = str(manifest["runtime_lkg"]["fleet_binary_sha256"]).lower()
     if str(baseline[0].meta.get("fleet_binary_sha256", "")).lower() != lkg_binary:
         fail("baseline fleet binary hash does not match the LKG")

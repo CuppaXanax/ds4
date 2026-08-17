@@ -32,9 +32,11 @@ if pgrep -x ds4 >/dev/null || pgrep -x ds4-bench >/dev/null; then
 fi
 
 cd "$repo_dir"
-if [[ -n "$(git status --porcelain)" ]]; then
+non_shader_status="$(git status --porcelain --untracked-files=all |
+    grep -vE '^.. vulkan/shaders/spv/[^/]+\.spv$' || true)"
+if [[ -n "$non_shader_status" ]]; then
     echo "refusing to benchmark a dirty checkout" >&2
-    git status --short >&2
+    printf '%s\n' "$non_shader_status" >&2
     exit 6
 fi
 
@@ -44,6 +46,7 @@ m = json.load(open(sys.argv[1], encoding="utf-8"))
 print(m["runtime_lkg"]["commit"])
 print(m["runtime_lkg"]["fleet_binary_sha256"])
 print(m["runtime_lkg"]["runtime_shader_count"])
+print(m["runtime_lkg"]["runtime_shader_manifest_sha256"])
 print(m["model"]["default_path"])
 print(m["benchmark"]["prompt_path"])
 print(m["benchmark"]["prompt_sha256"])
@@ -59,15 +62,16 @@ PY
 expected_commit="${DS4_EXPECTED_COMMIT:-${cfg[0]}}"
 expected_lkg_binary="${cfg[1]}"
 expected_shaders="${DS4_EXPECTED_SHADER_COUNT:-${cfg[2]}}"
-model_path="${DS4_BENCH_MODEL:-${cfg[3]}}"
-prompt_path="${cfg[4]}"
-expected_prompt_hash="${cfg[5]}"
-ctx_start="${cfg[6]}"
-ctx_max="${cfg[7]}"
-ctx_alloc="${cfg[8]}"
-gen_tokens="${cfg[9]}"
-weight_budget="${cfg[10]}"
-dist_bits="${cfg[11]}"
+expected_shader_manifest="${DS4_EXPECTED_SHADER_MANIFEST:-${cfg[3]}}"
+model_path="${DS4_BENCH_MODEL:-${cfg[4]}}"
+prompt_path="${cfg[5]}"
+expected_prompt_hash="${cfg[6]}"
+ctx_start="${cfg[7]}"
+ctx_max="${cfg[8]}"
+ctx_alloc="${cfg[9]}"
+gen_tokens="${cfg[10]}"
+weight_budget="${cfg[11]}"
+dist_bits="${cfg[12]}"
 
 actual_commit="$(git rev-parse HEAD)"
 if ! git cat-file -e "$expected_commit^{commit}" 2>/dev/null; then
@@ -107,7 +111,21 @@ if [[ "$actual_prompt_hash" != "$expected_prompt_hash" ]]; then
     exit 11
 fi
 
-unexpected_env="$(env | cut -d= -f1 | grep '^DS4_' | grep -Ev '^(DS4_USER_APPROVED_BENCHMARK|DS4_EXPECTED_COMMIT|DS4_EXPECTED_SHADER_COUNT|DS4_BENCH_MODEL)$' || true)"
+shader_list="$(find vulkan/shaders/spv -maxdepth 1 -type f -name '*.spv' -print0 |
+    sort -z | xargs -0 sha256sum)"
+disk_shader_count="$(printf '%s\n' "$shader_list" | sed '/^$/d' | wc -l)"
+actual_shader_manifest="$(printf '%s\n' "$shader_list" | sha256sum |
+    awk '{print tolower($1)}')"
+if [[ "$disk_shader_count" != "$expected_shaders" ]]; then
+    echo "expected $expected_shaders shader files; found $disk_shader_count" >&2
+    exit 14
+fi
+if [[ "$actual_shader_manifest" != "$expected_shader_manifest" ]]; then
+    echo "shader manifest mismatch: $actual_shader_manifest" >&2
+    exit 14
+fi
+
+unexpected_env="$(env | cut -d= -f1 | grep '^DS4_' | grep -Ev '^(DS4_USER_APPROVED_BENCHMARK|DS4_EXPECTED_COMMIT|DS4_EXPECTED_SHADER_COUNT|DS4_EXPECTED_SHADER_MANIFEST|DS4_BENCH_MODEL)$' || true)"
 if [[ -n "$unexpected_env" ]]; then
     echo "unexpected DS4 environment variables:" >&2
     echo "$unexpected_env" >&2
@@ -126,7 +144,8 @@ audit_summary="$(python3 "$script_dir/fleet_identity.py" \
     --audit "$fleet_audit" \
     --expected-commit "$expected_commit" \
     --expected-binary "$fleet_binary_hash" \
-    --expected-shader-count "$expected_shaders")"
+    --expected-shader-count "$expected_shaders" \
+    --expected-shader-manifest "$expected_shader_manifest")"
 mapfile -t audit_cfg <<<"$audit_summary"
 fleet_identity_hash="${audit_cfg[0]}"
 fleet_topology_hash="${audit_cfg[1]}"
@@ -182,7 +201,7 @@ governor_state="$(cat /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null | tr '
 python3 - "$output_dir/meta.json" "$expected_commit" "$actual_commit" \
     "$binary_hash" "$fleet_binary_hash" "$fleet_identity_hash" \
     "$fleet_topology_hash" "$fleet_env_hash" "$fleet_node_count" \
-    "$shader_count" "$model_path" "$model_hash" "$prompt_path" \
+    "$shader_count" "$actual_shader_manifest" "$model_path" "$model_hash" "$prompt_path" \
     "$actual_prompt_hash" "$ctx_start" "$ctx_max" "$ctx_alloc" \
     "$gen_tokens" "$weight_budget" "$dist_bits" "$host" "$kernel" \
     "$governor_state" <<'PY'
@@ -192,9 +211,9 @@ import sys
 (
     _, output_path, commit, source_head, binary_hash, fleet_binary_hash,
     fleet_identity_hash, fleet_topology_hash, fleet_env_hash, fleet_node_count,
-    shader_count, model_path, model_hash, prompt_path, prompt_hash, ctx_start,
-    ctx_max, ctx_alloc, gen_tokens, weight_budget, dist_bits, host, kernel,
-    governor_state,
+    shader_count, shader_manifest, model_path, model_hash, prompt_path,
+    prompt_hash, ctx_start, ctx_max, ctx_alloc, gen_tokens, weight_budget,
+    dist_bits, host, kernel, governor_state,
 ) = sys.argv
 meta = {
   "schema_version": 1,
@@ -209,6 +228,7 @@ meta = {
   "fleet_env_sha256": fleet_env_hash,
   "fleet_node_count": int(fleet_node_count),
   "runtime_shader_count": int(shader_count),
+  "runtime_shader_manifest_sha256": shader_manifest,
   "model_path": model_path,
   "model_sha256": model_hash,
   "prompt_path": prompt_path,

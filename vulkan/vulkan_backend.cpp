@@ -537,6 +537,7 @@ static int load_all_shaders(void) {
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
+        {"routed_moe_iq2_project_wave64", 68, 7}, /* opt-in IQ2 projection-only candidate */
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
         {"roofline_weight_stream", 12, 2}, /* checksum-only resident weight read */
@@ -6855,6 +6856,25 @@ static bool ds4gk_routed_down_reduce_appliance(
         n_total_expert == 256u && n_expert == 6u;
 }
 
+/* Opt-in occupancy experiment.  The compact fused shader keeps a complete
+ * 256-value Q8 block live while decoding sixteen row tiles.  This candidate
+ * uses two Wave64 subgroups over eight rows, then reuses the existing exact
+ * SwiGLU and Q8 quantizers.  Keep it disabled until a BC-250 run proves that
+ * the lower register footprint beats the extra stages. */
+static bool ds4gk_routed_iq2_projection_appliance(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_IQ2_PROJECT");
+    if (!enabled || *enabled == '0' || *enabled == 'n' || *enabled == 'N')
+        return false;
+    return ds4gk_routed_wave64_enabled() &&
+        g_vk.shader_map.find("routed_moe_iq2_project_wave64") != g_vk.shader_map.end() &&
+        n_tokens == 1u && gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
+}
+
 /* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
  * while the generic fused gate/up shader additionally writes b5 and b6. The
  * compact mid-only shader writes b4; the compact Q2 appliance writes b3
@@ -6889,6 +6909,8 @@ static void ds4gk_routed_output_barrier(
         add(5);
         add(6);
     }
+    if (shader_name && strcmp(shader_name, "routed_moe_iq2_project_wave64") == 0)
+        add(5); /* projection writes gate (b4) and up (b5) */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_output_dependency");
     vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -7038,6 +7060,9 @@ static bool ds4gk_routed_common(
     const bool mid_only = ds4gk_routed_mid_only_appliance(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
+    const bool projection_only = mid_only && ds4gk_routed_iq2_projection_appliance(
+        gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert, n_tokens);
     if (mid_is_f16) *mid_is_f16 = false;
     if (!out || !mid || !selected || !weights ||
         !x || !model_map || n_tokens == 0 || n_expert == 0 || n_total_expert == 0 ||
@@ -7102,17 +7127,21 @@ static bool ds4gk_routed_common(
     } owned;
     const uint64_t pair_bytes = pair_values * sizeof(float);
     const uint64_t expert_bytes = expert_values * sizeof(float);
-    if (!gate && !mid_only) {
+    if (!gate && (!mid_only || projection_only)) {
         if (ds4_gpu_tensor_alloc_on(&owned.gate, 0, pair_bytes) != 0)
             return false;
         gate = &owned.gate;
     }
-    if (!up && !mid_only) {
+    if (!up && (!mid_only || projection_only)) {
         if (ds4_gpu_tensor_alloc_on(&owned.up, 0, pair_bytes) != 0)
             return false;
         up = &owned.up;
     }
-    if (!mid_only && mid->bytes < pair_bytes) {
+    if (projection_only) {
+        if (ds4_gpu_tensor_alloc_on(&owned.mid, 0, pair_bytes) != 0)
+            return false;
+        mid = &owned.mid;
+    } else if (!mid_only && mid->bytes < pair_bytes) {
         if (ds4_gpu_tensor_alloc_on(&owned.mid, 0, pair_bytes) != 0)
             return false;
         mid = &owned.mid;
@@ -7127,7 +7156,8 @@ static bool ds4gk_routed_common(
     VkDescriptorBufferInfo gate_model, up_model, down_model;
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
-        (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
+        ((!mid_only || projection_only) &&
+         (!ds4gk_routed_buffer(gate, gate_info) ||
                        !ds4gk_routed_buffer(up, up_info))) ||
         !ds4gk_routed_buffer(mid, mid_info) ||
         (!fused_down_reduce && !ds4gk_routed_buffer(experts, exp_info)) ||
@@ -7173,7 +7203,8 @@ static bool ds4gk_routed_common(
         ? (input_q8_bytes + storage_alignment - 1u) /
               storage_alignment * storage_alignment
         : 0u;
-    const bool persistent_q8 = mid_only && mid_q8_offset <= mid->bytes &&
+    const bool persistent_q8 = mid_only && !projection_only &&
+        mid_q8_offset <= mid->bytes &&
         mid_q8_bytes <= mid->bytes - mid_q8_offset;
     if (persistent_q8) {
         q8.ptr = mid->ptr;
@@ -7187,10 +7218,14 @@ static bool ds4gk_routed_common(
     }
     if ((!persistent_q8 &&
          ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0) ||
+        (projection_only &&
+         ds4_gpu_tensor_alloc_host_scratch_in_place(&compact_mid_q8,
+                                                    mid_q8_bytes) != 0) ||
         (validate_selected &&
          ds4_gpu_tensor_alloc_host_scratch_in_place(&invalid,
                                                     sizeof(uint32_t)) != 0)) {
         ds4_gpu_tensor_free_in_place(&q8);
+        ds4_gpu_tensor_free_in_place(&compact_mid_q8);
         ds4_gpu_tensor_free_in_place(&invalid);
         return false;
     }
@@ -7198,6 +7233,7 @@ static bool ds4gk_routed_common(
     if (validate_selected &&
         !ds4_gpu_tensor_write(&invalid, 0, &zero, sizeof(zero))) {
         ds4_gpu_tensor_free_in_place(&invalid);
+        ds4_gpu_tensor_free_in_place(&compact_mid_q8);
         ds4_gpu_tensor_free_in_place(&q8);
         return false;
     }
@@ -7212,7 +7248,7 @@ static bool ds4gk_routed_common(
     VkDescriptorBufferInfo q8_info, compact_mid_q8_info{}, invalid_info{}, iq2_lut_info;
     ok = ds4gk_routed_iq2_lut_ensure() &&
          ds4gk_routed_buffer(&q8, q8_info) &&
-         (!mid_only || (persistent_q8 &&
+         (!mid_only || ((projection_only || persistent_q8) &&
                         ds4gk_routed_buffer(&compact_mid_q8,
                                             compact_mid_q8_info))) &&
          (!validate_selected || ds4gk_routed_buffer(&invalid, invalid_info)) &&
@@ -7258,7 +7294,16 @@ static bool ds4gk_routed_common(
         pc.q2_words = iq2_words ? 1u : 0u;
         fused_gate_up = iq2_words && (mid_only ||
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
-        if (mid_only) {
+        if (projection_only) {
+            VkDescriptorBufferInfo project_buffers[7] = {
+                q8_info, gate_model, up_model, selected_info,
+                gate_info, up_info, iq2_lut_info};
+            ok = ds4gk_routed_dispatch_shader(
+                "routed_moe_iq2_project_wave64", "gate_up_iq2_project", pc,
+                project_buffers, 7,
+                (expert_mid_dim + 7u) / 8u,
+                n_tokens, n_expert, sets);
+        } else if (mid_only) {
             VkDescriptorBufferInfo fused_buffers[7] = {
                 q8_info, gate_model, up_model, selected_info,
                 compact_mid_q8_info,
@@ -7309,12 +7354,13 @@ static bool ds4gk_routed_common(
             swiglu_buffers,
             (expert_mid_dim + 255u) / 256u, n_tokens, n_expert, sets);
     }
-    if (ok && !mid_only) {
+    if (ok && (!mid_only || projection_only)) {
         pc.mode = 0; pc.gate_type = down_type; pc.in_dim = expert_mid_dim;
         pc.q8_blocks = (uint32_t)mid_blocks;
         pc.n_tokens = n_tokens * n_expert;
         VkDescriptorBufferInfo mid_quantize_buffers[6] = {
-            mid_info, mid_info, mid_info, mid_info, q8_info, iq2_lut_info};
+            mid_info, mid_info, mid_info, mid_info,
+            projection_only ? compact_mid_q8_info : q8_info, iq2_lut_info};
         ok = ds4gk_routed_dispatch("requantization", pc,
             mid_quantize_buffers,
             mid_blocks, n_tokens * n_expert, 1, sets);
@@ -7379,6 +7425,7 @@ static bool ds4gk_routed_common(
     }
     if (!ds4gk_routed_flush(sets)) ok = false;
     ds4_gpu_tensor_free_in_place(&invalid);
+    ds4_gpu_tensor_free_in_place(&compact_mid_q8);
     ds4_gpu_tensor_free_in_place(&q8);
     if (resume_recording && !get_cmd_ctx().recording && !begin_cmd()) ok = false;
     return ok;

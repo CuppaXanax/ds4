@@ -43,6 +43,40 @@ struct RoutedTimestamp {
     uint32_t first_query = 0;
 };
 
+/* Descriptor sets are immutable after binding into a command buffer.  Keep a
+ * small exact-key cache for the current recording generation, then recycle
+ * completed sets by descriptor-set layout.  The generation boundary matters:
+ * a cached set is never rewritten while an earlier command buffer can still
+ * reference it. */
+struct DescriptorCacheKey {
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    std::vector<VkDescriptorBufferInfo> buffers;
+
+    bool operator==(const DescriptorCacheKey &other) const {
+        if (layout != other.layout || buffers.size() != other.buffers.size())
+            return false;
+        for (size_t i = 0; i < buffers.size(); i++) {
+            const auto &a = buffers[i];
+            const auto &b = other.buffers[i];
+            if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range)
+                return false;
+        }
+        return true;
+    }
+};
+
+struct DescriptorCacheKeyHash {
+    size_t operator()(const DescriptorCacheKey &key) const {
+        size_t h = std::hash<VkDescriptorSetLayout>{}(key.layout);
+        for (const auto &buffer : key.buffers) {
+            h ^= std::hash<VkBuffer>{}(buffer.buffer) + (h << 6) + (h >> 2);
+            h ^= std::hash<VkDeviceSize>{}(buffer.offset) + (h << 6) + (h >> 2);
+            h ^= std::hash<VkDeviceSize>{}(buffer.range) + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
+};
+
 enum class TimelineEventKind : uint8_t {
     Dispatch,
     Barrier,
@@ -102,6 +136,11 @@ struct VulkanCommandCtx {
     uint32_t slot_timestamp_counts[DS4_VK_COMMAND_RING_SIZE] = {};
     std::vector<RoutedTimestamp> slot_routed_timestamps[DS4_VK_COMMAND_RING_SIZE];
     std::vector<VkDescriptorSet> slot_descriptors[DS4_VK_COMMAND_RING_SIZE];
+    std::unordered_map<DescriptorCacheKey, VkDescriptorSet,
+                       DescriptorCacheKeyHash> recording_descriptors;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>
+        reusable_descriptors;
+    std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout> descriptor_layouts;
     std::vector<ds4_gpu_tensor *> slot_tensors[DS4_VK_COMMAND_RING_SIZE];
     std::vector<void *> slot_in_place_ptrs[DS4_VK_COMMAND_RING_SIZE];
     uint32_t cmd_rot_idx = 0;
@@ -1035,16 +1074,40 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
 
 static bool release_tensor_header(TensorHeader *header);
 
+static void recycle_descriptor_set(VulkanCommandCtx &ctx, VkDescriptorSet set) {
+    if (set == VK_NULL_HANDLE) return;
+    auto it = ctx.descriptor_layouts.find(set);
+    if (it == ctx.descriptor_layouts.end()) {
+        /* A legacy caller may have allocated a set outside the common helper.
+         * Preserve the old behavior for that path rather than retaining an
+         * unkeyed set that cannot be safely reused. */
+        (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+        return;
+    }
+    ctx.reusable_descriptors[it->second].push_back(set);
+}
+
+static bool descriptor_set_deferred(const VulkanCommandCtx &ctx,
+                                    VkDescriptorSet set) {
+    for (const auto &[_, cached] : ctx.recording_descriptors)
+        if (cached == set) return true;
+    for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++)
+        for (VkDescriptorSet deferred : ctx.slot_descriptors[slot])
+            if (deferred == set) return true;
+    for (VkDescriptorSet deferred : ctx.layer_batch_descriptors)
+        if (deferred == set) return true;
+    for (VkDescriptorSet deferred : ctx.attention_output_descriptors)
+        if (deferred == set) return true;
+    return false;
+}
+
 static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
     int ok = 1;
     const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.slot_descriptors[slot]) {
-        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
-            ok = 0;
+        recycle_descriptor_set(ctx, set);
     }
-    if (!ctx.slot_descriptors[slot].empty())
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
+    (void)descriptor_start;
     for (ds4_gpu_tensor *tensor : ctx.slot_tensors[slot]) {
         if (!tensor) continue;
         if (tensor->owner && tensor->ptr) {
@@ -1186,6 +1249,10 @@ static int end_and_submit(void) {
     }
     timeline_duration_current(TimelineEventKind::HostFlush, "flush_live_tensors",
                               flush_start);
+    const uint32_t slot = c.cmd_rot_idx;
+    for (const auto &[_, set] : c.recording_descriptors)
+        c.slot_descriptors[slot].push_back(set);
+    c.recording_descriptors.clear();
     VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
     const uint64_t wait_value = c.last_submit_value;
@@ -1217,7 +1284,6 @@ static int end_and_submit(void) {
             event->count = c.command_count;
         }
     }
-    const uint32_t slot = c.cmd_rot_idx;
     c.last_submit_value = signal_value;
     c.slot_submit_values[slot] = signal_value;
     c.slot_generations[slot] = c.recording_generation;
@@ -1308,12 +1374,9 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume,
     if (defer) return ok;
     const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
-        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
-            ok = 0;
+        recycle_descriptor_set(ctx, set);
     }
-    if (!ctx.layer_batch_descriptors.empty())
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
+    (void)descriptor_start;
     for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors)
         ds4_gpu_tensor_free(tensor);
     for (void *ptr : ctx.layer_batch_in_place_ptrs) {
@@ -1354,6 +1417,10 @@ static void maybe_submit(void) {
 
 static void mark_bound_weight_buffers(VkDescriptorBufferInfo *buffers,
                                       uint32_t count, uint64_t generation);
+static int allocate_simple_descriptors(const ShaderEntry &shader,
+                                       VkDescriptorBufferInfo *buffers,
+                                       uint32_t count, VkDescriptorSet &set);
+static int release_simple_descriptors(VkDescriptorSet set);
 
 static int dispatch_shader(const char *name,
                            const void *push, uint32_t push_size,
@@ -1367,26 +1434,8 @@ static int dispatch_shader(const char *name,
 
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e.pipeline);
 
-    /* Allocate + update descriptor set */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &e.desc_layout;
-    VkDescriptorSet ds;
-    VK_CHECK_RAW(vkAllocateDescriptorSets(g_vk.device, &dai, &ds));
-
-    std::vector<VkWriteDescriptorSet> writes(n_bufs);
-    for (uint32_t i = 0; i < n_bufs; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = ds; writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufs[i];
-    }
-    if (n_bufs) vkUpdateDescriptorSets(g_vk.device, n_bufs, writes.data(), 0, nullptr);
-    mark_bound_weight_buffers(bufs, n_bufs, c.recording_generation);
-    timeline_descriptors(c, name, bufs, n_bufs);
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(e, bufs, n_bufs, ds)) return -1;
 
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             e.layout, 0, 1, &ds, 0, nullptr);
@@ -1395,11 +1444,12 @@ static int dispatch_shader(const char *name,
         vkCmdPushConstants(c.cmd, e.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
 
     timeline_dispatch(c, name, bufs, n_bufs, gx, gy, gz);
+    c.command_count++;
 
     /* Reset descriptor pool periodically (simplified: reset each time) */
     /* In production, use multiple pools or recycle sets */
     maybe_submit();
-    return 0;
+    return release_simple_descriptors(ds) ? 0 : -1;
 }
 
 /* =====================================================================
@@ -3034,14 +3084,33 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         for (uint32_t i = 0; i < count; i++)
             if (buffers[i].offset % alignment != 0) return 0;
     }
+    auto &ctx = get_cmd_ctx();
+    DescriptorCacheKey key;
+    key.layout = shader.desc_layout;
+    key.buffers.assign(buffers, buffers + count);
+    auto cached = ctx.recording_descriptors.find(key);
+    if (cached != ctx.recording_descriptors.end()) {
+        set = cached->second;
+        mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
+        timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+        return 1;
+    }
     VkDescriptorSetAllocateInfo allocate{};
     allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocate.descriptorPool = g_vk.desc_pool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &shader.desc_layout;
     const uint64_t descriptor_start = timeline_now_ns();
-    if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
+    bool reused = false;
+    auto reusable = ctx.reusable_descriptors.find(shader.desc_layout);
+    if (reusable != ctx.reusable_descriptors.end() && !reusable->second.empty()) {
+        set = reusable->second.back();
+        reusable->second.pop_back();
+        reused = true;
+    } else if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS) {
         return 0;
+    }
+    ctx.descriptor_layouts[set] = shader.desc_layout;
 
     std::vector<VkWriteDescriptorSet> writes(count);
     for (uint32_t i = 0; i < count; i++) {
@@ -3055,38 +3124,27 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
     }
     vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
     timeline_duration_current(TimelineEventKind::DescriptorAlloc,
-                              "descriptor_cpu", descriptor_start);
-    auto &ctx = get_cmd_ctx();
+                              reused ? "descriptor_reuse_cpu" : "descriptor_cpu",
+                              descriptor_start);
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+    ctx.recording_descriptors.emplace(std::move(key), set);
     return 1;
 }
 
 static int release_simple_descriptors(VkDescriptorSet set) {
     auto &ctx = get_cmd_ctx();
-    if (ctx.layer_batch_active) {
-        ctx.layer_batch_descriptors.push_back(set);
-        maybe_submit();
-        return 1;
-    }
+    if (descriptor_set_deferred(ctx, set)) return 1;
     const uint64_t descriptor_start = timeline_now_ns();
-    const bool ok = vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
-    if (ok) {
-        timeline_resource(get_cmd_ctx(), TimelineEventKind::DescriptorFree,
-                          "descriptor_set", 0);
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
-    }
-    return ok;
+    recycle_descriptor_set(ctx, set);
+    timeline_duration_current(TimelineEventKind::DescriptorFree,
+                              "descriptor_recycle_cpu", descriptor_start);
+    return 1;
 }
 
 static int release_or_defer_simple_descriptors(VulkanCommandCtx &ctx,
                                                VkDescriptorSet set) {
-    if (ctx.attention_output_batch) {
-        ctx.attention_output_descriptors.push_back(set);
-        maybe_submit();
-        return 1;
-    }
+    (void)ctx;
     return release_simple_descriptors(set);
 }
 
@@ -3438,12 +3496,6 @@ int ds4_gpu_matmul_q8_0_tensor(
             (uint64_t)tile_n * out_dim > UINT32_MAX) return 0;
         if (c.recording && c.command_count != 0 && !submit_and_wait()) return 0;
         if (!c.recording && !begin_cmd()) return 0;
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &sh.desc_layout;
-        VkDescriptorSet ds;
-        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
         const VkDeviceSize x_size = (VkDeviceSize)tile_n * in_dim * sizeof(float);
         const VkDeviceSize o_size = (VkDeviceSize)tile_n * out_dim * sizeof(float);
         const VkDeviceSize tile_x_off =
@@ -3453,7 +3505,6 @@ int ds4_gpu_matmul_q8_0_tensor(
         if (storage_align != 0 &&
             ((tile_x_off % storage_align) != 0 ||
              (tile_o_off % storage_align) != 0)) {
-            vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds);
             return 0;
         }
         VkDescriptorBufferInfo bufs[3] = {
@@ -3461,14 +3512,8 @@ int ds4_gpu_matmul_q8_0_tensor(
             {wbuf, wbuf_off, w_size},
             {obuf, tile_o_off, o_size},
         };
-        VkWriteDescriptorSet w[3];
-        for (int i = 0; i < 3; i++) {
-            w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
-        }
-        vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-        timeline_descriptors(c, "matmul_q8_0", bufs, 3);
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+        if (!allocate_simple_descriptors(sh, bufs, 3, ds)) return 0;
         vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
         vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
         const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
@@ -3489,8 +3534,6 @@ int ds4_gpu_matmul_q8_0_tensor(
                              0, nullptr, 0, nullptr);
         if (!submit_and_wait()) return 0;
         if (!release_simple_descriptors(ds)) return 0;
-        timeline_resource(c, TimelineEventKind::DescriptorFree,
-                          "matmul_q8_0", 0);
     }
     return 1;
 }

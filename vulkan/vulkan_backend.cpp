@@ -7384,25 +7384,12 @@ static bool ds4gk_routed_dispatch_shader(
         uint32_t buffer_count, uint32_t gx, uint32_t gy, uint32_t gz,
         std::vector<VkDescriptorSet> &sets) {
     auto si = g_vk.shader_map.find(shader_name);
-    if (si == g_vk.shader_map.end()) {
-        if (getenv("DS4_VULKAN_DEBUG"))
-            fprintf(stderr, "ds4: [dbg] routed shader missing %s\\n", shader_name);
-        return false;
-    }
+    if (si == g_vk.shader_map.end()) return false;
     auto &ctx = get_cmd_ctx();
-    if (!ctx.recording && !begin_cmd()) {
-        if (getenv("DS4_VULKAN_DEBUG"))
-            fprintf(stderr, "ds4: [dbg] routed begin failed %s\\n", shader_name);
-        return false;
-    }
+    if (!ctx.recording && !begin_cmd()) return false;
     auto &shader = g_vk.shaders[si->second];
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (!allocate_simple_descriptors(shader, buffers, buffer_count, set)) {
-        if (getenv("DS4_VULKAN_DEBUG"))
-            fprintf(stderr, "ds4: [dbg] routed descriptors failed %s count=%u\\n",
-                    shader_name, buffer_count);
-        return false;
-    }
+    if (!allocate_simple_descriptors(shader, buffers, buffer_count, set)) return false;
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shader.pipeline);
     vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             shader.layout, 0, 1, &set, 0, nullptr);
@@ -7626,10 +7613,6 @@ static bool ds4gk_routed_common(
             found->second.arena_entry.format != DS4_VULKAN_EXEC_Q2_K ||
             found->second.arena_entry.in_dim != expert_mid_dim ||
             found->second.arena_entry.out_dim < artifact_rows) {
-            if (getenv("DS4_VULKAN_DEBUG"))
-                fprintf(stderr, "ds4: [dbg] Q2 artifact lookup failed off=%llu found=%d\\n",
-                        (unsigned long long)down_offset,
-                        found != g_vk.execution_artifacts.end());
             if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION")) return false;
             use_down_execution = false;
         } else {

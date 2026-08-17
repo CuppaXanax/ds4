@@ -103,11 +103,20 @@ static int test_routed_q2_execution_artifact(void) {
         std::fprintf(stderr, "q2_exec: baseline read failed\n");
         return cleanup();
     }
+    /* The baseline dispatch may still be in the command-ring recording
+     * window.  The artifact builder must be allowed to retire the raw range
+     * before it replaces it, otherwise the overlap guard deliberately falls
+     * back to raw storage and the required replay has nothing to bind. */
+    if (!ds4_gpu_synchronize()) {
+        std::fprintf(stderr, "q2_exec: baseline synchronize failed\n");
+        return cleanup();
+    }
     /* Build the execution artifact while the execution path is enabled.  The
      * cache API intentionally honors DS4_VULKAN_ROUTED_Q2_EXECUTION=0 by
      * taking the raw fallback, so calling it in the baseline mode would leave
      * the required artifact absent for the zeroed-raw verification below. */
     setenv("DS4_VULKAN_ROUTED_Q2_EXECUTION", "1", 1);
+    setenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION", "1", 1);
     if (!ds4_gpu_cache_q2_execution_range(
             model.data(), model.size(), down_offset, down_bytes,
             mid_dim, (uint64_t)n_total * out_dim, "routed-q2-exec-test")) {
@@ -115,7 +124,6 @@ static int test_routed_q2_execution_artifact(void) {
         return cleanup();
     }
     std::memset(model.data() + down_offset, 0, (size_t)down_bytes);
-    setenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION", "1", 1);
     if (!run()) { std::fprintf(stderr, "q2_exec: artifact run failed\n"); return cleanup(); }
     std::vector<float> got(out_dim);
     if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float))) {

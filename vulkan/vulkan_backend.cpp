@@ -232,6 +232,10 @@ static struct {
     };
     struct ExecutionArtifactEntry {
         ds4_vulkan_execution_arena_entry arena_entry{};
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        uint64_t source_offset = 0;
+        uint64_t source_bytes = 0;
         uint64_t plane_offset[3] = {};
         uint64_t plane_bytes[3] = {};
         uint32_t plane_element_bytes[3] = {};
@@ -239,16 +243,12 @@ static struct {
         uint32_t block_elements = 0;
         uint32_t source_blocks_per_tile = 0;
     };
-    ds4_vulkan_execution_arena execution_arena{};
-    VkBuffer execution_arena_buffer = VK_NULL_HANDLE;
-    VmaAllocation execution_arena_allocation = VK_NULL_HANDLE;
-    uint64_t execution_arena_capacity = 0;
     std::unordered_map<uint64_t, ExecutionArtifactEntry> execution_artifacts;
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
     std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache; /* source offset -> artifact */
     /* Model tensor ranges registered by cache_model_range (metadata only). */
     std::unordered_map<uint64_t, uint64_t> range_registry; /* offset -> bytes */
-    uint64_t weight_budget = 40ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
+    uint64_t weight_budget = 11ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
     uint64_t weight_used = 0;
     uint64_t lru_counter = 0;
     uint64_t cmd_gen = 0;   /* incremented each begin_cmd; guards in-flight eviction */
@@ -1423,6 +1423,9 @@ int ds4_gpu_init(void) {
     load_all_shaders();
     const char *bg = getenv("DS4_VULKAN_WEIGHT_BUDGET_GB");
     if (bg && *bg) g_vk.weight_budget = (uint64_t)atoll(bg) * 1024ull * 1024ull * 1024ull;
+    if (g_vk.caps.device_memory_total != 0 &&
+        g_vk.weight_budget > g_vk.caps.device_memory_total)
+        g_vk.weight_budget = g_vk.caps.device_memory_total;
     g_vk.initialized = true;
     fprintf(stderr, "ds4: VULKAN backend ready\n");
     return 1;  /* DS4 convention: 1 = success, 0 = failure */
@@ -1962,19 +1965,11 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
     return 1;  /* DS4 convention: 1 = success */
 }
 
-/* The execution arena is an immutable, device-local byte store.  Artifacts
- * are appended once during warmup and consumers bind sub-ranges through the
- * offset table; the runtime never binds GGUF records directly on this path.
- * Growth is deliberately a cold-path operation and is rejected while a
- * command buffer is recording, so a previously recorded dispatch can never
- * observe a destroyed arena buffer. */
-static bool execution_arena_recording(void) {
-    std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
-    for (const auto &[_, c] : g_vk.cmd_ctxs)
-        if (c.recording && c.command_count != 0) return true;
-    return false;
-}
-
+/* Execution artifacts are immutable, exact-size device-local buffers.  Each
+ * artifact is uploaded once during warmup and consumers bind its plane ranges
+ * through the entry table; the runtime never binds GGUF records directly on
+ * this path.  Keeping buffers per artifact avoids arena growth and a retained
+ * host-side packed mirror while preserving command-buffer lifetime safety. */
 static bool execution_one_time_copy(VkBuffer src, VkBuffer dst,
                                     VkDeviceSize src_offset,
                                     VkDeviceSize dst_offset,
@@ -2024,89 +2019,68 @@ static bool execution_one_time_copy(VkBuffer src, VkBuffer dst,
     if (fence) vkDestroyFence(g_vk.device, fence, nullptr);
     vkFreeCommandBuffers(g_vk.device, pool, 1, &cb);
     if (!ok && getenv("DS4_VULKAN_DEBUG"))
-        fprintf(stderr, "ds4: execution arena copy failed (%s)\n", label ? label : "copy");
+        fprintf(stderr, "ds4: execution artifact copy failed (%s)\n", label ? label : "copy");
     return ok;
 }
 
-static bool execution_arena_resize(uint64_t required) {
-    if (required <= g_vk.execution_arena_capacity) return true;
-    if (execution_arena_recording()) return false;
-    if (timeline_device_wait_idle("execution_arena_resize") != VK_SUCCESS) return false;
-    uint64_t capacity = std::max<uint64_t>(required, 64ull * 1024ull * 1024ull);
-    while (capacity < required) {
-        if (capacity > UINT64_MAX / 2u) return false;
-        capacity *= 2u;
-    }
-    const uint64_t old_capacity = g_vk.execution_arena_capacity;
-    if (capacity - old_capacity > g_vk.weight_budget -
-        std::min(g_vk.weight_used, g_vk.weight_budget))
-        return false;
-    VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = capacity;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VmaAllocationCreateInfo aci{}; aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    VkBuffer buffer = VK_NULL_HANDLE; VmaAllocation allocation = VK_NULL_HANDLE;
-    VmaAllocationInfo info{};
-    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &buffer, &allocation, &info) != VK_SUCCESS)
-        return false;
-    if (g_vk.execution_arena_buffer && g_vk.execution_arena.bytes != 0) {
-        if (!execution_one_time_copy(g_vk.execution_arena_buffer, buffer, 0, 0,
-                                     g_vk.execution_arena.bytes, "arena_resize")) {
-            vmaDestroyBuffer(g_vk.allocator, buffer, allocation);
-            return false;
-        }
-        vmaDestroyBuffer(g_vk.allocator, g_vk.execution_arena_buffer,
-                         g_vk.execution_arena_allocation);
-    }
-    g_vk.execution_arena_buffer = buffer;
-    g_vk.execution_arena_allocation = allocation;
-    g_vk.execution_arena_capacity = capacity;
-    g_vk.weight_used += capacity - old_capacity;
-    timeline_resource_current(TimelineEventKind::BufferAlloc,
-                              "execution_arena", capacity);
-    return true;
-}
-
-static bool execution_arena_upload(uint64_t offset, const void *data, uint64_t bytes) {
-    if (!data || bytes == 0 || !g_vk.execution_arena_buffer ||
-        offset > g_vk.execution_arena_capacity || bytes > g_vk.execution_arena_capacity - offset)
+static bool execution_artifact_upload(const void *data, uint64_t bytes,
+                                      VkBuffer &buffer, VmaAllocation &allocation) {
+    if (!data || bytes == 0) return false;
+    VkBufferCreateInfo dbi{}; dbi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    dbi.size = bytes;
+    dbi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo daci{}; daci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaAllocationInfo dinfo{};
+    if (vmaCreateBuffer(g_vk.allocator, &dbi, &daci, &buffer, &allocation, &dinfo) != VK_SUCCESS)
         return false;
     VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VmaAllocationCreateInfo aci{}; aci.usage = VMA_MEMORY_USAGE_AUTO;
     aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                 VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VkBuffer staging = VK_NULL_HANDLE; VmaAllocation allocation = VK_NULL_HANDLE;
+    VkBuffer staging = VK_NULL_HANDLE; VmaAllocation staging_allocation = VK_NULL_HANDLE;
     VmaAllocationInfo info{};
-    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &staging, &allocation, &info) != VK_SUCCESS ||
+    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &staging, &staging_allocation, &info) != VK_SUCCESS ||
         !info.pMappedData) {
-        if (staging) vmaDestroyBuffer(g_vk.allocator, staging, allocation);
+        if (staging) vmaDestroyBuffer(g_vk.allocator, staging, staging_allocation);
+        vmaDestroyBuffer(g_vk.allocator, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
         return false;
     }
     memcpy(info.pMappedData, data, (size_t)bytes);
-    const bool ok = execution_one_time_copy(staging, g_vk.execution_arena_buffer,
-                                            0, offset, bytes, "arena_upload");
-    vmaDestroyBuffer(g_vk.allocator, staging, allocation);
+    const bool ok = execution_one_time_copy(staging, buffer, 0, 0, bytes,
+                                            "execution_artifact_upload");
+    vmaDestroyBuffer(g_vk.allocator, staging, staging_allocation);
+    if (!ok) {
+        vmaDestroyBuffer(g_vk.allocator, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+    }
     return ok;
 }
 
 static void execution_arena_clear(void) {
-    if (g_vk.execution_arena_buffer) {
-        (void)timeline_device_wait_idle("execution_arena_clear");
-        vmaDestroyBuffer(g_vk.allocator, g_vk.execution_arena_buffer,
-                         g_vk.execution_arena_allocation);
+    if (!g_vk.execution_artifacts.empty()) {
+        (void)timeline_device_wait_idle("execution_artifact_clear");
+        for (auto &[_, entry] : g_vk.execution_artifacts) {
+            if (entry.buffer) {
+                timeline_resource_current(TimelineEventKind::BufferFree,
+                                          "execution_artifact_clear",
+                                          entry.arena_entry.bytes,
+                                          entry.source_offset);
+                vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
+            }
+            g_vk.weight_used -= std::min(g_vk.weight_used,
+                                         entry.arena_entry.bytes);
+        }
     }
-    g_vk.weight_used -= std::min(g_vk.weight_used, g_vk.execution_arena_capacity);
-    g_vk.execution_arena_buffer = VK_NULL_HANDLE;
-    g_vk.execution_arena_allocation = VK_NULL_HANDLE;
-    g_vk.execution_arena_capacity = 0;
     g_vk.execution_artifacts.clear();
-    ds4_vulkan_execution_arena_free(&g_vk.execution_arena);
 }
 
 static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
 static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset);
+static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes);
 
 static bool ensure_execution_artifact(
         const void *model_map, uint64_t model_size, uint64_t source_offset,
@@ -2129,50 +2103,37 @@ static bool ensure_execution_artifact(
             format,
             g_vk.caps.min_storage_buffer_offset_alignment))
         return false;
+    if (g_vk.caps.max_storage_buffer_range != 0) {
+        for (uint32_t p = 0; p < artifact.plane_count; ++p)
+            if (artifact.plane_bytes[p] > g_vk.caps.max_storage_buffer_range) {
+                ds4_vulkan_execution_artifact_free(&artifact);
+                return false;
+            }
+    }
     if (!remove_raw_weight_overlap(source_offset, artifact.source_bytes) ||
+        !remove_aligned_weight_overlap(source_offset, artifact.source_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, source_offset)) {
         ds4_vulkan_execution_artifact_free(&artifact);
         return false;
     }
-    if (g_vk.execution_arena.alignment == 0 &&
-        !ds4_vulkan_execution_arena_init(
-            &g_vk.execution_arena, std::max<uint64_t>(256,
-                g_vk.caps.min_storage_buffer_offset_alignment))) {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    if (!execution_artifact_upload(artifact.data, artifact.bytes,
+                                   buffer, allocation)) {
         ds4_vulkan_execution_artifact_free(&artifact);
         return false;
     }
-    const uint64_t old_bytes = g_vk.execution_arena.bytes;
-    const uint64_t align = g_vk.execution_arena.alignment;
-    if (old_bytes > UINT64_MAX - (align - 1u) ||
-        old_bytes + align - 1u > UINT64_MAX - artifact.bytes) {
-        ds4_vulkan_execution_artifact_free(&artifact);
-        return false;
-    }
-    const uint64_t data_offset = (old_bytes + align - 1u) / align * align;
-    const uint64_t required = data_offset + artifact.bytes;
-    if (!execution_arena_resize(required)) {
-        ds4_vulkan_execution_artifact_free(&artifact);
-        return false;
-    }
-    uint32_t entry_index = UINT32_MAX;
-    if (!ds4_vulkan_execution_arena_add(&g_vk.execution_arena, 0,
-                                        static_cast<uint32_t>(g_vk.execution_artifacts.size()),
-                                        &artifact, &entry_index) ||
-        entry_index >= g_vk.execution_arena.entry_count) {
-        ds4_vulkan_execution_artifact_free(&artifact);
-        return false;
-    }
-    const ds4_vulkan_execution_arena_entry arena_entry =
-        g_vk.execution_arena.entries[entry_index];
-    if (arena_entry.data_offset != data_offset ||
-        !execution_arena_upload(arena_entry.data_offset,
-                                g_vk.execution_arena.data + arena_entry.data_offset,
-                                artifact.bytes)) {
-        ds4_vulkan_execution_artifact_free(&artifact);
-        return false;
-    }
+    timeline_resource_current(TimelineEventKind::BufferAlloc,
+                              "execution_artifact", artifact.bytes,
+                              source_offset);
     decltype(g_vk.execution_artifacts)::mapped_type value{};
-    value.arena_entry = arena_entry;
+    value.arena_entry = {
+        0, static_cast<uint32_t>(g_vk.execution_artifacts.size()),
+        artifact.format, 0, 0, artifact.bytes, artifact.in_dim, artifact.out_dim};
+    value.buffer = buffer;
+    value.allocation = allocation;
+    value.source_offset = source_offset;
+    value.source_bytes = artifact.source_bytes;
     value.plane_count = artifact.plane_count;
     value.block_elements = artifact.block_elements;
     value.source_blocks_per_tile = artifact.source_blocks_per_tile;
@@ -2182,6 +2143,7 @@ static bool ensure_execution_artifact(
         value.plane_element_bytes[i] = artifact.plane_element_bytes[i];
     }
     g_vk.execution_artifacts[source_offset] = value;
+    g_vk.weight_used += artifact.bytes;
     entry = &g_vk.execution_artifacts.find(source_offset)->second;
     ds4_vulkan_execution_artifact_free(&artifact);
     return true;
@@ -2458,6 +2420,71 @@ static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes) {
     return true;
 }
 
+static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes) {
+    bool found = false;
+    for (const auto &[base, value] : g_vk.aligned_cache) {
+        const uint64_t blocks = value.blocks;
+        if (value.out_dim != 0 && blocks != 0 &&
+            value.out_dim <= UINT64_MAX / blocks &&
+            value.out_dim * blocks <= UINT64_MAX / 34u &&
+            ranges_overlap(offset, bytes, value.source_offset,
+                           value.out_dim * blocks * 34u))
+            found = true;
+    }
+    if (!found) return true;
+    if (current_commands_reference_weights() ||
+        timeline_device_wait_idle("aligned_weight_overlap_remove") != VK_SUCCESS)
+        return false;
+    for (auto it = g_vk.aligned_cache.begin(); it != g_vk.aligned_cache.end();) {
+        const auto &value = it->second;
+        const uint64_t blocks = value.blocks;
+        const bool valid = value.out_dim != 0 && blocks != 0 &&
+            value.out_dim <= UINT64_MAX / blocks &&
+            value.out_dim * blocks <= UINT64_MAX / 34u;
+        const uint64_t source_size = valid ? value.out_dim * blocks * 34u : 0;
+        if (!valid || !ranges_overlap(offset, bytes, value.source_offset, source_size)) {
+            ++it;
+            continue;
+        }
+        timeline_resource_current(TimelineEventKind::BufferFree,
+                                  "aligned_weight_overlap_remove",
+                                  value.gpu.size, value.source_offset);
+        vmaDestroyBuffer(g_vk.allocator, value.gpu.buffer, value.gpu.allocation);
+        g_vk.weight_used -= std::min(g_vk.weight_used, value.gpu.size);
+        it = g_vk.aligned_cache.erase(it);
+    }
+    return true;
+}
+
+static bool remove_execution_artifact_overlap(uint64_t offset, uint64_t bytes) {
+    bool found = false;
+    for (const auto &[_, value] : g_vk.execution_artifacts)
+        if (ranges_overlap(offset, bytes, value.source_offset, value.source_bytes))
+            found = true;
+    if (!found) return true;
+    if (current_commands_reference_weights() ||
+        timeline_device_wait_idle("execution_artifact_overlap_remove") != VK_SUCCESS)
+        return false;
+    for (auto it = g_vk.execution_artifacts.begin(); it != g_vk.execution_artifacts.end();) {
+        if (!ranges_overlap(offset, bytes, it->second.source_offset,
+                            it->second.source_bytes)) {
+            ++it;
+            continue;
+        }
+        timeline_resource_current(TimelineEventKind::BufferFree,
+                                  "execution_artifact_overlap_remove",
+                                  it->second.arena_entry.bytes,
+                                  it->second.source_offset);
+        if (it->second.buffer)
+            vmaDestroyBuffer(g_vk.allocator, it->second.buffer,
+                             it->second.allocation);
+        g_vk.weight_used -= std::min(g_vk.weight_used,
+                                     it->second.arena_entry.bytes);
+        it = g_vk.execution_artifacts.erase(it);
+    }
+    return true;
+}
+
 static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset) {
     if (bytes > g_vk.weight_budget) return false;
     while (g_vk.weight_used > g_vk.weight_budget - bytes) {
@@ -2611,6 +2638,7 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     }
     const uint64_t raw_bytes = out_dim * artifact.blocks_per_row * 34u;
     if (!remove_raw_weight_overlap(offset, raw_bytes) ||
+        !remove_execution_artifact_overlap(offset, raw_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, offset)) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr,
@@ -2652,9 +2680,11 @@ int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t
         odim * blocks > UINT64_MAX / 34u || bytes != odim * blocks * 34u) return 0;
     set_model_map_identity(m, s);
     const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
+    const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
     if (g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
         idim % 256u == 0u && odim % 4u == 0u &&
-        !(exec_env && strcmp(exec_env, "0") == 0)) {
+        !(exec_env && strcmp(exec_env, "0") == 0) &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0)) {
         decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
         if (ensure_execution_q8_artifact(m, s, off, idim, odim, execution))
             return 1;
@@ -3495,12 +3525,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     buffers[descriptor_count++] = {xbuf, xoff, (VkDeviceSize)q_bytes};
     if (use_execution) {
         buffers[descriptor_count++] = {
-            g_vk.execution_arena_buffer,
-            (VkDeviceSize)(execution->arena_entry.data_offset + execution->plane_offset[0]),
+            execution->buffer,
+            (VkDeviceSize)execution->plane_offset[0],
             (VkDeviceSize)execution->plane_bytes[0]};
         buffers[descriptor_count++] = {
-            g_vk.execution_arena_buffer,
-            (VkDeviceSize)(execution->arena_entry.data_offset + execution->plane_offset[1]),
+            execution->buffer,
+            (VkDeviceSize)execution->plane_offset[1],
             (VkDeviceSize)execution->plane_bytes[1]};
     } else if (use_aligned) {
         buffers[descriptor_count++] = {aligned->gpu.buffer, 0,
@@ -7641,21 +7671,17 @@ static bool ds4gk_routed_common(
             if (use_iq2_execution) {
                 VkDescriptorBufferInfo fused_buffers[9] = {
                     q8_info,
-                    {g_vk.execution_arena_buffer,
-                     (VkDeviceSize)(gate_execution->arena_entry.data_offset +
-                                    gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE]),
+                    {gate_execution->buffer,
+                     (VkDeviceSize)gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE],
                      (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
-                    {g_vk.execution_arena_buffer,
-                     (VkDeviceSize)(gate_execution->arena_entry.data_offset +
-                                    gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD]),
+                    {gate_execution->buffer,
+                     (VkDeviceSize)gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD],
                      (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
-                    {g_vk.execution_arena_buffer,
-                     (VkDeviceSize)(up_execution->arena_entry.data_offset +
-                                    up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE]),
+                    {up_execution->buffer,
+                     (VkDeviceSize)up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE],
                      (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
-                    {g_vk.execution_arena_buffer,
-                     (VkDeviceSize)(up_execution->arena_entry.data_offset +
-                                    up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD]),
+                    {up_execution->buffer,
+                     (VkDeviceSize)up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD],
                      (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
                     selected_info, compact_mid_q8_info, weights_info, iq2_lut_info};
                 const char *fused_mid_shader = ds4gk_routed_shape_shader(

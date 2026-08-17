@@ -508,6 +508,7 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_aligned_bfe", 20, 4},
         {"matmul_q8_0_exec", 20, 4},
+        {"matmul_q8_0_exec_128", 20, 4},
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
@@ -3506,8 +3507,10 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(rows8_env && strcmp(rows8_env, "0") == 0) &&
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
+    bool use_execution_128 = use_execution && blocks <= 128u &&
+        g_vk.shader_map.find("matmul_q8_0_exec_128") != g_vk.shader_map.end();
     const char *shader_name = use_execution
-        ? "matmul_q8_0_exec"
+        ? (use_execution_128 ? "matmul_q8_0_exec_128" : "matmul_q8_0_exec")
         : (use_wave64
         ? "matmul_q8_0_wave64_bfe"
         : (use_rows2
@@ -3544,6 +3547,14 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         use_aligned = false;
         shader_name = "matmul_q8_0_prequant";
         si = g_vk.shader_map.find(shader_name);
+    }
+    if (si == g_vk.shader_map.end() && use_execution) {
+        if (use_execution_128) {
+            /* A stale bundle may omit only the narrow 128-lane variant. */
+            use_execution_128 = false;
+            shader_name = "matmul_q8_0_exec";
+            si = g_vk.shader_map.find(shader_name);
+        }
     }
     if (si == g_vk.shader_map.end() && use_execution) {
         use_execution = false;

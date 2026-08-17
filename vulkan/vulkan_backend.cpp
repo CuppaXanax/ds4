@@ -320,6 +320,12 @@ static struct {
         uint64_t unsupported = 0;
         uint64_t failures = 0;
     } execution_artifact_stats[3];
+    struct ExecutionCoverageShape {
+        uint64_t dispatches = 0;
+        uint64_t artifact_hits = 0;
+        uint64_t fallbacks = 0;
+    };
+    std::unordered_map<uint64_t, ExecutionCoverageShape> q8_execution_coverage;
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
     std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache; /* source offset -> artifact */
     /* Model tensor ranges registered by cache_model_range (metadata only). */
@@ -2455,6 +2461,7 @@ static void execution_arena_clear(void) {
         }
     }
     g_vk.execution_artifacts.clear();
+    g_vk.q8_execution_coverage.clear();
 }
 
 static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
@@ -3111,6 +3118,21 @@ extern "C" void ds4_gpu_execution_artifact_report(void) {
                 (unsigned long long)s.unsupported,
                 (unsigned long long)s.failures,
                 execution_artifact_required(i) ? " required=1" : "");
+    }
+    if (!g_vk.q8_execution_coverage.empty()) {
+        fprintf(stderr, "ds4: Q8 execution coverage by shape\n");
+        for (const auto &[shape, coverage] : g_vk.q8_execution_coverage) {
+            const uint32_t in_dim = uint32_t(shape >> 32u);
+            const uint32_t out_dim = uint32_t(shape);
+            fprintf(stderr,
+                    "ds4: Q8 shape %ux%u dispatches=%llu artifact_hits=%llu "
+                    "fallbacks=%llu%s\n",
+                    in_dim, out_dim,
+                    (unsigned long long)coverage.dispatches,
+                    (unsigned long long)coverage.artifact_hits,
+                    (unsigned long long)coverage.fallbacks,
+                    coverage.fallbacks ? " INCOMPLETE" : "");
+        }
     }
 }
 
@@ -3968,6 +3990,12 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     q8_stats.dispatches++;
     if (use_execution) q8_stats.dispatch_hits++;
     else q8_stats.dispatch_fallbacks++;
+    const uint64_t coverage_key = (uint64_t(uint32_t(in_dim)) << 32u) |
+                                  uint64_t(uint32_t(out_dim));
+    auto &coverage = g_vk.q8_execution_coverage[coverage_key];
+    coverage.dispatches++;
+    if (use_execution) coverage.artifact_hits++;
+    else coverage.fallbacks++;
     if (use_execution && getenv("DS4_VULKAN_TRACE_KERNELS"))
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,

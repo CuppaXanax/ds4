@@ -264,6 +264,11 @@ those gates pass, the only defensible statement is that the architecture is
 implemented and GPU-correct on its focused gates, not that 50 ms or 20 TPS has
 been achieved.
 
+The runtime report now includes a Q8 coverage ledger keyed by input/output
+shape. A production gate must show `fallbacks=0` for every reported hot shape;
+the aggregate artifact flag alone is insufficient evidence because a single
+large dense projection can dominate the remaining stream.
+
 ## Evidence limits
 
 The retained artifacts do not contain a complete 43-layer continuous timeline,

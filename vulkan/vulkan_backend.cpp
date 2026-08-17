@@ -513,6 +513,7 @@ static int load_all_shaders(void) {
         {"attention_decode_mixed_rope", 76, 6},
         {"attention_mixed_online", 64, 8},
         {"attention_indexed_online_wave64", 108, 8},
+        {"attention_indexed_online_wave64_512", 108, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
         {"indexer_qat", 4, 1},
@@ -4723,8 +4724,10 @@ extern "C" int ds4_gpu_attention_indexed_wave64_used(void) {
 
 extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_available(void) {
     return indexed_wave64_enabled() && indexed_wave64_inv_rope_enabled() &&
-        g_vk.shader_map.find("attention_indexed_online_wave64") !=
-            g_vk.shader_map.end();
+        (g_vk.shader_map.find("attention_indexed_online_wave64") !=
+             g_vk.shader_map.end() ||
+         g_vk.shader_map.find("attention_indexed_online_wave64_512") !=
+             g_vk.shader_map.end());
 }
 
 extern "C" int ds4_gpu_attention_indexed_wave64_inv_rope_used(void) {
@@ -4751,7 +4754,8 @@ static int dispatch_attention_mixed_online(
     if (!heads || !q || !raw_kv || !model_map || n_q == 0 || n_tokens == 0 ||
         n_head == 0 || head_dim == 0 || n_q > n_tokens ||
         q_row0 > n_tokens - n_q || n_raw > raw_cap ||
-        (n_raw != 0 && raw_start >= raw_cap) || n_comp > 4096u ||
+        (n_raw != 0 && raw_start >= raw_cap) ||
+        (mode == 1u ? n_comp > 32768u : n_comp > 4096u) ||
         top_k > 512u || (mode == 1u && top_k == 0u) ||
         (n_comp != 0 && !comp_kv) || (mode == 1u && !topk) ||
         (use_mask != 0u && !comp_mask) ||
@@ -4784,7 +4788,8 @@ static int dispatch_attention_mixed_online(
     if (ratio != 0) {
         max_visible = std::min<uint64_t>((position_end - 1u) / ratio, n_comp);
     }
-    const uint64_t visible_limit = (mode == 0u && use_mask == 0u) ? 512u : 4096u;
+    const uint64_t visible_limit = mode == 1u ? 32768u :
+        ((mode == 0u && use_mask == 0u) ? 512u : 4096u);
     if (max_visible > visible_limit || raw_bytes < 4u) return 0;
     if (heads->bytes < head_bytes || q->bytes < q_bytes ||
         raw_kv->bytes < raw_bytes ||
@@ -4848,13 +4853,21 @@ static int dispatch_attention_mixed_online(
             comp_kv_f16, use_mask, mode};
         const uint64_t tile_head_count = (uint64_t)tile_rows * n_head;
         const bool more_tiles = local_row0 + tile_rows < n_q;
-        /* Indexed 128K decode is the only path admitted to the register
-         * accumulator candidate.  It preserves the canonical online order,
-         * but requires one full wave and exactly two head values per lane. */
-        const bool use_indexed_wave64 = mode == 1u && head_dim == 128u &&
+        /* Indexed decode is admitted to the register-accumulator candidates
+         * only for the production 128-wide legacy path or the exact
+         * head_dim=512 candidate.  Both preserve canonical online order and
+         * require one full Wave64; the 512 shader owns eight values per lane. */
+        const bool use_indexed_wave64_128 = mode == 1u && head_dim == 128u &&
             indexed_wave64_enabled() &&
             g_vk.shader_map.find("attention_indexed_online_wave64") !=
                 g_vk.shader_map.end();
+        const bool use_indexed_wave64_512 = mode == 1u && head_dim == 512u &&
+            ratio == 4u && top_k == 512u && n_tokens == 1u && n_q == 1u &&
+            indexed_wave64_enabled() &&
+            g_vk.shader_map.find("attention_indexed_online_wave64_512") !=
+                g_vk.shader_map.end();
+        const bool use_indexed_wave64 = use_indexed_wave64_128 ||
+            use_indexed_wave64_512;
         const bool use_indexed_wave64_inv_rope = use_indexed_wave64 &&
             n_tokens == 1u && n_q == 1u &&
             g_decode_attn_rope_fuse.armed &&
@@ -4898,7 +4911,9 @@ static int dispatch_attention_mixed_online(
             rope_pc.beta_slow = 0.0f;
         }
         const char *shader_name = use_indexed_wave64
-            ? "attention_indexed_online_wave64" : "attention_mixed_online";
+            ? (use_indexed_wave64_512 ? "attention_indexed_online_wave64_512"
+                                      : "attention_indexed_online_wave64")
+            : "attention_mixed_online";
         if (use_indexed_wave64) g_indexed_wave64_used = true;
         DS4_VK_TRACE_KERNEL(shader_name);
         if (tile_head_count > g_vk.caps.max_compute_work_group_count[0] ||

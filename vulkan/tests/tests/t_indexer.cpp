@@ -970,3 +970,156 @@ done:
 }
 REGISTER_TEST(indexed_attention_wave64_inv_rope_bench,
               test_indexed_attention_wave64_inv_rope_bench);
+
+/* Dedicated production-shape gate for the 512-wide indexed candidate.  The
+ * legacy 128-wide gates above remain unchanged. */
+static int test_indexed_attention_wave64_512_impl(uint32_t n_comp,
+                                                  bool benchmark) {
+    if (benchmark && !std::getenv("DS4_TEST_BENCH_INDEXED_WAVE64_512")) return 0;
+    if (!benchmark && n_comp == 32768u &&
+        !std::getenv("DS4_TEST_INDEXED_WAVE64_32768")) return 0;
+    const uint32_t n_tokens = 1, n_head = 64, head_dim = 512;
+    const uint32_t top_k = 512, raw_cap = 128, n_raw = 128;
+    const uint32_t pos0 = n_comp == 32768u ? 131072u : 4096u;
+    const uint32_t raw_start = 3, window = 128, ratio = 4;
+    const size_t q_values = (size_t)n_tokens * n_head * head_dim;
+    const size_t raw_values = (size_t)raw_cap * head_dim;
+    const size_t comp_values = (size_t)n_comp * head_dim;
+    const size_t out_values = q_values;
+    std::vector<float> q(q_values), raw(raw_values), comp(comp_values, 0.0f);
+    std::vector<uint32_t> topk(top_k);
+    std::vector<float> fallback(out_values), candidate(out_values);
+    for (size_t i = 0; i < q.size(); i++)
+        q[i] = 0.03125f * (float)((i * 17u) % 29u) - 0.4f;
+    for (size_t i = 0; i < raw.size(); i++)
+        raw[i] = 0.015625f * (float)((i * 11u) % 23u) - 0.2f;
+    for (uint32_t c = 0; c < top_k; c++) {
+        const uint32_t selected_row = n_comp == 32768u
+            ? n_comp - top_k + c : c;
+        topk[c] = selected_row;
+        for (uint32_t d = 0; d < head_dim; d++)
+            comp[(size_t)selected_row * head_dim + d] =
+                0.0078125f * (float)(((selected_row + d) * 7u) % 41u) - 0.15f;
+    }
+    float sinks[n_head] = {};
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = 0.125f - 0.003f * h;
+    std::vector<unsigned char> model(16u + sizeof(sinks), 0u);
+    std::memcpy(model.data() + 16u, sinks, sizeof(sinks));
+    const uint64_t q_bytes = q.size() * sizeof(float);
+    const uint64_t raw_bytes = raw.size() * sizeof(float);
+    const uint64_t comp_bytes = comp.size() * sizeof(float);
+    const uint64_t out_bytes = out_values * sizeof(float);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *qt = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *rt = ds4_gpu_tensor_alloc(raw_bytes);
+    ds4_gpu_tensor *ct = ds4_gpu_tensor_alloc(comp_bytes);
+    ds4_gpu_tensor *tt = ds4_gpu_tensor_alloc(topk.size() * sizeof(uint32_t));
+    const char *saved = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64");
+    const char *saved_inv = std::getenv("DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE");
+    const bool had_saved = saved != nullptr, had_saved_inv = saved_inv != nullptr;
+    const std::string saved_value = saved ? saved : "";
+    const std::string saved_inv_value = saved_inv ? saved_inv : "";
+    int rc = 1;
+    do {
+        if (!out || !qt || !rt || !ct || !tt ||
+            !ds4_gpu_set_model_map(model.data(), model.size()) ||
+            !ds4_gpu_tensor_write(qt, 0, q.data(), q_bytes) ||
+            !ds4_gpu_tensor_write(rt, 0, raw.data(), raw_bytes) ||
+            !ds4_gpu_tensor_write(ct, 0, comp.data(), comp_bytes) ||
+            !ds4_gpu_tensor_write(tt, 0, topk.data(), topk.size() * sizeof(uint32_t)))
+            break;
+        set_indexed_wave64_inv_rope_env("0");
+        auto dispatch_and_read = [&](ds4_gpu_tensor *dst, std::vector<float> &data) -> bool {
+            if (!ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                    dst, model.data(), model.size(), 16u, qt, rt, ct, 0u, tt,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                    window, ratio, n_head, head_dim)) return false;
+            return ds4_gpu_tensor_read(dst, 0, data.data(), out_bytes) != 0;
+        };
+        set_indexed_wave64_env("0");
+        if (!dispatch_and_read(out, fallback)) break;
+        if (benchmark) {
+            const uint32_t rounds = 8;
+            const auto begin = std::chrono::steady_clock::now();
+            for (uint32_t i = 0; i < rounds; i++)
+                if (!dispatch_and_read(out, fallback)) break;
+            const auto end = std::chrono::steady_clock::now();
+            const double fallback_ms = std::chrono::duration<double, std::milli>(end - begin).count();
+            set_indexed_wave64_env("1");
+            if (!dispatch_and_read(out, candidate) ||
+                ds4_gpu_attention_indexed_wave64_used() != 1) break;
+            const auto candidate_begin = std::chrono::steady_clock::now();
+            for (uint32_t i = 0; i < rounds; i++)
+                if (!dispatch_and_read(out, candidate)) break;
+            const auto candidate_end = std::chrono::steady_clock::now();
+            const double candidate_ms = std::chrono::duration<double, std::milli>(candidate_end - candidate_begin).count();
+            fprintf(stderr, "indexed_attention_wave64_512_bench: n_comp=%u rounds=%u fallback_per_dispatch_ms=%.3f candidate_per_dispatch_ms=%.3f\n",
+                    n_comp, rounds, fallback_ms / rounds, candidate_ms / rounds);
+        } else {
+            set_indexed_wave64_env("1");
+            if (!dispatch_and_read(out, candidate) ||
+                ds4_gpu_attention_indexed_wave64_used() != 1) {
+                rc = std::getenv("DS4_TEST_REQUIRE_INDEXED_WAVE64") ? 1 : 0;
+                break;
+            }
+        }
+        if (std::memcmp(fallback.data(), candidate.data(), out_bytes) != 0) break;
+        /* The production decode also fuses inverse RoPE into this shader.
+         * Compare it against the ordinary indexed path plus standalone
+         * rope_tail while retaining the non-fused A/B above. */
+        const float rope_base = 10000.0f;
+        set_indexed_wave64_env("0");
+        set_indexed_wave64_inv_rope_env("0");
+        ds4_gpu_set_decode_attn_rope_fuse(head_dim, 64u, pos0, 0u, true,
+                                          rope_base, 1.0f, 0.0f, 1.0f,
+                                          0.0f, 0.0f);
+        if (!dispatch_and_read(out, fallback) ||
+            !ds4_gpu_rope_tail_tensor(out, n_tokens, n_head, head_dim, 64u,
+                                      pos0, 0u, true, rope_base, 1.0f, 0.0f,
+                                      1.0f, 0.0f, 0.0f) ||
+            !ds4_gpu_tensor_read(out, 0, fallback.data(), out_bytes)) break;
+        set_indexed_wave64_env("1");
+        set_indexed_wave64_inv_rope_env("1");
+        ds4_gpu_set_decode_attn_rope_fuse(head_dim, 64u, pos0, 0u, true,
+                                          rope_base, 1.0f, 0.0f, 1.0f,
+                                          0.0f, 0.0f);
+        if (ds4_gpu_attention_indexed_wave64_inv_rope_available() == 0) {
+            rc = std::getenv("DS4_TEST_REQUIRE_INDEXED_WAVE64") ? 1 : 0;
+            break;
+        }
+        if (!dispatch_and_read(out, candidate) ||
+            ds4_gpu_attention_indexed_wave64_used() != 1 ||
+            ds4_gpu_attention_indexed_wave64_inv_rope_used() != 1 ||
+            std::memcmp(fallback.data(), candidate.data(), out_bytes) != 0)
+            break;
+        rc = 0;
+    } while (false);
+    if (had_saved) set_indexed_wave64_env(saved_value.c_str());
+    else set_indexed_wave64_env(nullptr);
+    if (had_saved_inv) set_indexed_wave64_inv_rope_env(saved_inv_value.c_str());
+    else set_indexed_wave64_inv_rope_env(nullptr);
+    if (tt) ds4_gpu_tensor_free(tt);
+    if (ct) ds4_gpu_tensor_free(ct);
+    if (rt) ds4_gpu_tensor_free(rt);
+    if (qt) ds4_gpu_tensor_free(qt);
+    if (out) ds4_gpu_tensor_free(out);
+    return rc;
+}
+
+static int test_indexed_attention_wave64_512_exact_ab(void) {
+    return test_indexed_attention_wave64_512_impl(1024u, false);
+}
+REGISTER_TEST(indexed_attention_wave64_512_exact_ab,
+              test_indexed_attention_wave64_512_exact_ab);
+
+static int test_indexed_attention_wave64_512_bench(void) {
+    return test_indexed_attention_wave64_512_impl(1024u, true);
+}
+REGISTER_TEST(indexed_attention_wave64_512_bench,
+              test_indexed_attention_wave64_512_bench);
+
+static int test_indexed_attention_wave64_512_32768_exact(void) {
+    return test_indexed_attention_wave64_512_impl(32768u, false);
+}
+REGISTER_TEST(indexed_attention_wave64_512_32768_exact,
+              test_indexed_attention_wave64_512_32768_exact);

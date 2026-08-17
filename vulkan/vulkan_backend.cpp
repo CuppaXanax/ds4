@@ -128,6 +128,7 @@ struct VulkanCommandCtx {
     uint64_t layer_timeline_stop_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
+    bool slice_batch_active = false;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
@@ -1274,7 +1275,8 @@ static int defer_layer_batch_resources(VulkanCommandCtx &ctx) {
     return 1;
 }
 
-static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
+static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume,
+                                   bool force_wait = false) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     const bool was_active = ctx.layer_batch_active;
     ctx.layer_batch_active = false;
@@ -1285,7 +1287,7 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
      * enclosing token completion. */
     const bool nonblocking_timeline = ctx.layer_timeline_active &&
         getenv("DS4_VULKAN_TIMELINE_LAYER_NO_WAIT") != nullptr;
-    const bool defer = ctx.command_count != 0 && !resume &&
+    const bool defer = !force_wait && ctx.command_count != 0 && !resume &&
         (!ctx.layer_timeline_active || nonblocking_timeline) &&
         command_ring_enabled();
     int ok = defer ? end_and_submit() : submit_and_wait_force();
@@ -1776,6 +1778,9 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
+    /* A worker slice owns the enclosing lifetime scope.  Keep the per-layer
+     * encoder contract successful without opening a nested retirement scope. */
+    if (ctx.slice_batch_active) return 1;
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0) {
         /* Decode records token embedding before opening the first layer
@@ -1801,6 +1806,7 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
 extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active) return 1;
     if (ctx.layer_batch_active) return 0;
     /* Prefill already owns an ordered layer-major stream.  Attaching the
      * lifetime scope must not submit/wait on the preceding layer; the next
@@ -1820,8 +1826,41 @@ extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
 extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active) return 1;
     if (!ctx.layer_batch_active) return 1;
     return retire_layer_batch_span(ctx, false);
+}
+
+extern "C" int ds4_gpu_batch_slice_begin(uint32_t first_layer,
+                                           uint32_t last_layer) {
+    (void)first_layer;
+    (void)last_layer;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active || ctx.layer_batch_active) return 0;
+    /* Do not submit setup work already recorded in this command epoch. */
+    if (!ctx.recording && !begin_cmd()) return 0;
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    ctx.layer_batch_descriptors.reserve(128);
+    ctx.layer_batch_tensors.reserve(32);
+    ctx.layer_batch_in_place_ptrs.reserve(16);
+    ctx.layer_batch_active = true;
+    ctx.slice_batch_active = true;
+    return 1;
+}
+
+extern "C" int ds4_gpu_batch_slice_end(uint32_t first_layer,
+                                         uint32_t last_layer) {
+    (void)first_layer;
+    (void)last_layer;
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.slice_batch_active) return 1;
+    /* The worker output boundary: force completion of every command-ring
+     * segment belonging to this logical slice before mapped output is read,
+     * while retaining the existing descriptor/tensor retirement path. */
+    ctx.slice_batch_active = false;
+    return retire_layer_batch_span(ctx, false, true);
 }
 
 int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {

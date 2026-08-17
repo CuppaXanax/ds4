@@ -59833,6 +59833,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
+#ifdef DS4_VULKAN_BUILD
+        bool worker_slice_scope = false;
+#endif
         if (g->ssd_streaming) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
@@ -59864,6 +59867,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
         } else {
+#ifdef DS4_VULKAN_BUILD
+            const bool use_worker_slice_scope =
+                split_after_layers == 0 &&
+                getenv("DS4_VULKAN_TIMELINE_LAYER") == NULL &&
+                g->placement == NULL && g->tp_world < 2 &&
+                !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
+            if (ok && use_worker_slice_scope) {
+                worker_slice_scope =
+                    ds4_gpu_batch_slice_begin(layer_start, layer_end) != 0;
+                ok = worker_slice_scope;
+            }
+#endif
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
                 ok = metal_graph_encode_decode_layer(g,
                                                      &e->model,
@@ -59890,6 +59905,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             if (ok && output_logits) {
                 ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
             }
+#ifdef DS4_VULKAN_BUILD
+            if (worker_slice_scope) {
+                if (ok) ok = ds4_gpu_batch_slice_end(layer_start, layer_end) != 0;
+                else (void)ds4_gpu_batch_slice_end(layer_start, layer_end);
+                worker_slice_scope = false;
+            } else
+#endif
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
         if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
@@ -59945,6 +59967,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         layer_start == 0 &&
         (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
          metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+#ifdef DS4_VULKAN_BUILD
+    bool worker_slice_scope = false;
+#endif
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             g->streaming_static_decode_map_current = false;
@@ -59969,6 +59994,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+#ifdef DS4_VULKAN_BUILD
+        if (ok) {
+            const bool use_worker_slice_scope =
+                !g->quality && g->placement == NULL && g->tp_world < 2 &&
+                !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
+            if (use_worker_slice_scope) {
+                worker_slice_scope =
+                    ds4_gpu_batch_slice_begin(layer_start, layer_end) != 0;
+                ok = worker_slice_scope;
+            }
+        }
+#endif
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             ok = metal_graph_encode_layer_batch(g,
                                                 &e->model,
@@ -59994,7 +60031,16 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             g->cur_hc_by_tier[src_tier] = saved_cur;
         }
     }
-    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
+#ifdef DS4_VULKAN_BUILD
+    if (worker_slice_scope) {
+        if (ok) ok = ds4_gpu_batch_slice_end(layer_start, layer_end) != 0;
+        else (void)ds4_gpu_batch_slice_end(layer_start, layer_end);
+        worker_slice_scope = false;
+    } else
+#endif
+    if (ok && !g->ssd_streaming) {
+        ok = ds4_gpu_end_commands() != 0;
+    }
     if (saved_cur) g->cur_hc_by_tier[src_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 

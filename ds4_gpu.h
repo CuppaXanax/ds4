@@ -118,6 +118,11 @@ int ds4_gpu_batch_layer_begin(uint32_t layer);
  * preceding work already recorded in the command stream. */
 int ds4_gpu_batch_prefill_layer_begin(uint32_t layer);
 int ds4_gpu_batch_layer_end(uint32_t layer);
+/* Keep a non-streaming worker layer slice in one logical command/lifetime
+ * epoch. The command-size guard may split submissions, but retirement waits
+ * only at slice_end. */
+int ds4_gpu_batch_slice_begin(uint32_t first_layer, uint32_t last_layer);
+int ds4_gpu_batch_slice_end(uint32_t first_layer, uint32_t last_layer);
 #endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

@@ -151,6 +151,8 @@ struct VulkanCommandCtx {
     std::vector<VkDescriptorSet> slot_descriptors[DS4_VK_COMMAND_RING_SIZE];
     std::unordered_map<DescriptorCacheKey, VkDescriptorSet,
                        DescriptorCacheKeyHash> recording_descriptors;
+    std::unordered_map<DescriptorCacheKey, VkDescriptorSet,
+                       DescriptorCacheKeyHash> persistent_descriptors;
     std::unordered_map<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>
         reusable_descriptors;
     std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout> descriptor_layouts;
@@ -1305,6 +1307,31 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
 
 static bool release_tensor_header(TensorHeader *header);
 
+static bool persistent_descriptors_enabled(const VulkanCommandCtx &ctx) {
+    const char *env = getenv("DS4_VULKAN_PERSIST_DESCRIPTORS");
+    return ctx.slice_batch_active && (!env || strcmp(env, "0") != 0);
+}
+
+static void invalidate_persistent_descriptors_for_buffer(VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) return;
+    for (auto &[_, ctx] : g_vk.cmd_ctxs) {
+        for (auto it = ctx.persistent_descriptors.begin();
+             it != ctx.persistent_descriptors.end();) {
+            bool references = false;
+            for (const auto &info : it->first.buffers)
+                references |= info.buffer == buffer;
+            if (!references) {
+                ++it;
+                continue;
+            }
+            VkDescriptorSet set = it->second;
+            ctx.descriptor_layouts.erase(set);
+            (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+            it = ctx.persistent_descriptors.erase(it);
+        }
+    }
+}
+
 static void recycle_descriptor_set(VulkanCommandCtx &ctx, VkDescriptorSet set) {
     if (set == VK_NULL_HANDLE) return;
     auto it = ctx.descriptor_layouts.find(set);
@@ -1320,6 +1347,8 @@ static void recycle_descriptor_set(VulkanCommandCtx &ctx, VkDescriptorSet set) {
 
 static bool descriptor_set_deferred(const VulkanCommandCtx &ctx,
                                     VkDescriptorSet set) {
+    for (const auto &[_, cached] : ctx.persistent_descriptors)
+        if (cached == set) return true;
     for (const auto &[_, cached] : ctx.recording_descriptors)
         if (cached == set) return true;
     for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++)
@@ -1753,6 +1782,13 @@ void ds4_gpu_cleanup(void) {
         for (auto &[__, lease] : c.slice_scratch_leases)
             free(lease.owner);
         c.slice_scratch_leases.clear();
+        for (const auto &[__, set] : c.persistent_descriptors) {
+            VkDescriptorSet mutable_set = set;
+            (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1,
+                                       &mutable_set);
+            c.descriptor_layouts.erase(set);
+        }
+        c.persistent_descriptors.clear();
         for (VkQueryPool pool : c.timestamp_pools)
             if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
@@ -1898,8 +1934,10 @@ static bool release_tensor_header(TensorHeader *header) {
         pool[header->bytes].push_back(header);
         return true;
     }
-    if (header->buffer)
+    if (header->buffer) {
+        invalidate_persistent_descriptors_for_buffer(header->buffer);
         vmaDestroyBuffer(g_vk.allocator, header->buffer, header->allocation);
+    }
     free(header);
     return false;
 }
@@ -2294,6 +2332,7 @@ static void clear_weight_cache(void) {
         for (auto &[offset, entry] : g_vk.weight_cache) {
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "weight_cache_clear", entry.size, offset);
+            invalidate_persistent_descriptors_for_buffer(entry.buffer);
             vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
         }
         g_vk.weight_cache.clear();
@@ -2303,6 +2342,7 @@ static void clear_weight_cache(void) {
         for (auto &[offset, entry] : g_vk.aligned_cache) {
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "aligned_cache_clear", entry.gpu.size, offset);
+            invalidate_persistent_descriptors_for_buffer(entry.gpu.buffer);
             vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
         }
         g_vk.aligned_cache.clear();
@@ -2454,6 +2494,7 @@ static void execution_arena_clear(void) {
                                           "execution_artifact_clear",
                                           entry.arena_entry.bytes,
                                           entry.source_offset);
+                invalidate_persistent_descriptors_for_buffer(entry.buffer);
                 vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
             }
             g_vk.weight_used -= std::min(g_vk.weight_used,
@@ -2772,6 +2813,7 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
         auto it = g_vk.weight_cache.find(lru_base);
         timeline_resource_current(TimelineEventKind::BufferFree,
                       "weight_cache_evict", it->second.size, lru_base);
+        invalidate_persistent_descriptors_for_buffer(it->second.buffer);
         vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
         g_vk.weight_used -= it->second.size;
         g_vk.weight_cache.erase(it);
@@ -2807,6 +2849,7 @@ static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes) {
         }
         timeline_resource_current(TimelineEventKind::BufferFree,
                       "weight_overlap_remove", it->second.size, it->first);
+        invalidate_persistent_descriptors_for_buffer(it->second.buffer);
         vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
         g_vk.weight_used -= std::min(g_vk.weight_used, it->second.size);
         it = g_vk.weight_cache.erase(it);
@@ -2843,6 +2886,7 @@ static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes) {
         timeline_resource_current(TimelineEventKind::BufferFree,
                                   "aligned_weight_overlap_remove",
                                   value.gpu.size, value.source_offset);
+        invalidate_persistent_descriptors_for_buffer(value.gpu.buffer);
         vmaDestroyBuffer(g_vk.allocator, value.gpu.buffer, value.gpu.allocation);
         g_vk.weight_used -= std::min(g_vk.weight_used, value.gpu.size);
         it = g_vk.aligned_cache.erase(it);
@@ -2869,9 +2913,11 @@ static bool remove_execution_artifact_overlap(uint64_t offset, uint64_t bytes) {
                                   "execution_artifact_overlap_remove",
                                   it->second.arena_entry.bytes,
                                   it->second.source_offset);
-        if (it->second.buffer)
+        if (it->second.buffer) {
+            invalidate_persistent_descriptors_for_buffer(it->second.buffer);
             vmaDestroyBuffer(g_vk.allocator, it->second.buffer,
                              it->second.allocation);
+        }
         g_vk.weight_used -= std::min(g_vk.weight_used,
                                      it->second.arena_entry.bytes);
         it = g_vk.execution_artifacts.erase(it);
@@ -2906,6 +2952,7 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
             auto it = g_vk.aligned_cache.find(victim);
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "aligned_cache_evict", it->second.gpu.size, victim);
+            invalidate_persistent_descriptors_for_buffer(it->second.gpu.buffer);
             vmaDestroyBuffer(g_vk.allocator, it->second.gpu.buffer, it->second.gpu.allocation);
             g_vk.weight_used -= it->second.gpu.size;
             g_vk.aligned_cache.erase(it);
@@ -2913,6 +2960,7 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
             auto it = g_vk.weight_cache.find(victim);
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "weight_cache_evict", it->second.size, victim);
+            invalidate_persistent_descriptors_for_buffer(it->second.buffer);
             vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
             g_vk.weight_used -= it->second.size;
             g_vk.weight_cache.erase(it);
@@ -3278,6 +3326,7 @@ void ds4_gpu_release_q8_f16_cache(void) {
     for (auto &[offset, entry] : g_vk.aligned_cache) {
         timeline_resource_current(TimelineEventKind::BufferFree,
                                   "aligned_cache_release", entry.gpu.size, offset);
+        invalidate_persistent_descriptors_for_buffer(entry.gpu.buffer);
         vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
         g_vk.weight_used -= std::min(g_vk.weight_used, entry.gpu.size);
     }
@@ -3443,6 +3492,15 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
         return 1;
     }
+    if (persistent_descriptors_enabled(ctx)) {
+        auto persistent = ctx.persistent_descriptors.find(key);
+        if (persistent != ctx.persistent_descriptors.end()) {
+            set = persistent->second;
+            mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
+            timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+            return 1;
+        }
+    }
     VkDescriptorSetAllocateInfo allocate{};
     allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocate.descriptorPool = g_vk.desc_pool;
@@ -3476,7 +3534,11 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
                               descriptor_start);
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
-    ctx.recording_descriptors.emplace(std::move(key), set);
+    if (persistent_descriptors_enabled(ctx) &&
+        ctx.persistent_descriptors.size() < 8192u)
+        ctx.persistent_descriptors.emplace(std::move(key), set);
+    else
+        ctx.recording_descriptors.emplace(std::move(key), set);
     return 1;
 }
 

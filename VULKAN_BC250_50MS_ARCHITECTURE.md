@@ -243,6 +243,16 @@ safe to the established scratch allocator. This is a prerequisite for fully
 persistent descriptors and re-record-free worker graphs; it is not claimed as
 a standalone TPS result.
 
+Exact descriptor bindings now persist with those stable buffers across worker
+tokens. The cache is limited to 8192 sets per command context, applies only to
+bounded worker slices, and can be disabled with
+`DS4_VULKAN_PERSIST_DESCRIPTORS=0`. Every tensor, raw-weight, aligned-weight,
+and execution-artifact destruction/eviction path invalidates descriptor keys
+that reference the retiring `VkBuffer` before it is destroyed. This removes
+per-token descriptor writes and establishes the immutable binding layer needed
+by graph replay; measured descriptor overhead alone is too small for this to
+be treated as the target latency win.
+
 ## Remaining qualification gates
 
 For each materially different architecture candidate:

@@ -7,7 +7,7 @@
 
 Date: 2026-08-17  
 Reference baseline: `origin/pr-557-merge` at `8fb6bd9`  
-Integrated execution-artifact candidate: `c793c4e` (not promoted and not a TPS result)
+Integrated execution-artifact candidate: `951c666` (not promoted and not a TPS result)
 
 ## Target and authoritative budget
 
@@ -143,7 +143,7 @@ as an achieved forecast; their overlap must be measured on the same binary.
 
 ## Achieved substrate evidence
 
-The integrated candidate through `c793c4e` now losslessly repacks and consumes
+The integrated candidate through `951c666` now losslessly repacks and consumes
 all three hot quantized weight families:
 
 - dense Q8 through `matmul_q8_0_exec`;
@@ -166,9 +166,19 @@ recreate the rejected multi-gigabyte host mirror or transient arena resize.
 The blade was then restored to the published `8fb6bd9` LKG binary and its
 verified hash.  The coordinator was not touched.
 
+The same branch also closes two statically proven streaming defects discovered
+after that hardware gate.  Execution-artifact startup now reports Q8/IQ2/Q2
+hit, fallback, unsupported, and failure counts and fails closed when an
+artifact family is explicitly required.  Command-ring dispatches are no longer
+counted twice, changing a roughly 158-dispatch worker slice from about five
+premature submissions toward the configured three plus the final output fence.
+For common 4096-input Q8 projections, a validated 128-lane variant replaces the
+256-lane workgroup in which half the invocations were permanently idle; larger
+8192-input shapes retain the 256-lane variant.
+
 These results prove the representation, GPU consumers, and startup memory
 shape.  They are not a production layer timing, a full-model exactness result,
-or a TPS claim.  `c793c4e` remains a candidate branch and has not replaced the
+or a TPS claim.  `951c666` remains a candidate branch and has not replaced the
 `8fb6bd9` deployment baseline.
 
 ## Remaining qualification gates

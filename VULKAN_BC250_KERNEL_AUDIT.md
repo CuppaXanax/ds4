@@ -6,8 +6,10 @@
 
 ## Qualified baseline
 
-The qualified publication is `origin/pr-557-merge` at `f85a909`. It includes
-the exact indexed Wave64 attention and inverse-RoPE promotion described below.
+The deployed baseline is `origin/pr-557-merge` at `8fb6bd9`. It contains the
+qualified `f85a909` lineage and the subsequent revert of the experimental
+512-wide fused decode path. `a7d639c` (`origin/codex/execution-artifact-substrate`)
+is a documentation/measurement candidate and is not the deployed baseline.
 
 | Item | Qualified result |
 |---|---:|
@@ -52,25 +54,21 @@ DS4_VULKAN_ATTN_INDEXED_WAVE64=0
 DS4_VULKAN_ATTN_INDEXED_WAVE64_INV_ROPE=0
 ```
 
-## Newly qualified indexed attention path
+## Indexed Wave64 reachability correction
 
-The indexed long-context path uses one Wave64 per 128-wide head, keeps online
-attention accumulators in registers, and applies the 64-element inverse-RoPE
-tail before writing the final head. It removes the standalone inverse-RoPE
-dispatch and its global output round-trip.
+The loaded `attention_indexed_online_wave64` shader is not the production
+indexed-attention path for DeepSeek Flash in the `8fb6bd9` baseline. The shader
+requires `head_dim == 128`, while Flash attention invokes the attention path
+with `head_dim == 512`. The host predicate therefore selects the canonical
+`attention_mixed_online` implementation for this model; the 128-wide shader is
+loaded but unreachable for the production Flash attention shape.
 
-Qualification on a BC-250:
-
-- focused fallback/candidate output: byte-identical;
-- canonical indexed attention plus standalone RoPE: byte-identical to fusion;
-- same-command-buffer push-constant regression: passing;
-- production-shaped focused time: `0.864 -> 0.824 ms` per invocation, about
-  4.6% faster;
-- non-BC devices retain the fallback unless explicitly enabled;
-- explicit `=0` kill switches remain available.
-
-This is a long-context indexed-attention improvement. It is not evidence of an
-immediate short-position generation TPS increase.
+The retained `0.864 -> 0.824 ms` result is valid focused evidence for a
+128-wide indexed-head experiment only. It is not a production Flash timing and
+does not support a TPS claim. The indexed Wave64 controls remain useful for
+future explicitly gated shapes, but must not be described as a qualified
+Flash decode optimization until a 512-wide implementation passes its own
+exactness and end-to-end gates.
 
 ## What the evidence rules out
 
@@ -133,6 +131,9 @@ routed/shared MoE    <= 0.40 ms/layer
 total layer          approximately 1.0-1.2 ms
 single-session       >= 10 TPS minimum, 20 TPS north star
 ```
+
+The architecture-level latency plan for the 20 TPS/50 ms target is documented
+in [`VULKAN_BC250_50MS_ARCHITECTURE.md`](VULKAN_BC250_50MS_ARCHITECTURE.md).
 
 Moving from about 3.25 ms to 1.1 ms requires removing roughly two-thirds of
 current GPU layer time. No launch-only cleanup or isolated 20-microsecond

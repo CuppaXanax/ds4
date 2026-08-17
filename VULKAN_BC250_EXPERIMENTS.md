@@ -6,7 +6,10 @@
 
 ## Current qualified deployment
 
-Qualified publication: `f85a909` (`origin/pr-557-merge`).
+Deployed baseline: `8fb6bd9` (`origin/pr-557-merge`).  The `f85a909` result is
+part of its qualified lineage.  `a7d639c` (`origin/codex/execution-artifact-substrate`)
+is a candidate execution-artifact substrate and has not been deployed or
+credited with a TPS result.
 
 - approximately 5.4-5.5 generation tokens/s;
 - approximately 3.25 ms representative Layer 4 GPU time;
@@ -22,10 +25,11 @@ Qualified publication: `f85a909` (`origin/pr-557-merge`).
 | Commit/range | Result |
 |---|---|
 | `74a22cd..c519309` | Current BC-250 decode baseline: GPU-resident layer scopes/routing, command ring, pooled scratch, Q8 grouping/tiling, activation reuse, routed mid/down fusion, HC/inverse-RoPE fusion, and Wave64 routed arithmetic. |
-| indexed Wave64 publication | Register-resident indexed attention plus fused inverse-RoPE. Byte-exact focused gate; `0.864 -> 0.824 ms` (~4.6%) on the production-shaped indexed path. Long-context scope only. |
+| 128-wide indexed Wave64 experiment | Register-resident indexed attention plus fused inverse-RoPE. Byte-exact focused gate; `0.864 -> 0.824 ms` (~4.6%) for the 128-wide indexed-head fixture. Not the production Flash attention path: Flash uses `head_dim == 512`, while the shader predicate requires 128. No TPS claim. |
 
-The indexed path is enabled by default only for the qualified BC-250/subgroup64
-predicate. Disable it with:
+The indexed Wave64 controls apply only when the 128-wide host predicate is
+reachable. They do not make the shader the production Flash path, which uses
+512-wide attention heads. Disable the experimental path with:
 
 ```text
 DS4_VULKAN_ATTN_INDEXED_WAVE64=0
@@ -46,7 +50,7 @@ These must not be rediscovered and promoted from architectural appeal alone.
 | Exact i24 regroup | Generated code did not contain the intended native instructions. Rejected without TPS promotion. |
 | Paired F16 projection shader | Exact; `5.43/5.41` versus `5.45/5.41` TPS was noise-sized. |
 | Resource-aware barrier trackers | First version ordered barriers after consumers; corrected version still changed the exact artifact. |
-| Generic Q-cache optimization | Unreachable on the production indexed path. |
+| Generic Q-cache optimization | Unreachable on the production Flash attention path. |
 | One-submit/cross-layer command buffers | Unsafe or regressed beyond the qualified RADV command-count bound. |
 | Q8 rows4/q36 transfer | Exact, but lower occupancy/cache behavior made the production dispatch slower. |
 | Q8/Q2 cosmetic unpack rearrangements | Rejected when they did not move the production stage materially. |

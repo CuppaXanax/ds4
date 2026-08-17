@@ -1,0 +1,180 @@
+# BC-250 Vulkan: Architecture for 50 ms/token
+
+> Status: architecture plan, not a performance claim.  This document is
+> intentionally scoped to the existing 24-CU BC-250 distributed topology.
+> It does not assume the 40-CU firmware unlock, tensor parallelism, MTP, or
+> speculative decoding.
+
+Date: 2026-08-17  
+Reference baseline: `origin/pr-557-merge` at `8fb6bd9`  
+Execution-artifact candidate: `a7d639c` (not deployed and not a TPS result)
+
+## Target and authoritative budget
+
+The target is sustained end-to-end decode latency of at most 50 ms/token
+(20 sustained tokens/s) on the existing 24-CU topology, with model outputs,
+quantization semantics, routing, coordinator behavior, and layer placement
+unchanged.
+
+The strongest retained whole-token evidence is the four-layer worker slice:
+
+| Quantity | Four layers | Per layer | 43-layer projection |
+|---|---:|---:|---:|
+| Worker wall time | ~16.5 ms | ~4.125 ms | ~177.4 ms |
+| Timestamped GPU work | ~12.9 ms | ~3.225 ms | ~138.7 ms |
+| Non-GPU residual | ~3.6 ms | ~0.900 ms | ~38.7 ms |
+
+The 177.4 ms projection agrees with the archived 5.4-5.65 TPS range.  It is
+not a kernel microbenchmark extrapolation.  A 50 ms token permits only
+`50 / 43 = 1.16 ms` per layer, so the architecture must remove approximately
+2.96 ms from each current 4.125 ms layer.
+
+The retained GPU group accounting is:
+
+| GPU group | Per layer | 43-layer cost |
+|---|---:|---:|
+| Attention and projections | ~1.77 ms | ~76.1 ms |
+| Routed/shared MoE | ~1.31 ms | ~56.3 ms |
+| Other GPU work | ~0.17 ms | ~7.3 ms |
+| Total | ~3.25 ms | ~139.8 ms |
+
+The known non-GPU terms are only about 0.214 ms/layer: descriptor work,
+dispatch recording, flush/invalidate, submission CPU, and measured GPU idle.
+The remaining approximately 0.686 ms/layer is not independently assigned,
+which is about 29.5 ms/token.  Reported fence time overlaps useful GPU work;
+it must not be added to the budget a second time.
+
+The useful production weight stream is approximately 62-64 GB/s, compared
+with approximately 246.8 GB/s for the same-allocation stream.  The retained
+distinct-weight ledger is approximately 8.9 GiB/token:
+
+```text
+8.9 GiB / 64 GB/s  ~= 143 ms of traffic-equivalent time
+8.9 GiB / 180 GB/s ~=  50 ms
+8.9 GiB / 246.8 GB/s ~= 36 ms
+```
+
+The latter two figures are bounds, not achieved results.  They establish that
+the production graph must approach the streaming layout while keeping all
+quantized arithmetic and dependency overhead inside the remaining budget.
+
+Transport is not a credible primary explanation: the retained worker-hop
+measurement is approximately 0.08-0.13 ms/hop.  Warm decode also recorded 76
+cached-weight uses with zero uploads and zero evictions.  Neither transport
+nor warm paging can supply the missing 130 ms/token.
+
+## Ranked architecture plan
+
+These are deliberately large, coordinated changes.  Individual shader
+polishes below the 0.465 ms/layer threshold are parked unless they are part of
+one of these designs.
+
+### 1. Packed execution artifacts for the decode weight stream
+
+Make load-time execution layout, rather than GGUF layout, the Vulkan contract.
+Build one immutable, blade-local arena with aligned payload and metadata planes
+for Q8, IQ2, and Q2.  The artifact must be a lossless copy/reordering of the
+source quantized values; it must not change dequantization or accumulation
+semantics.
+
+The required hardware shape is consecutive packed words for consecutive lanes,
+with metadata separated from payloads and no per-lane 66/84-byte record stride.
+The routed IQ2 gate/up representation is first because the retained production
+shape reaches only approximately 55 GB/s in the isolated C ladder, while Q8
+and Q-B reach approximately 147 and 226 GB/s respectively in the same family
+of tests.  Those C results are diagnostic, not whole-token results.
+
+The architecture-level gate is not “one IQ2 shader got faster.”  It is a
+production useful-stream target of at least 180 GB/s across the decode-critical
+weight families.  Reaching that region can remove well over 20 ms/token and is
+the only single-topology change that can plausibly remove most of the current
+139 ms GPU budget.
+
+### 2. Persistent worker-slice execution graph
+
+Represent a worker's layer slice as a bounded, persistent GPU command graph:
+
+- persistent descriptors, scratch, and tensor lifetimes;
+- indirect or pre-recorded dispatches where shapes are stable;
+- resource-range dependencies instead of a blanket barrier after every helper;
+- timeline-semaphore ordering between bounded graph chunks;
+- one host wait at the worker-output boundary, not host participation at each
+  internal dependency.
+
+The graph must not be implemented as an unbounded mega-command-buffer.  Earlier
+one-submit/cross-layer experiments were unsafe or regressed under the RADV
+command-count bound.  The intended design is a small number of reusable graph
+chunks with explicit resource access metadata.
+
+The retained budget gives this change a concrete ROI gate:
+
+```text
+20 ms/token / 43 layers = 0.465 ms/layer required
+unassigned residual      ~= 0.686 ms/layer available
+```
+
+If the missing residual is orchestration rather than hidden GPU work, this
+change can remove approximately 20-30 ms/token.  A continuous timeline must
+confirm that result; no claim is made until it does.
+
+### 3. Weight-pass fusion with activation reuse
+
+After the packed artifacts exist, change the layer dataflow so one activation
+tile is consumed by all compatible projections before it is retired or
+requantized.  The objective is to eliminate repeated activation quantization,
+temporary global intermediates, and immediate write/read pairs while keeping
+enough register headroom for occupancy.
+
+The first coordinated passes are:
+
+1. Q/QB/KV and attention-output projection families;
+2. shared gate/up/SwiGLU/down;
+3. routed IQ2 gate/up through Q8 intermediate and routed Q2 down/reduction.
+
+The existing group ranges imply the required scale: attention/projection reuse
+has a plausible 0.4-0.7 ms/layer range and routed/shared dataflow has a
+0.4-0.65 ms/layer range.  These are planning ranges, not measurements.  The
+combined pass must demonstrate at least 0.465 ms/layer of production saving to
+qualify as a 20 ms/token architecture lever.  Do not add the ranges together
+as an achieved forecast; their overlap must be measured on the same binary.
+
+## Achieved substrate evidence
+
+`a7d639c` adds the execution-artifact consumer to the Vulkan test build and a
+strict synthetic Q8 GPU gate in
+`vulkan/tests/tests/t_matmul_q8_0_exec.cpp`.  The gate requires the immutable
+Q8 artifact, zeroes the source model range after artifact construction, and
+then dispatches through the artifact-backed path.  This proves the test can
+catch accidental fallback to raw GGUF bytes.
+
+This is focused Q8 substrate evidence only.  It is not a production layer
+measurement, not an IQ2 or Q2 result, and not a TPS claim.  `a7d639c` is a
+candidate branch and has not replaced the `8fb6bd9` deployment baseline.
+
+## Remaining qualification gates
+
+For each materially different architecture candidate:
+
+1. Compile and validate all affected SPIR-V and the Vulkan backend.
+2. Prove the production predicate selects the intended artifact/graph.
+3. Run the exact focused gate, recording every repeated timing rather than the
+   best sample.
+4. Run the complete GFX1013 Vulkan suite.
+5. Run the established full-model exact artifact gate.
+6. Run the sustained full-sequence end-to-end benchmark; no `-n`-limited run
+   qualifies as TPS evidence.
+7. Promote only reproducible end-to-end gains and delete rejected experiments.
+
+IQ2 and Q2 artifacts still require production-shaped GPU timing and exactness.
+The full packed stream and weight-pass fusion require a no-upload warm decode
+trace and a continuous worker timeline.  Until those gates pass, the only
+defensible statement is that the architecture is plausible, not that 50 ms or
+20 TPS has been achieved.
+
+## Evidence limits
+
+The retained artifacts do not contain a complete 43-layer continuous timeline,
+final output-head timing, authoritative production dispatch/barrier counts, or
+context-correlated KV migration measurements.  Any future budget that assigns
+those milliseconds without collecting those events is an inference, not a
+measurement.

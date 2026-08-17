@@ -305,6 +305,9 @@ static struct {
     struct ExecutionArtifactStats {
         uint64_t cache_calls = 0;
         uint64_t artifact_hits = 0;
+        uint64_t dispatches = 0;
+        uint64_t dispatch_hits = 0;
+        uint64_t dispatch_fallbacks = 0;
         uint64_t fallbacks = 0;
         uint64_t unsupported = 0;
         uint64_t failures = 0;
@@ -3005,9 +3008,13 @@ extern "C" void ds4_gpu_execution_artifact_report(void) {
     for (uint32_t i = 0; i < 3; ++i) {
         const auto &s = g_vk.execution_artifact_stats[i];
         fprintf(stderr, "ds4: execution artifact %s cache_calls=%llu hits=%llu "
+                       "dispatches=%llu dispatch_hits=%llu dispatch_fallbacks=%llu "
                        "fallbacks=%llu unsupported=%llu failures=%llu%s\n",
                 names[i], (unsigned long long)s.cache_calls,
                 (unsigned long long)s.artifact_hits,
+                (unsigned long long)s.dispatches,
+                (unsigned long long)s.dispatch_hits,
+                (unsigned long long)s.dispatch_fallbacks,
                 (unsigned long long)s.fallbacks,
                 (unsigned long long)s.unsupported,
                 (unsigned long long)s.failures,
@@ -3865,6 +3872,10 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     if (use_execution)
         use_execution = ensure_execution_q8_artifact(
             model_map, model_size, weight_offset, in_dim, out_dim, execution);
+    auto &q8_stats = g_vk.execution_artifact_stats[ExecQ8];
+    q8_stats.dispatches++;
+    if (use_execution) q8_stats.dispatch_hits++;
+    else q8_stats.dispatch_fallbacks++;
     if (use_execution && getenv("DS4_VULKAN_TRACE_KERNELS"))
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,
@@ -8008,6 +8019,12 @@ static bool ds4gk_routed_common(
             return false;
         }
     }
+    if (mid_only && gate_type == 16u) {
+        auto &iq2_stats = g_vk.execution_artifact_stats[ExecIQ2];
+        iq2_stats.dispatches++;
+        if (use_iq2_execution) iq2_stats.dispatch_hits++;
+        else iq2_stats.dispatch_fallbacks++;
+    }
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
         (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
@@ -8035,6 +8052,12 @@ static bool ds4gk_routed_common(
             down_execution = &found->second;
             fused_down_reduce = true;
         }
+    }
+    if (down_type == 10u) {
+        auto &q2_stats = g_vk.execution_artifact_stats[ExecQ2];
+        q2_stats.dispatches++;
+        if (use_down_execution) q2_stats.dispatch_hits++;
+        else q2_stats.dispatch_fallbacks++;
     }
     if (!use_down_execution && execution_artifact_required(ExecQ2)) {
         g_vk.execution_artifact_stats[ExecQ2].failures++;

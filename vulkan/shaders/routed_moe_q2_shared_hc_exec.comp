@@ -1,0 +1,202 @@
+#version 460 core
+
+/* Opt-in BC-250 decode tail appliance.
+ *
+ * This is deliberately bounded to the production Flash shape: six routed
+ * Q2 ranks, 2048-value routed mid, 4096 output, and a four-stream HC tail.
+ * One workgroup owns five output rows.  The eight-lane rank slots preserve
+ * the existing Q2 block dot/reduction and rank-ascending FP32 sum; rank zero
+ * then performs the shared Q8 down reduction in ascending block order and
+ * applies the existing routed+shared HC post expression.
+ *
+ * The routed output is retained as a debug/compatibility write, but is not
+ * consumed by a later dispatch.  The fused HC result is written directly.
+ * All weight planes are immutable execution artifacts.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+/* Routed Q2 activation (Q8_K), shared Q8_0 activation, shared Q8 artifact,
+ * routed Q2 artifact, selected IDs, routed compatibility output, and HC
+ * inputs/outputs. */
+layout(set = 0, binding = 0) readonly buffer RoutedX { uint routed_x[]; };
+layout(set = 0, binding = 1) readonly buffer SharedX { uint shared_x[]; };
+layout(set = 0, binding = 2) readonly buffer SharedScale { uint shared_scale[]; };
+layout(set = 0, binding = 3) readonly buffer SharedPayload { uint shared_payload[]; };
+layout(set = 0, binding = 4) readonly buffer RoutedScale { uint routed_scale[]; };
+layout(set = 0, binding = 5) readonly buffer RoutedPayload { uint routed_payload[]; };
+layout(set = 0, binding = 6) readonly buffer RoutedD { uint routed_d[]; };
+layout(set = 0, binding = 7) readonly buffer Selected { uint selected[]; };
+layout(set = 0, binding = 8) buffer RoutedOut { float routed_out[]; };
+layout(set = 0, binding = 9) buffer HcOut { float hc_out[]; };
+layout(set = 0, binding = 10) readonly buffer Residual { float residual[]; };
+layout(set = 0, binding = 11) readonly buffer Split { float split[]; };
+
+layout(push_constant) uniform PC {
+    uint mode; uint gate_type; uint down_type; uint in_dim; uint mid_dim; uint out_dim;
+    uint n_tokens; uint n_selected; uint n_total_expert;
+    uint gate_expert_bytes; uint gate_row_bytes; uint down_expert_bytes;
+    uint down_row_bytes; uint q8_blocks; float clamp_value;
+    uint add_enabled; uint q2_words;
+} pc;
+
+const uint SHARED_BLOCKS = 128u;
+const uint N_HC = 4u;
+const uint Q2_ARTIFACT_BLOCKS = 8u;
+const uint Q8_ARTIFACT_BLOCKS = 16u;
+
+shared float dot_values[256];
+shared float rank_values[32];
+
+float f16(uint h) {
+    return unpackHalf2x16(h).x;
+}
+
+/* Match the execution-artifact Q8 consumers' explicit half conversion for
+ * the shared-down scale.  Q2 keeps its established unpackHalf2x16 helper. */
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(word), int(byte_index * 8u), 8);
+}
+
+float q2_block_dot(uint global_row, uint input_token, uint block) {
+    const uint tile = global_row >> 2u;
+    const uint row_in_tile = global_row & 3u;
+    const uint entry = ((tile * Q2_ARTIFACT_BLOCKS + block) * 4u) + row_in_tile;
+    const uint scale_base = entry * 4u;
+    const uint q_base = entry * 16u;
+    const uint xb = (input_token * pc.q8_blocks + block) * 73u;
+    uint scale_words[4];
+    uint q_words[16];
+    uint bsum_words[8];
+    for (uint i = 0u; i < 4u; ++i) scale_words[i] = routed_scale[scale_base + i];
+    for (uint i = 0u; i < 16u; ++i) q_words[i] = routed_payload[q_base + i];
+    for (uint i = 0u; i < 8u; ++i) bsum_words[i] = routed_x[xb + 65u + i];
+
+    const uint dword = routed_d[entry];
+    const float dall = uintBitsToFloat(routed_x[xb]) * f16(dword & 0xffffu);
+    const float dmin = uintBitsToFloat(routed_x[xb]) * f16(dword >> 16u);
+    int isum = 0;
+    int summs = 0;
+    for (uint j = 0u; j < 16u; ++j) {
+        uint raw = bsum_words[j >> 1u];
+        int bsum = int((j & 1u) == 0u ? (raw & 0xffffu) : (raw >> 16u));
+        if (bsum >= 32768) bsum -= 65536;
+        uint sw = scale_words[j >> 2u];
+        uint sb = (sw >> ((j & 3u) * 8u)) & 255u;
+        summs += bsum * int(sb >> 4u);
+    }
+    for (uint half_block = 0u; half_block < 2u; ++half_block) {
+        const uint q8base = xb + 1u + half_block * 32u;
+        for (uint group = 0u; group < 4u; ++group) {
+            const uint shift = group * 2u;
+            const uint scale0_index = half_block * 8u + group * 2u;
+            const uint scale1_index = scale0_index + 1u;
+            const uint sw0 = scale_words[scale0_index >> 2u];
+            const uint sw1 = scale_words[scale1_index >> 2u];
+            const uint scale0 = (sw0 >> ((scale0_index & 3u) * 8u)) & 15u;
+            const uint scale1 = (sw1 >> ((scale1_index & 3u) * 8u)) & 15u;
+            const uint q2base = half_block * 8u;
+            const uint q8group = q8base + group * 8u;
+            for (uint k = 0u; k < 16u; ++k) {
+                const uint q0_word = q_words[q2base + (k >> 2u)];
+                const uint q1_word = q_words[q2base + 4u + (k >> 2u)];
+                const uint q0 = (q0_word >> ((k & 3u) * 8u + shift)) & 3u;
+                const uint q1 = (q1_word >> ((k & 3u) * 8u + shift)) & 3u;
+                const uint x0_word = routed_x[q8group + (k >> 2u)];
+                const uint x1_word = routed_x[q8group + 4u + (k >> 2u)];
+                const int x0 = i8_at(x0_word, k & 3u);
+                const int x1 = i8_at(x1_word, k & 3u);
+                isum += int(scale0) * int(q0) * x0;
+                isum += int(scale1) * int(q1) * x1;
+            }
+        }
+    }
+    return dall * float(isum) - dmin * float(summs);
+}
+
+float shared_q8_row(uint row) {
+    float sum = 0.0;
+    const uint tile = row >> 2u;
+    const uint row_in_tile = row & 3u;
+    for (uint block = 0u; block < SHARED_BLOCKS; ++block) {
+        const uint artifact_block = block >> 3u;
+        const uint source_block = block & 7u;
+        const uint entry = ((tile * Q8_ARTIFACT_BLOCKS + artifact_block) * 4u) + row_in_tile;
+        const uint scale_byte = entry * 16u + source_block * 2u;
+        const uint scale_word = shared_scale[scale_byte >> 2u];
+        const uint scale_bits = (scale_word >> ((scale_byte & 3u) * 8u)) & 0xffffu;
+        const uint payload_base = entry * 64u + source_block * 8u;
+        const uint x_base = block * 9u + 1u;
+        int dot = 0;
+        for (uint word = 0u; word < 8u; ++word) {
+            const uint ww = shared_payload[payload_base + word];
+            const uint xx = shared_x[x_base + word];
+            dot += i8_at(ww, 0u) * i8_at(xx, 0u);
+            dot += i8_at(ww, 1u) * i8_at(xx, 1u);
+            dot += i8_at(ww, 2u) * i8_at(xx, 2u);
+            dot += i8_at(ww, 3u) * i8_at(xx, 3u);
+        }
+        sum += f16tof32(scale_bits) * uintBitsToFloat(shared_x[block * 9u]) * float(dot);
+    }
+    return sum;
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint slot = lid >> 3u;
+    const uint lane = lid & 7u;
+    const uint experts = pc.n_selected;
+    const uint rows_per_group = 32u / experts;
+    const uint row_in_group = slot < rows_per_group * experts ? slot / experts : rows_per_group;
+    const uint rank = slot - (slot / experts) * experts;
+    const uint row = gl_WorkGroupID.x * rows_per_group + row_in_group;
+    const bool valid = experts != 0u && experts <= 32u && rows_per_group != 0u &&
+                       slot < rows_per_group * experts && row < pc.out_dim;
+    const uint selected_index = rank;
+    const uint expert = valid ? selected[selected_index] : 0u;
+    float partial = 0.0;
+    if (valid && expert < pc.n_total_expert) {
+        const uint global_row = expert * pc.out_dim + row;
+        for (uint block = lane; block < pc.q8_blocks; block += 8u)
+            partial += q2_block_dot(global_row, selected_index, block);
+    }
+    dot_values[lid] = partial;
+    barrier();
+    for (uint stride = 4u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) dot_values[lid] += dot_values[lid + stride];
+        barrier();
+    }
+    if (lane == 0u) rank_values[slot] = dot_values[slot * 8u];
+    barrier();
+
+    if (valid && lane == 0u && rank == 0u) {
+        const uint base = row_in_group * experts;
+        float routed_value = rank_values[base];
+        for (uint r = 1u; r < 32u; ++r) {
+            if (r >= experts) break;
+            routed_value += rank_values[base + r];
+        }
+        routed_out[row] = routed_value;
+        const float shared_value = shared_q8_row(row);
+        const float block_value = routed_value + shared_value;
+        const uint comb_base = 2u * N_HC;
+        for (uint dst = 0u; dst < N_HC; ++dst) {
+            float acc = block_value * split[N_HC + dst];
+            for (uint src = 0u; src < N_HC; ++src)
+                acc += split[comb_base + dst + src * N_HC] *
+                       residual[src * pc.out_dim + row];
+            hc_out[dst * pc.out_dim + row] = acc;
+        }
+    }
+}

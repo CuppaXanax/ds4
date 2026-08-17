@@ -72,3 +72,23 @@ then run the sustained decode gate; this change is the first candidate in
 this area that can plausibly remove at least 0.465 ms/layer because it joins
 the Q2 routed reduction and Q8 shared down rather than merely deleting a
 small float scratch copy.
+
+## Current implementation candidate
+
+`routed_moe_q2_shared_hc_exec.comp` is staged as the larger, artifact-only
+variant. It is admitted only when both the routed Q2 and shared Q8 execution
+artifacts are present and the caller sets:
+
+```text
+DS4_VULKAN_ROUTED_Q2_SHARED_HC_FUSE=1
+DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE=1
+```
+
+The existing IQ2 gate/up path remains intact. After it produces the routed
+Q8_K mid, the candidate quantizes shared mid once, then one 256-lane
+workgroup per five output rows performs the exact six-rank Q2 reduction, the
+shared Q8 artifact down projection, routed-first/shared-second addition, and
+HC post. It retains the routed output write for diagnostics, but no later
+dispatch consumes it. Artifact admission failure leaves the established path
+available unless `REQUIRE` is set. This is a compile/static candidate only
+until the exact full-model gate and sustained decode test run.

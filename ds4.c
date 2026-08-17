@@ -24939,7 +24939,43 @@ static bool metal_graph_encode_decode_layer_phase(
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     }
 #endif
-    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+    bool routed_shared_hc_fused = false;
+    const bool routed_shared_hc_candidate =
+        phase == METAL_DECODE_LAYER_FULL &&
+        shared_gate_up_prelaunched && fuse_shared_down_hc &&
+        getenv("DS4_VULKAN_ROUTED_Q2_SHARED_HC_FUSE") != NULL &&
+        getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE") != NULL &&
+        !g->quality && !g->cuda_tp_moe && !g->cuda_tp_shared &&
+        !metal_graph_directional_steering_ffn_enabled(g) &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        DS4_N_EXPERT == 256u && DS4_N_EXPERT_USED == 6u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        routed_out_dim == 4096u && shared_dim == 4096u;
+    if (ok && !tp_fold_ffn && !cuda_tp_moe && routed_shared_hc_candidate) {
+        ok = ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
+                metal_graph_after_ffn_hc(g), metal_graph_routed_out(g),
+                metal_graph_routed_gate(g), metal_graph_routed_up(g),
+                metal_graph_routed_mid(g), metal_graph_routed_down(g),
+                model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                (uint32_t)expert_in_dim, (uint32_t)down_in_dim,
+                (uint32_t)routed_out_dim,
+                metal_graph_router_selected(g), metal_graph_router_weights(g),
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                metal_graph_ffn_norm(g),
+                layer->ffn_down_shexp->abs_offset,
+                (uint32_t)shared_dim, DS4_N_EMBD,
+                metal_graph_shared_mid(g), metal_graph_after_attn_hc(g),
+                metal_graph_hc_split(g), DS4_N_EMBD, DS4_N_HC, il, false) != 0;
+        routed_shared_hc_fused = ok;
+    } else if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
                                                  metal_graph_routed_mid(g),
@@ -25169,7 +25205,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
-    } else if (ok && fuse_shared_down_hc) {
+    } else if (ok && fuse_shared_down_hc && !routed_shared_hc_fused) {
         if (cuda_tp_moe_peer_tmp) {
             ok = ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
                     metal_graph_after_ffn_hc(g),
@@ -25297,7 +25333,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                         metal_graph_hc_comb(g),
                                         DS4_N_EMBD,
                                         DS4_N_HC) != 0;
-    } else if (ok && !cuda_tp_shared_fold && !fuse_shared_down_hc) {
+    } else if (ok && !cuda_tp_shared_fold && !fuse_shared_down_hc &&
+               !routed_shared_hc_fused) {
         ok = ds4_gpu_hc_expand_add_split_tensor(metal_graph_after_ffn_hc(g),
                                                   tp_ffn_a ? tp_ffn_a : metal_graph_routed_out(g),
                                                   tp_ffn_a ? tp_ffn_b :

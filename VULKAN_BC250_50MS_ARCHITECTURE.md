@@ -286,3 +286,31 @@ final output-head timing, authoritative production dispatch/barrier counts, or
 context-correlated KV migration measurements.  Any future budget that assigns
 those milliseconds without collecting those events is an inference, not a
 measurement.
+
+## 2026-08-17 integrated 128K hardware gate
+
+The first full-fleet gate exposed two concrete integration defects and one
+architectural blocker:
+
+- A fixed nine-element descriptor-layout binding array overflowed when the
+  twelve-binding mixed routed/shared HC shader was registered. This crashed
+  RADV in `radv_CreateDescriptorSetLayout` on every blade before model load.
+  Commit `e71e76b` replaces it with an exact-size binding vector; startup was
+  then verified on GFX1013.
+- Strict Q8 decode-artifact enforcement incorrectly rejected the distinct
+  token-batched prefill path before decode began. Commit `15066ff` scopes the
+  fail-closed runtime requirement to `n_tok == 1` while retaining prefill
+  fallback accounting.
+- With those defects repaired, the 128K coordinator was OOM-killed during the
+  first prompt. The kernel recorded a global OOM kill of `ds4`; startup had
+  packed 45 artifacts while the process also planned 8.85 GiB resident model
+  plus 2.98 GiB context. Therefore the current per-weight artifact buffers do
+  not yet satisfy the architecture requirement that packed execution ranges
+  replace, rather than coexist with, raw resident mappings. No TPS or
+  correctness claim is valid from this run.
+
+The fleet was restored to published LKG `8fb6bd9` (binary SHA-256
+`f0d32af04aade31505ecb698514d703a2569c772fe1c98258e29d525455bb028`),
+with workers running and the coordinator intentionally stopped. The next
+candidate must use a single replacement weight arena or otherwise unmap raw
+resident spans before packed artifacts are admitted at 128K.

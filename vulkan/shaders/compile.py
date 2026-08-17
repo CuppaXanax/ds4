@@ -71,5 +71,22 @@ for source_name in ("routed_moe_fused_mid", "routed_moe_down_reduce_q2"):
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {src.name} Wave64: {diagnostics}", file=sys.stderr)
 
+# Opt-in routed IQ2 execution candidates.  The ordinary paired source is
+# compiled once at 128 threads/eight rows and once at 256 threads/sixteen
+# rows so scheduling granularity can be compared without changing arithmetic.
+src = SRC_DIR / "routed_moe_iq2_project_wave64.comp"
+spv = OUT_DIR / "routed_moe_iq2_project_rows16_wave64.spv"
+result = subprocess.run(
+    [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+     "-DDS4_IQ2_PROJECT_ROWS16=1", str(src), "-o", str(spv)],
+    capture_output=True, text=True)
+if result.returncode == 0:
+    compiled += 1
+else:
+    failed += 1
+    diagnostics = "\n".join(part for part in
+                            (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"FAIL {src.name} rows16: {diagnostics}", file=sys.stderr)
+
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

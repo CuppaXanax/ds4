@@ -9,7 +9,18 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#ifndef DS4_IQ2_PROJECT_ROWS16
+#define DS4_IQ2_PROJECT_ROWS16 0
+#endif
+#if DS4_IQ2_PROJECT_ROWS16
+#define DS4_IQ2_PROJECT_LOCAL_SIZE 256u
+#define DS4_IQ2_PROJECT_ROWS_PER_GROUP 16u
+#else
+#define DS4_IQ2_PROJECT_LOCAL_SIZE 128u
+#define DS4_IQ2_PROJECT_ROWS_PER_GROUP 8u
+#endif
+
+layout(local_size_x = DS4_IQ2_PROJECT_LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
 layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
@@ -156,10 +167,10 @@ void main() {
     uint logical_id = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
     uint lane = logical_id & 15u;
     uint row_in_tile = logical_id >> 4u;
-    uint row = gl_WorkGroupID.x * 8u + row_in_tile;
-    for (uint i = lid; i < pc.q8_blocks * 73u; i += 128u)
+    uint row = gl_WorkGroupID.x * DS4_IQ2_PROJECT_ROWS_PER_GROUP + row_in_tile;
+    for (uint i = lid; i < pc.q8_blocks * 73u; i += DS4_IQ2_PROJECT_LOCAL_SIZE)
         q8_cache[i] = b0[token * pc.q8_blocks * 73u + i];
-    for (uint i = lid; i < 544u; i += 128u) iq2_lut[i] = b6[i];
+    for (uint i = lid; i < 544u; i += DS4_IQ2_PROJECT_LOCAL_SIZE) iq2_lut[i] = b6[i];
     barrier();
     uint expert = b3[token * pc.n_selected + rank];
     uint at = (token * pc.n_selected + rank) * pc.mid_dim + row;

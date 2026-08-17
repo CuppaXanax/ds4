@@ -3063,6 +3063,50 @@ static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
     return true;
 }
 
+static DS4_MAYBE_UNUSED bool accelerator_cache_q2_down_tensors(
+        const ds4_model *m, const uint64_t *span_offsets,
+        const uint64_t *span_sizes, uint32_t span_count) {
+    static const char suffix[] = "ffn_down_exps.weight";
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->type != DS4_TENSOR_Q2_K || t->ndim != 3 || t->bytes == 0 ||
+            t->dim[0] == 0 || t->dim[1] == 0 || t->dim[2] == 0 ||
+            !accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count))
+            continue;
+        bool is_down = false;
+        for (uint64_t j = 0; j + sizeof(suffix) - 1u <= t->name.len; j++) {
+            if (memcmp(t->name.ptr + j, suffix, sizeof(suffix) - 1u) == 0) {
+                is_down = true;
+                break;
+            }
+        }
+        if (!is_down || t->dim[0] % 256u != 0 ||
+            t->dim[2] > UINT64_MAX / t->dim[1])
+            continue;
+        const uint64_t total_rows = t->dim[1] * t->dim[2];
+        const uint64_t source_bytes = (t->dim[0] / 256u) * 84u;
+        if (total_rows > UINT64_MAX / source_bytes ||
+            total_rows * source_bytes != t->bytes)
+            continue;
+        char label[128];
+        snprintf(label, sizeof(label), "q2-execution:%.*s",
+                 (int)t->name.len, t->name.ptr);
+        if (!ds4_gpu_cache_q2_execution_range(
+                m->map, m->size, t->abs_offset, t->bytes,
+                t->dim[0], total_rows, label)) {
+            if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION")) {
+                fprintf(stderr, "ds4: required Q2 execution artifact failed for %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            fprintf(stderr, "ds4: Q2 execution artifact unavailable for %.*s; raw fallback\n",
+                    (int)t->name.len, t->name.ptr);
+        }
+    }
+    return true;
+}
+
 static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             const ds4_model *m,
                                             const uint64_t *span_offsets,
@@ -3077,6 +3121,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
         return false;
     }
     if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    if (!accelerator_cache_q2_down_tensors(m, span_offsets, span_sizes, span_count)) return false;
     fprintf(stderr,
             "ds4: Vulkan startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             (double)prepared / 1073741824.0, now_sec() - t0);

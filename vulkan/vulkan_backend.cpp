@@ -818,6 +818,7 @@ static int load_all_shaders(void) {
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
         {"routed_moe_down_reduce_q2_exec", 68, 7}, /* Q2 execution artifact */
+        {"routed_moe_q2_shared_hc_exec", 68, 12}, /* bounded Q2+Q8+HC tail */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -7711,6 +7712,21 @@ static bool ds4gk_routed_down_reduce_execution_requested(
         out_dim != 0u && n_total_expert != 0u && n_expert >= 1u && n_expert <= 32u;
 }
 
+/* Optional exact tail supplied by the single-GPU decode caller.  It is kept
+ * out of the ordinary routed ABI so every legacy/prefill caller retains its
+ * established output buffers and synchronization. */
+struct RoutedSharedHcTail {
+    ds4_gpu_tensor *out_hc = nullptr;
+    const ds4_gpu_tensor *shared_mid = nullptr;
+    const ds4_gpu_tensor *residual_hc = nullptr;
+    const ds4_gpu_tensor *split = nullptr;
+    uint64_t shared_weight_offset = 0;
+    uint32_t shared_in_dim = 0;
+    uint32_t shared_out_dim = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_hc = 0;
+};
+
 /* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
  * while the generic fused gate/up shader additionally writes b5 and b6. The
  * compact mid-only shader writes b4; the compact Q2 appliance writes b3
@@ -7741,10 +7757,17 @@ static void ds4gk_routed_output_barrier(
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
     const bool execution_down = shader_name &&
         strcmp(shader_name, "routed_moe_down_reduce_q2_exec") == 0;
+    const bool shared_hc_tail = shader_name &&
+        strcmp(shader_name, "routed_moe_q2_shared_hc_exec") == 0;
     const bool exec_mid = shader_name &&
         (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
          strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
-    add(execution_down ? 5u : (down_reduce ? 3u : exec_mid ? 6u : 4u));
+    if (shared_hc_tail) {
+        add(8u);
+        add(9u);
+    } else {
+        add(execution_down ? 5u : (down_reduce ? 3u : exec_mid ? 6u : 4u));
+    }
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
         add(5);
         add(6);
@@ -7763,7 +7786,7 @@ static void ds4gk_routed_input_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
         uint32_t buffer_count) {
-    VkBufferMemoryBarrier barriers[2] = {};
+    VkBufferMemoryBarrier barriers[3] = {};
     uint32_t count = 0;
     auto add = [&](uint32_t binding) {
         if (binding >= buffer_count || buffers[binding].buffer == VK_NULL_HANDLE ||
@@ -7783,10 +7806,16 @@ static void ds4gk_routed_input_barrier(
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
     const bool execution_down = shader_name &&
         strcmp(shader_name, "routed_moe_down_reduce_q2_exec") == 0;
+    const bool shared_hc_tail = shader_name &&
+        strcmp(shader_name, "routed_moe_q2_shared_hc_exec") == 0;
     const bool exec_mid = shader_name &&
         (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
          strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
-    if (pc.mode == 1u || pc.mode == 3u) {
+    if (shared_hc_tail) {
+        add(0u);
+        add(1u);
+        add(7u);
+    } else if (pc.mode == 1u || pc.mode == 3u) {
         add(execution_down ? 4u : (exec_mid ? 5u : (down_reduce ? 2u : 3u)));
     }
     if (pc.mode == 2u) add(2);                  /* router weights */
@@ -7894,7 +7923,8 @@ static bool ds4gk_routed_common(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t n_tokens, bool *mid_is_f16, bool validate_selected) {
+        uint32_t n_tokens, bool *mid_is_f16, bool validate_selected,
+        const RoutedSharedHcTail *shared_hc_tail = nullptr) {
     /* A layer command batch consumes GPU-produced IDs; the routed shaders
      * already bounds-check them, so its one-token and batched calls pass
      * validate_selected=false.  Calls outside a batch retain validation for
@@ -7963,7 +7993,9 @@ static bool ds4gk_routed_common(
      * generic stages. The destructor also covers every early-return path. */
     struct RoutedOwnedScratch {
         ds4_gpu_tensor gate{}, up{}, mid{}, experts{};
+        ds4_gpu_tensor *shared_q8 = nullptr;
         ~RoutedOwnedScratch() {
+            ds4_gpu_tensor_free(shared_q8);
             ds4_gpu_tensor_free_in_place(&experts);
             ds4_gpu_tensor_free_in_place(&mid);
             ds4_gpu_tensor_free_in_place(&up);
@@ -8069,6 +8101,33 @@ static bool ds4gk_routed_common(
     if (!use_down_execution &&
         !ds4gk_routed_model(down_offset, down_bytes, down_model))
         return false;
+
+    decltype(g_vk.execution_artifacts)::mapped_type *shared_execution = nullptr;
+    bool use_shared_hc_tail = shared_hc_tail &&
+        getenv("DS4_VULKAN_ROUTED_Q2_SHARED_HC_FUSE") != nullptr &&
+        use_down_execution && n_tokens == 1u && mid_only &&
+        gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        out_dim == 4096u && n_total_expert == 256u && n_expert == 6u &&
+        shared_hc_tail->shared_in_dim == 4096u &&
+        shared_hc_tail->shared_out_dim == 4096u &&
+        shared_hc_tail->n_embd == 4096u && shared_hc_tail->n_hc == 4u &&
+        g_vk.shader_map.find("routed_moe_q2_shared_hc_exec") !=
+            g_vk.shader_map.end();
+    if (use_shared_hc_tail) {
+        use_shared_hc_tail = shared_hc_tail->out_hc &&
+            shared_hc_tail->shared_mid && shared_hc_tail->residual_hc &&
+            shared_hc_tail->split &&
+            shared_hc_tail->shared_mid->bytes >= 4096u * sizeof(float) &&
+            shared_hc_tail->out_hc->bytes >= 4096u * 4u * sizeof(float) &&
+            shared_hc_tail->residual_hc->bytes >= 4096u * 4u * sizeof(float) &&
+            shared_hc_tail->split->bytes >= 32u * sizeof(float) &&
+            ensure_execution_q8_artifact(
+                model_map, model_size, shared_hc_tail->shared_weight_offset,
+                4096u, 4096u, shared_execution);
+        if (!use_shared_hc_tail && getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE"))
+            return false;
+    }
 
     uint64_t q8_blocks = 0, q8_bytes = 0;
     uint64_t input_q8_bytes = 0, mid_q8_bytes = 0;
@@ -8290,10 +8349,76 @@ static bool ds4gk_routed_common(
         pc.in_dim = expert_mid_dim;
         pc.q8_blocks = (uint32_t)mid_blocks;
     }
+    if (ok && use_shared_hc_tail) {
+        const uint64_t shared_q8_bytes = 128u * 36u;
+        owned.shared_q8 = ds4_gpu_tensor_alloc_device_scratch(shared_q8_bytes);
+        if (!owned.shared_q8 ||
+            ds4_gpu_quantize_q8_0_tensor(owned.shared_q8,
+                                         shared_hc_tail->shared_mid,
+                                         4096u, 1u) == 0) {
+            ds4_gpu_tensor_free(owned.shared_q8);
+            owned.shared_q8 = nullptr;
+            use_shared_hc_tail = false;
+            shared_execution = nullptr;
+            if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE"))
+                ok = false;
+        }
+    }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
         pc.q2_words = down_type == 10;
-        if (fused_down_reduce) {
+        if (use_shared_hc_tail) {
+            VkDescriptorBufferInfo shared_q8_info, tail_out_hc_info,
+                tail_residual_info, tail_split_info;
+            const bool tail_buffers = owned.shared_q8 &&
+                ds4gk_routed_buffer(owned.shared_q8, shared_q8_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->out_hc, tail_out_hc_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->residual_hc,
+                                    tail_residual_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->split, tail_split_info);
+            if (!tail_buffers) {
+                ok = false;
+            } else {
+                VkDescriptorBufferInfo tail_buffers_info[12] = {
+                    compact_mid_q8_info,
+                    shared_q8_info,
+                    {shared_execution->buffer,
+                     (VkDeviceSize)shared_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)shared_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {shared_execution->buffer,
+                     (VkDeviceSize)shared_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)shared_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_Q2_D],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_Q2_D]},
+                    selected_info, out_info, tail_out_hc_info,
+                    tail_residual_info, tail_split_info};
+                const uint32_t rows_per_group = 32u / n_expert;
+                ok = rows_per_group != 0u &&
+                    ds4gk_routed_dispatch_shader(
+                        "routed_moe_q2_shared_hc_exec",
+                        "down_reduce_q2_shared_hc_exec", pc,
+                        tail_buffers_info, 12,
+                        (out_dim + rows_per_group - 1u) / rows_per_group,
+                        n_tokens, 1, sets);
+            }
+        } else if (fused_down_reduce) {
             pc.add_enabled = add_in ? 1u : 0u;
             const uint32_t rows_per_group = 32u / n_expert;
             if (rows_per_group == 0u) {
@@ -8405,6 +8530,68 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim, selected, weights,
         n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16,
         !get_cmd_ctx().layer_batch_active) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *routed_out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint64_t                shared_weight_offset,
+        uint32_t                shared_in_dim,
+        uint32_t                shared_out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                layer_index,
+        bool                    force_resident) {
+    DS4_VK_TRACE_KERNEL("routed_moe_q2_shared_hc_exec");
+    (void)layer_index;
+    (void)force_resident;
+    if (!out_hc || !routed_out || !shared_mid || !residual_hc || !split)
+        return 0;
+    RoutedSharedHcTail tail{};
+    tail.out_hc = out_hc;
+    tail.shared_mid = shared_mid;
+    tail.residual_hc = residual_hc;
+    tail.split = split;
+    tail.shared_weight_offset = shared_weight_offset;
+    tail.shared_in_dim = shared_in_dim;
+    tail.shared_out_dim = shared_out_dim;
+    tail.n_embd = n_embd;
+    tail.n_hc = n_hc;
+    bool mid_is_f16 = false;
+    return ds4gk_routed_common(
+        routed_out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, nullptr, 1, &mid_is_f16,
+        !get_cmd_ctx().layer_batch_active, &tail) ? 1 : 0;
 }
 
 /* Prefill routed MoE over n_tokens tokens.  Same math as the single-token

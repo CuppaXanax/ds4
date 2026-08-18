@@ -102,6 +102,54 @@ try {
         throw "Canonical prompt hash mismatch: $promptHash"
     }
 
+    $coordinatorProfile = $manifest.runtime_lkg.runtime_shader_profiles.coordinator
+    $workerProfile = $manifest.runtime_lkg.runtime_shader_profiles.worker
+    if (-not [bool]$manifest.runtime_lkg.uniform_shader_profile_required -or
+        [int]$coordinatorProfile.shader_count -ne [int]$workerProfile.shader_count -or
+        [string]$coordinatorProfile.shader_manifest_sha256 -ne
+            [string]$workerProfile.shader_manifest_sha256) {
+        throw "Runtime LKG does not declare one uniform shader profile"
+    }
+
+    $hex64 = '^[0-9a-f]{64}$'
+    if ([long]$manifest.model.size_bytes -ne 86720111488 -or
+        ([string]$manifest.model.sha256).ToLowerInvariant() -notmatch $hex64 -or
+        ([string]$manifest.model.sample_sha256).ToLowerInvariant() -notmatch $hex64 -or
+        [string]$manifest.model.sample_scheme -ne
+            'sha256(first_4mib || centered_4mib || last_4mib)') {
+        throw "Runtime LKG model identity is incomplete or invalid"
+    }
+
+    $semantic = $manifest.runtime_lkg.promotion_evidence.semantic_qualification
+    if ([string]$semantic.status -ne 'pass') {
+        throw "Runtime LKG lacks a passing semantic qualification"
+    }
+    $fixturePath = Join-Path $repoPath ([string]$semantic.fixture)
+    if (-not (Test-Path -LiteralPath $fixturePath -PathType Leaf) -or
+        (Get-LfNormalizedSha256 -LiteralPath $fixturePath) -ne
+            ([string]$semantic.fixture_sha256).ToLowerInvariant()) {
+        throw "Official semantic fixture is missing or changed"
+    }
+    $semanticCases = @(
+        @('short_reasoning_plain', '16', @(926)),
+        @('short_italian_fact', 'Ada Lovelace', @(108149, 47121, 317, 805))
+    )
+    foreach ($caseSpec in $semanticCases) {
+        $caseName = [string]$caseSpec[0]
+        $expectedText = [string]$caseSpec[1]
+        $expectedTokens = @($caseSpec[2])
+        $case = $semantic.$caseName
+        $casePromptPath = Join-Path $repoPath ([string]$case.prompt)
+        if ([string]$case.expected -ne $expectedText -or
+            [string]$case.actual -ne $expectedText -or
+            (@($case.token_ids) -join ',') -ne ($expectedTokens -join ',') -or
+            -not (Test-Path -LiteralPath $casePromptPath -PathType Leaf) -or
+            (Get-LfNormalizedSha256 -LiteralPath $casePromptPath) -ne
+                ([string]$case.prompt_sha256).ToLowerInvariant()) {
+            throw "Official semantic case $caseName is missing, changed, or failing"
+        }
+    }
+
     $archiveChecks = @($manifest.archives | ForEach-Object {
         $archivePath = [string]$_.path
         if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {

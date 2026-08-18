@@ -6,3 +6,6 @@ gguf-tools/quality-testing/data/*/continuations/*.txt -diff
 /performance/bc250/*.sh text eol=lf
 /performance/bc250/*.py text eol=lf
 /tests/long_context_story_prompt.txt text eol=lf
+/tests/test-vectors/flash-0731/official.vec text eol=lf
+/tests/test-vectors/flash-0731/prompts/short_reasoning_plain.txt text eol=lf
+/tests/test-vectors/flash-0731/prompts/short_italian_fact.txt text eol=lf

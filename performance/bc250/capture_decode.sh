@@ -59,6 +59,10 @@ print(m["benchmark"]["ctx_alloc"])
 print(m["benchmark"]["gen_tokens"])
 print(m["benchmark"]["weight_budget_gib"])
 print(m["benchmark"]["dist_activation_bits"])
+print(m["model"]["size_bytes"])
+print(m["model"]["sha256"])
+print(m["model"]["sample_sha256"])
+print(int(bool(m["promotion"].get("requires_uniform_shader_manifest"))))
 PY
 )
 
@@ -77,6 +81,10 @@ ctx_alloc="${cfg[11]}"
 gen_tokens="${cfg[12]}"
 weight_budget="${cfg[13]}"
 dist_bits="${cfg[14]}"
+expected_model_size="${cfg[15]}"
+expected_model_hash="${cfg[16]}"
+expected_model_sample_hash="${cfg[17]}"
+uniform_shader_manifest_required="${cfg[18]}"
 
 actual_commit="$(git rev-parse HEAD)"
 if ! git cat-file -e "$expected_commit^{commit}" 2>/dev/null; then
@@ -106,6 +114,24 @@ if [[ ! -f "$model_path" ]]; then
     echo "missing model: $model_path" >&2
     exit 9
 fi
+actual_model_size="$(stat -c '%s' "$model_path")"
+if [[ "$actual_model_size" != "$expected_model_size" ]]; then
+    echo "model size mismatch: $actual_model_size" >&2
+    exit 9
+fi
+sample_bytes=4194304
+sample_mid=$((actual_model_size / 2 - sample_bytes / 2))
+((sample_mid < 0)) && sample_mid=0
+actual_model_sample_hash="$({
+    dd if="$model_path" iflag=count_bytes count="$sample_bytes" status=none
+    dd if="$model_path" iflag=skip_bytes,count_bytes skip="$sample_mid" \
+        count="$sample_bytes" status=none
+    tail -c "$sample_bytes" "$model_path"
+} | sha256sum | awk '{print tolower($1)}')"
+if [[ "$actual_model_sample_hash" != "$expected_model_sample_hash" ]]; then
+    echo "model sample hash mismatch: $actual_model_sample_hash" >&2
+    exit 9
+fi
 if [[ ! -f "$prompt_path" ]]; then
     echo "missing prompt: $prompt_path" >&2
     exit 10
@@ -127,6 +153,13 @@ if [[ "$disk_shader_count" != "$expected_coordinator_shaders" ]]; then
 fi
 if [[ "$actual_shader_manifest" != "$expected_coordinator_manifest" ]]; then
     echo "shader manifest mismatch: $actual_shader_manifest" >&2
+    exit 14
+fi
+if [[ "$uniform_shader_manifest_required" == 1 ]] && {
+    [[ "$expected_coordinator_shaders" != "$expected_worker_shaders" ]] ||
+    [[ "$expected_coordinator_manifest" != "$expected_worker_manifest" ]]
+}; then
+    echo "uniform shader manifest required, but role profiles differ" >&2
     exit 14
 fi
 
@@ -201,6 +234,10 @@ if [[ "$shader_count" != "$expected_coordinator_shaders" ]]; then
 fi
 
 model_hash="$(sha256sum "$model_path" | awk '{print tolower($1)}')"
+if [[ "$model_hash" != "$expected_model_hash" ]]; then
+    echo "full model hash mismatch: $model_hash" >&2
+    exit 9
+fi
 kernel="$(uname -r)"
 host="$(hostname)"
 governor_state="$(cat /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null | tr '\n' ';' || true)"

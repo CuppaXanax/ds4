@@ -21,8 +21,8 @@ trying” after a failed gate.
 - Do not create subagents unless the user explicitly requests them.
 - Do not create candidate branches or worktrees. Runtime candidates are clean,
   disposable checkouts under `/tmp`, identified by the LKG base commit, exact
-  patch SHA-256, candidate commit/tree, binaries, and role-specific shader
-  manifests. Delete
+  patch SHA-256, candidate commit/tree, binaries, and one uniform shader
+  manifest. Delete
   the checkout after scoring or rejection; retain the ignored evidence record.
 - The only local branches are `main` and the runtime LKG branch declared in
   `performance/bc250/lkg.json`.
@@ -35,14 +35,18 @@ trying” after a failed gate.
 - If the user explicitly orders an exact, production-activated causal unit to
   be retained while deferring the canonical repetition gate, the hook may
   accept a `user_approved_checkpoint` evidence record. It must bind the exact
-  staged runtime diff, matching end-to-end artifacts, production activation,
-  and the reason the full score was deferred. This is an LKG checkpoint, not a
-  claim that the 10/20 TPS milestone was met.
+  staged runtime diff, matching candidate/control artifacts, production
+  activation, uniform shader/model identity, passing official multi-token
+  semantic vectors, and the reason the full score was deferred. This is an LKG
+  checkpoint, not a claim that the 10/20 TPS milestone was met.
 - Never push any ref without explicit user approval in the current turn.
 - Never infer promotion or push approval. An agent may set
   `DS4_USER_APPROVED_PROMOTION=1` only when the user explicitly approved
   promotion of the exact scored candidate in the current turn. Never set
   `DS4_USER_APPROVED_PUSH`; the user must separately authorize every push.
+- Never infer LKG-metadata approval. An agent may set
+  `DS4_USER_APPROVED_LKG_UPDATE=1` only when the user explicitly approved the
+  semantically qualified LKG change in the current turn.
 - Do not store experiment patches, generated logs, or benchmark output in the
   source tree. Use `performance/bc250/evidence/`, which is ignored.
 
@@ -53,6 +57,8 @@ trying” after a failed gate.
 - Canonical score and promotion verdict: `performance/bc250/score.py`
 - Coordinator-side capture: `performance/bc250/capture_decode.sh`
 - Read-only fleet identity gate: `performance/bc250/probe_fleet_identity.sh`
+- Official semantic fixtures: `tests/test-vectors/flash-0731/official.vec`
+- Distributed semantic gate: `performance/bc250/semantic_smoke.sh`
 - Process and current technical lane:
   `performance/bc250/ENGINEERING_SYSTEM.md`
 
@@ -82,7 +88,7 @@ For a GPU candidate, retain evidence for:
 - subgroup size and workgroup geometry;
 - VGPR, SGPR, LDS, scratch/spill, and occupancy information when available;
 - exact production dimensions and dispatch reachability;
-- full-model exactness;
+- candidate/control equivalence and the official multi-token semantic smoke;
 - candidate activation and zero unexpected fallback;
 - three canonical sustained decode runs.
 
@@ -91,8 +97,9 @@ scheduler, allocator, and deployment changes in one performance verdict.
 
 A scored runtime candidate must be a clean deterministic commit in a disposable
 checkout rooted at the exact runtime LKG. Its evidence must bind the LKG base,
-patch hash, candidate commit/tree, binaries, role-specific shader manifests, exactness
-artifacts, activation proof, and scores. It never gets a persistent branch.
+patch hash, candidate commit/tree, binaries, one uniform source-derived shader
+manifest, exact model identity, candidate/control artifacts, official semantic
+results, activation proof, and scores. It never gets a persistent branch.
 After a `promote_eligible` verdict and explicit user approval, apply that exact
 patch once to the runtime LKG branch, commit it, update `lkg.json`, and delete
 the disposable checkout. Do not ask the user to name internal Git objects.
@@ -102,15 +109,20 @@ the disposable checkout. Do not ask the user to name internal Git objects.
 - `promote_eligible` means only that the automated evidence gate passed. The
   user still decides whether to promote.
 - `hold` is not permission to merge. It means the result needs a user decision.
-- Any exactness failure, unexpected fallback, mixed fleet identity, OOM, GPU
-  reset, or canonical regression ends the candidate immediately.
+- Any official semantic-vector failure, obvious gibberish, candidate/control
+  mismatch, unexpected fallback, mixed fleet identity, OOM, GPU reset, or
+  canonical regression ends the candidate immediately. Candidate/control
+  equality alone never proves correctness; two broken builds can agree.
+- All twelve BC-250 blades must use the same deterministic SPIR-V manifest when
+  their source, device, and compiler target are the same. Never freeze stale
+  coordinator shaders as a role-specific exception.
 - Do not discard an exact, production-active kernel improvement solely because
   its end-to-end TPS effect is unresolved or below run noise. Preserve it as a
-  user-approved checkpoint unless it causes output drift, instability,
-  unintended fallback, mixed fleet identity, a material resource regression
-  in another production shape, or a matched canonical regression of at least
-  1%. Record deferred scoring honestly; never convert a focused win into a
-  10/20 TPS claim.
+  user-approved checkpoint unless it causes semantic-vector failure, output
+  drift, instability, unintended fallback, mixed fleet identity, a material
+  resource regression in another production shape, or a matched canonical
+  regression of at least 1%. Record deferred scoring honestly; never convert a
+  focused win into a 10/20 TPS claim.
 - After two invalid gates, stop and report the invariant that failed. Do not
   pivot into a new architecture in the same turn.
 - A user request to stop ends cluster and mutation activity immediately. Emit

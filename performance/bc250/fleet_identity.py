@@ -35,6 +35,13 @@ def validate(
     if age < -60 or age > max_age:
         fail(f"fleet identity audit age {age:.0f}s is outside 0..{max_age}s")
 
+    if manifest["promotion"].get("requires_uniform_shader_manifest"):
+        if (
+            coordinator_shader_count != worker_shader_count
+            or coordinator_shader_manifest != worker_shader_manifest
+        ):
+            fail("uniform shader manifest required, but role profiles differ")
+
     coordinator = manifest["topology"]["coordinator"]
     expected = {
         coordinator["host"]: ("coordinator-ready", coordinator["layers"])
@@ -74,6 +81,7 @@ def validate(
             shader_count = worker_shader_count
             shader_manifest = worker_shader_manifest
         checks = {
+            "commit": expected_commit,
             "binary_sha256": expected_binary,
             "source_clean": "1",
             "role": role,
@@ -83,17 +91,26 @@ def validate(
             "shader_count": str(shader_count),
             "shader_manifest_sha256": shader_manifest,
             "model": manifest["model"]["default_path"],
+            "model_size_bytes": str(manifest["model"]["size_bytes"]),
+            "model_sample_sha256": manifest["model"]["sample_sha256"],
+            "model_sha256": manifest["model"]["sha256"],
         }
         if role == "worker":
-            checks["commit"] = expected_commit
             worker_envs.add(row.get("env_sha256", ""))
         for key, wanted in checks.items():
             if row.get(key) != wanted:
                 fail(f"{host}: {key}={row.get(key)!r}, expected {wanted!r}")
 
     worker_env = next(iter(worker_envs), "")
-    if len(worker_envs) != 1 or not re.fullmatch(r"[0-9a-f]{64}", worker_env):
-        fail(f"worker environments are mixed or invalid: {sorted(worker_envs)}")
+    expected_worker_env = str(manifest["runtime_lkg"]["fleet_worker_env_sha256"])
+    if (
+        worker_envs != {expected_worker_env}
+        or not re.fullmatch(r"[0-9a-f]{64}", worker_env)
+    ):
+        fail(
+            "worker environments are mixed, invalid, or unexpected: "
+            f"{sorted(worker_envs)}"
+        )
 
     topology = [
         {"host": host, "role": expected[host][0], "layers": expected[host][1]}

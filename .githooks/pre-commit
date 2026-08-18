@@ -23,7 +23,57 @@ fi
 
 outside_system="$(git diff --cached --name-only --diff-filter=ACMRD |
     grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/|vulkan/shaders/(compile\.py|test_compile\.py)$)' || true)"
+staged_lkg="$(git diff --cached --name-only --diff-filter=ACMRD |
+    grep -E '^performance/bc250/lkg\.json$' || true)"
+if [ -z "$outside_system" ] && [ -z "$staged_lkg" ]; then
+    exit 0
+fi
+
 if [ -z "$outside_system" ]; then
+    if [ "${DS4_USER_APPROVED_LKG_UPDATE:-}" != "1" ]; then
+        echo "Refusing an LKG metadata change without explicit user approval." >&2
+        echo "Set DS4_USER_APPROVED_LKG_UPDATE=1 only after the user approves the qualified LKG." >&2
+        exit 1
+    fi
+    if python3 -c 'import sys' >/dev/null 2>&1; then
+        lkg_python=python3
+    elif python -c 'import sys' >/dev/null 2>&1; then
+        lkg_python=python
+    else
+        echo "Refusing LKG update: Python 3 is unavailable." >&2
+        exit 1
+    fi
+    "$lkg_python" - <<'PY'
+import json, re, subprocess
+
+data = json.loads(subprocess.check_output(
+    ["git", "show", ":performance/bc250/lkg.json"], text=True
+))
+runtime = data["runtime_lkg"]
+profiles = runtime["runtime_shader_profiles"]
+if not runtime.get("uniform_shader_profile_required") or profiles["coordinator"] != profiles["worker"]:
+    raise SystemExit("staged LKG does not require one uniform shader profile")
+if not re.fullmatch(r"[0-9a-f]{64}", str(runtime.get("fleet_worker_env_sha256", ""))):
+    raise SystemExit("staged LKG worker environment identity is invalid")
+model = data["model"]
+if int(model.get("size_bytes", 0)) <= 0 or not re.fullmatch(r"[0-9a-f]{64}", str(model.get("sha256", ""))):
+    raise SystemExit("staged LKG exact model identity is invalid")
+semantic = runtime["promotion_evidence"]["semantic_qualification"]
+required = {
+    "short_reasoning_plain": ("16", [926]),
+    "short_italian_fact": ("Ada Lovelace", [108149, 47121, 317, 805]),
+}
+if semantic.get("status") != "pass":
+    raise SystemExit("staged LKG semantic qualification is not passing")
+for case, (text, token_ids) in required.items():
+    result = semantic.get(case, {})
+    if result.get("expected") != text or result.get("actual") != text or result.get("token_ids") != token_ids:
+        raise SystemExit(f"staged LKG semantic case {case} is missing or incorrect")
+promotion = data["promotion"]
+for gate in ("requires_official_semantic_smoke", "requires_uniform_shader_manifest", "requires_model_identity"):
+    if not promotion.get(gate):
+        raise SystemExit(f"staged LKG disables mandatory gate {gate}")
+PY
     exit 0
 fi
 
@@ -47,7 +97,7 @@ else
     exit 1
 fi
 "$python_cmd" - "$evidence" "$staged_runtime_diff_sha256" <<'PY'
-import json, pathlib, sys
+import hashlib, json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 staged_hash = sys.argv[2]
 if not p.is_file():
@@ -57,7 +107,50 @@ verdict = data.get("verdict")
 if verdict not in {"promote_eligible", "user_approved_checkpoint"}:
     raise SystemExit(f"promotion evidence verdict is {verdict!r}")
 if not data.get("exactness", {}).get("match"):
-    raise SystemExit("promotion evidence does not prove exactness")
+    raise SystemExit("promotion evidence does not prove candidate/control equivalence")
+semantic = data.get("semantic_qualification", {})
+if semantic.get("status") != "pass":
+    raise SystemExit("promotion evidence does not include a passing semantic gate")
+artifact_hash = str(semantic.get("artifact_sha256", ""))
+if len(artifact_hash) != 64 or any(c not in "0123456789abcdef" for c in artifact_hash.lower()):
+    raise SystemExit("promotion semantic artifact hash is invalid")
+artifact_path = pathlib.Path(str(semantic.get("artifact_path", "")))
+if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact_hash:
+    raise SystemExit("promotion semantic artifact is missing or changed")
+raw_semantic = json.loads(artifact_path.read_text(encoding="utf-8"))
+candidate = data.get("candidate", {})
+identity_fields = {
+    "runtime_commit": "commit",
+    "fleet_binary_sha256": "fleet_binary_sha256",
+    "runtime_shader_manifest_sha256": "runtime_shader_manifest_sha256",
+    "expected_model_sha256": "model_sha256",
+    "fleet_identity_sha256": "fleet_identity_sha256",
+}
+for semantic_key, candidate_key in identity_fields.items():
+    if raw_semantic.get(semantic_key) != candidate.get(candidate_key):
+        raise SystemExit(f"promotion semantic {semantic_key} is not bound to the candidate")
+manifest = json.loads(pathlib.Path("performance/bc250/lkg.json").read_text(encoding="utf-8"))
+official = manifest["runtime_lkg"]["promotion_evidence"]["semantic_qualification"]
+if semantic.get("fixture_sha256") != official.get("fixture_sha256"):
+    raise SystemExit("promotion semantic fixture does not match the official fixture")
+cases = semantic.get("cases", {})
+for case in ("short_reasoning_plain", "short_italian_fact"):
+    result = cases.get(case, {})
+    expected = official[case]
+    if (
+        result.get("expected") != expected["expected"]
+        or result.get("actual") != expected["expected"]
+        or result.get("token_ids") != expected["token_ids"]
+        or result.get("prompt_sha256") != expected["prompt_sha256"]
+    ):
+        raise SystemExit(f"promotion semantic case {case} is missing or incorrect")
+fleet = data.get("fleet_qualification", {})
+if not fleet.get("uniform_shader_manifest"):
+    raise SystemExit("promotion evidence does not prove a uniform shader manifest")
+if not fleet.get("model_identity_match"):
+    raise SystemExit("promotion evidence does not prove exact model identity")
+if semantic.get("fleet_identity_sha256") != fleet.get("identity_sha256"):
+    raise SystemExit("promotion semantic run is not bound to the scored fleet identity")
 if verdict == "user_approved_checkpoint":
     if not data.get("activation", {}).get("proved"):
         raise SystemExit("checkpoint evidence does not prove production activation")

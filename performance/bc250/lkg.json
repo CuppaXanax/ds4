@@ -6,17 +6,19 @@
     "tree": "d34be33d50309009ade5962d99df2590995a4f12",
     "fleet_binary_sha256": "608f831d923b548b4299b2b5fcc841df27fc2e192e9eefbb14a57a2f5ff10c91",
     "fleet_bench_binary_sha256": "d5c1f974755fa052e0731a43ab83bea4524df0013b7514e038401ef5db6d1c09",
+    "fleet_worker_env_sha256": "95005182e6e02f8c71be9a13feda8a068a397bad34539b0ed3b72ccca4477ffa",
     "runtime_shader_profiles": {
       "coordinator": {
         "shader_count": 70,
-        "shader_manifest_sha256": "3adf4fa86594d399d8e568fc276dd02f78cbcfa8291148a7709fc8b98638c5ca"
+        "shader_manifest_sha256": "5a6af0b028f630ecbacf870bb62f4f7c22fcf50c0a05b1166ecb88d02c137805"
       },
       "worker": {
         "shader_count": 70,
         "shader_manifest_sha256": "5a6af0b028f630ecbacf870bb62f4f7c22fcf50c0a05b1166ecb88d02c137805"
       }
     },
-    "performance_qualification": "user_approved_exact_checkpoint_canonical_512_repetition_deferred",
+    "uniform_shader_profile_required": true,
+    "performance_qualification": "user_approved_semantically_valid_exact_checkpoint_canonical_512_repetition_deferred",
     "historical_short_prompt": {
       "commit": "a2fd02c4627028dfc4cc13b141b49c4a887d25a2",
       "prompt_tokens": [17, 12],
@@ -46,8 +48,7 @@
       "captured_control_indexed_layer_gpu_ms": 7.35888,
       "candidate_indexed_layer_gpu_ms": 5.45364,
       "promoted_repetition_indexed_layer_gpu_ms": 5.45112,
-      "captured_savings_per_indexed_layer_gpu_ms": 1.90524,
-      "full_model_exactness_artifact_sha256": "a31e2d480caf26ff51b05d6aae8a4b2ed05db04478b006f223a8c34590e9f815"
+      "captured_savings_per_indexed_layer_gpu_ms": 1.90524
     },
     "promotion_evidence": {
       "base_commit": "86840a1f7eecee79a45da797154bca76da793fa6",
@@ -55,13 +56,40 @@
       "candidate_commit": "474aa3a59c16ce54dc049c2961b27498b1972f37",
       "candidate_tree": "d34be33d50309009ade5962d99df2590995a4f12",
       "production_activation_proved": true,
-      "exactness_match": true,
+      "candidate_control_equivalence": {
+        "match": true,
+        "artifact_sha256": "a31e2d480caf26ff51b05d6aae8a4b2ed05db04478b006f223a8c34590e9f815",
+        "status": "differential_only_invalid_as_semantic_gate"
+      },
+      "semantic_qualification": {
+        "status": "pass",
+        "fixture": "tests/test-vectors/flash-0731/official.vec",
+        "fixture_sha256": "77ae699889bfaf1348768dcbe7ea2c72279ae86abb10470d3e1b08cd1fd82a83",
+        "short_reasoning_plain": {
+          "prompt": "tests/test-vectors/flash-0731/prompts/short_reasoning_plain.txt",
+          "prompt_sha256": "0943f0869b5b5b81f5fd1aad28d81770bb494445f0d871bd6c57340088547b74",
+          "expected": "16",
+          "actual": "16",
+          "token_ids": [926]
+        },
+        "short_italian_fact": {
+          "prompt": "tests/test-vectors/flash-0731/prompts/short_italian_fact.txt",
+          "prompt_sha256": "f8ba09a1973f567537f447e9a85400b0ca7369552dc72fe126b0a2623ae938dc",
+          "expected": "Ada Lovelace",
+          "actual": "Ada Lovelace",
+          "token_ids": [108149, 47121, 317, 805]
+        }
+      },
       "canonical_3x512_score": "deferred_by_user"
     }
   },
   "model": {
     "filename": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-    "default_path": "/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+    "default_path": "/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+    "size_bytes": 86720111488,
+    "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
+    "sample_sha256": "202b0a61c098a04321b15e6d53bdfe0df18a9f17ecef475c4c5d1e954cda67da",
+    "sample_scheme": "sha256(first_4mib || centered_4mib || last_4mib)"
   },
   "topology": {
     "blades": 12,
@@ -103,6 +131,9 @@
     "automatic_eligibility_ratio": 1.03,
     "requires_exact_artifact_match": true,
     "requires_activation_evidence": true,
+    "requires_official_semantic_smoke": true,
+    "requires_uniform_shader_manifest": true,
+    "requires_model_identity": true,
     "requires_user_approval": true
   },
   "archives": [

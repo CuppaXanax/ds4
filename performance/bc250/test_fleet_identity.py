@@ -33,14 +33,22 @@ class FleetIdentityTests(unittest.TestCase):
         for host, role, layers in nodes:
             profile_name = "coordinator" if role == "coordinator-ready" else "worker"
             profile = self.shader_profiles[profile_name]
-            env = "coordinator-managed" if role == "coordinator-ready" else "f" * 64
+            env = (
+                "coordinator-managed"
+                if role == "coordinator-ready"
+                else self.manifest["runtime_lkg"]["fleet_worker_env_sha256"]
+            )
             lines.append(
                 "BC250_IDENTITY|"
                 f"host={host}|commit={self.commit}|binary_sha256={self.binary}|"
                 f"source_clean=1|role={role}|layers={layers}|ctx=128000|"
                 f"weight_budget_gib=11|shader_count={profile['shader_count']}|"
                 f"shader_manifest_sha256={profile['shader_manifest_sha256']}|"
-                f"model={self.manifest['model']['default_path']}|env_sha256={env}"
+                f"model={self.manifest['model']['default_path']}|"
+                f"model_size_bytes={self.manifest['model']['size_bytes']}|"
+                f"model_sample_sha256={self.manifest['model']['sample_sha256']}|"
+                f"model_sha256={self.manifest['model']['sha256']}|"
+                f"env_sha256={env}"
             )
         self.audit.write_text("\n".join(lines) + "\n")
 
@@ -63,7 +71,10 @@ class FleetIdentityTests(unittest.TestCase):
     def test_valid_exact_fleet(self):
         result = self.validate()
         self.assertEqual(result["node_count"], 12)
-        self.assertEqual(result["worker_env_sha256"], "f" * 64)
+        self.assertEqual(
+            result["worker_env_sha256"],
+            self.manifest["runtime_lkg"]["fleet_worker_env_sha256"],
+        )
 
     def test_wrong_context_fails_closed(self):
         text = self.audit.read_text().replace("ctx=128000", "ctx=2048", 1)
@@ -93,6 +104,39 @@ class FleetIdentityTests(unittest.TestCase):
         text = self.audit.read_text().replace(worker_manifest, "0" * 64, 1)
         self.audit.write_text(text)
         with self.assertRaisesRegex(ValueError, "shader_manifest_sha256"):
+            self.validate()
+
+    def test_wrong_model_sample_fails_closed(self):
+        sample = self.manifest["model"]["sample_sha256"]
+        self.audit.write_text(self.audit.read_text().replace(sample, "0" * 64, 1))
+        with self.assertRaisesRegex(ValueError, "model_sample_sha256"):
+            self.validate()
+
+    def test_wrong_full_model_hash_fails_closed(self):
+        model_hash = self.manifest["model"]["sha256"]
+        self.audit.write_text(
+            self.audit.read_text().replace(model_hash, "0" * 64, 1)
+        )
+        with self.assertRaisesRegex(ValueError, "model_sha256"):
+            self.validate()
+
+    def test_split_role_manifests_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "uniform shader manifest"):
+            fleet_identity.validate(
+                self.manifest,
+                self.audit,
+                self.commit,
+                self.binary,
+                self.shader_profiles["coordinator"]["shader_count"],
+                self.shader_profiles["coordinator"]["shader_manifest_sha256"],
+                self.shader_profiles["worker"]["shader_count"],
+                "0" * 64,
+            )
+
+    def test_uniform_but_unexpected_worker_environment_fails_closed(self):
+        expected = self.manifest["runtime_lkg"]["fleet_worker_env_sha256"]
+        self.audit.write_text(self.audit.read_text().replace(expected, "0" * 64))
+        with self.assertRaisesRegex(ValueError, "unexpected"):
             self.validate()
 
 

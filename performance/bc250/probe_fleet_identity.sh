@@ -84,6 +84,20 @@ else
     }
 fi
 
-printf 'BC250_IDENTITY|host=%s|commit=%s|binary_sha256=%s|source_clean=%s|role=%s|layers=%s|ctx=%s|weight_budget_gib=%s|shader_count=%s|shader_manifest_sha256=%s|model=%s|env_sha256=%s\n' \
+[[ -f "$model" ]] || { echo "missing model on $ip: $model" >&2; exit 9; }
+model_size="$(stat -c '%s' "$model")"
+sample_bytes=4194304
+sample_mid=$((model_size / 2 - sample_bytes / 2))
+((sample_mid < 0)) && sample_mid=0
+model_sample_hash="$({
+    dd if="$model" iflag=count_bytes count="$sample_bytes" status=none
+    dd if="$model" iflag=skip_bytes,count_bytes skip="$sample_mid" \
+        count="$sample_bytes" status=none
+    tail -c "$sample_bytes" "$model"
+} | sha256sum | awk '{print tolower($1)}')"
+model_hash="$(sha256sum "$model" | awk '{print tolower($1)}')"
+
+printf 'BC250_IDENTITY|host=%s|commit=%s|binary_sha256=%s|source_clean=%s|role=%s|layers=%s|ctx=%s|weight_budget_gib=%s|shader_count=%s|shader_manifest_sha256=%s|model=%s|model_size_bytes=%s|model_sample_sha256=%s|model_sha256=%s|env_sha256=%s\n' \
     "$ip" "$commit" "$binary_hash" "$source_clean" "$role" "$layers" "$ctx" \
-    "$weight_budget" "$shader_count" "$shader_manifest" "$model" "$env_hash"
+    "$weight_budget" "$shader_count" "$shader_manifest" "$model" \
+    "$model_size" "$model_sample_hash" "$model_hash" "$env_hash"

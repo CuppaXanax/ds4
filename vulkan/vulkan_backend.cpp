@@ -33,6 +33,10 @@
 #include <thread>
 #include <algorithm>
 #include <chrono>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 /* =====================================================================
  * PART 1: Vulkan Device State & Infrastructure
@@ -321,6 +325,14 @@ static struct {
         uint64_t fallbacks = 0;
         uint64_t unsupported = 0;
         uint64_t failures = 0;
+        uint64_t raw_release_attempts = 0;
+        uint64_t raw_release_bytes = 0;
+        uint64_t raw_release_failures = 0;
+        uint64_t raw_release_successes = 0;
+        uint64_t transient_pack_peak_bytes = 0;
+        uint64_t transient_pack_live_bytes = 0;
+        uint64_t transient_pack_freed_bytes = 0;
+        uint64_t range_peak_residency_bytes = 0;
     } execution_artifact_stats[3];
     struct ExecutionCoverageShape {
         uint64_t dispatches = 0;
@@ -2522,6 +2534,50 @@ static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
 static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset);
 static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes);
 
+static bool release_packed_source_pages(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t source_bytes, uint32_t kind) {
+    auto &stats = g_vk.execution_artifact_stats[kind];
+    stats.raw_release_attempts++;
+    if (!model_map || g_vk.model_map != model_map ||
+        g_vk.model_size != model_size) {
+        stats.raw_release_failures++;
+        return false;
+    }
+#ifndef _WIN32
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        stats.raw_release_failures++;
+        return false;
+    }
+    uint64_t release_offset = 0, release_bytes = 0;
+    if (!ds4_vulkan_execution_artifact_release_window(
+            model_size, source_offset, source_bytes,
+            static_cast<uint64_t>(page_size_long),
+            &release_offset, &release_bytes)) {
+        stats.raw_release_failures++;
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(model_map);
+    if (base > UINTPTR_MAX - release_offset ||
+        (release_bytes != 0 && madvise(
+            reinterpret_cast<void *>(base + release_offset),
+            static_cast<size_t>(release_bytes), MADV_DONTNEED) != 0)) {
+        stats.raw_release_failures++;
+        return false;
+    }
+    stats.raw_release_successes++;
+    stats.raw_release_bytes += release_bytes;
+    return true;
+#else
+    (void)model_size;
+    (void)source_offset;
+    (void)source_bytes;
+    stats.raw_release_failures++;
+    return false;
+#endif
+}
+
 static bool ensure_execution_artifact(
         const void *model_map, uint64_t model_size, uint64_t source_offset,
         uint64_t in_dim, uint64_t out_dim, uint32_t format,
@@ -2543,24 +2599,43 @@ static bool ensure_execution_artifact(
             format,
             g_vk.caps.min_storage_buffer_offset_alignment))
         return false;
+    auto &stats = g_vk.execution_artifact_stats[
+        format == DS4_VULKAN_EXEC_Q8_0 ? ExecQ8 :
+        format == DS4_VULKAN_EXEC_IQ2_XXS ? ExecIQ2 : ExecQ2];
+    stats.transient_pack_live_bytes += artifact.bytes;
+    stats.transient_pack_peak_bytes = std::max(
+        stats.transient_pack_peak_bytes, stats.transient_pack_live_bytes);
+    if (artifact.bytes <= UINT64_MAX / 3u &&
+        artifact.source_bytes <= UINT64_MAX - artifact.bytes * 3u)
+        stats.range_peak_residency_bytes = std::max(
+            stats.range_peak_residency_bytes,
+            artifact.source_bytes + artifact.bytes * 3u);
+    auto free_transient_pack = [&]() {
+        if (artifact.data) {
+            stats.transient_pack_live_bytes -= std::min(
+                stats.transient_pack_live_bytes, artifact.bytes);
+            stats.transient_pack_freed_bytes += artifact.bytes;
+        }
+        ds4_vulkan_execution_artifact_free(&artifact);
+    };
     if (g_vk.caps.max_storage_buffer_range != 0) {
         for (uint32_t p = 0; p < artifact.plane_count; ++p)
             if (artifact.plane_bytes[p] > g_vk.caps.max_storage_buffer_range) {
-                ds4_vulkan_execution_artifact_free(&artifact);
+                free_transient_pack();
                 return false;
             }
     }
     if (!remove_raw_weight_overlap(source_offset, artifact.source_bytes) ||
         !remove_aligned_weight_overlap(source_offset, artifact.source_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, source_offset)) {
-        ds4_vulkan_execution_artifact_free(&artifact);
+        free_transient_pack();
         return false;
     }
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     if (!execution_artifact_upload(artifact.data, artifact.bytes,
                                    buffer, allocation)) {
-        ds4_vulkan_execution_artifact_free(&artifact);
+        free_transient_pack();
         return false;
     }
     timeline_resource_current(TimelineEventKind::BufferAlloc,
@@ -2585,7 +2660,14 @@ static bool ensure_execution_artifact(
     g_vk.execution_artifacts[source_offset] = value;
     g_vk.weight_used += artifact.bytes;
     entry = &g_vk.execution_artifacts.find(source_offset)->second;
-    ds4_vulkan_execution_artifact_free(&artifact);
+    /* The packed artifact is now the sole steady-state owner.  Release only
+     * interior file-backed pages after the map entry and upload are committed;
+     * failed builds/uploads retain the raw source for fallback. */
+    (void)release_packed_source_pages(
+        model_map, model_size, source_offset, artifact.source_bytes,
+        format == DS4_VULKAN_EXEC_Q8_0 ? ExecQ8 :
+        format == DS4_VULKAN_EXEC_IQ2_XXS ? ExecIQ2 : ExecQ2);
+    free_transient_pack();
     return true;
 }
 
@@ -3091,7 +3173,29 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
                     (unsigned long long)out_dim);
         return false;
     }
+    auto &stats = g_vk.execution_artifact_stats[ExecQ8];
+    stats.transient_pack_live_bytes += artifact.bytes;
+    stats.transient_pack_peak_bytes = std::max(
+        stats.transient_pack_peak_bytes, stats.transient_pack_live_bytes);
+    auto free_transient_pack = [&]() {
+        if (artifact.data) {
+            stats.transient_pack_live_bytes -= std::min(
+                stats.transient_pack_live_bytes, artifact.bytes);
+            stats.transient_pack_freed_bytes += artifact.bytes;
+        }
+        ds4_vulkan_q8_aligned_free(&artifact);
+    };
+    if (artifact.blocks_per_row == 0 ||
+        out_dim > UINT64_MAX / artifact.blocks_per_row ||
+        out_dim * artifact.blocks_per_row > UINT64_MAX / 34u) {
+        free_transient_pack();
+        return false;
+    }
     const uint64_t raw_bytes = out_dim * artifact.blocks_per_row * 34u;
+    if (artifact.bytes <= UINT64_MAX / 3u &&
+        raw_bytes <= UINT64_MAX - artifact.bytes * 3u)
+        stats.range_peak_residency_bytes = std::max(
+            stats.range_peak_residency_bytes, raw_bytes + artifact.bytes * 3u);
     if (!remove_raw_weight_overlap(offset, raw_bytes) ||
         !remove_execution_artifact_overlap(offset, raw_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, offset)) {
@@ -3103,7 +3207,7 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
                     (unsigned long long)artifact.bytes,
                     (unsigned long long)g_vk.weight_used,
                     (unsigned long long)g_vk.weight_budget);
-        ds4_vulkan_q8_aligned_free(&artifact);
+        free_transient_pack();
         return false;
     }
     VkBuffer buf = VK_NULL_HANDLE; VmaAllocation alloc = VK_NULL_HANDLE;
@@ -3120,8 +3224,12 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
         mark_weight_generation(g_vk.aligned_cache[offset].gpu);
         g_vk.weight_used += artifact.bytes;
         entry = &g_vk.aligned_cache.find(offset)->second;
+        /* The aligned artifact is committed before releasing the raw source.
+         * A later execution-artifact rebuild may refault and release again. */
+        (void)release_packed_source_pages(
+            model_map, model_size, offset, raw_bytes, ExecQ8);
     }
-    ds4_vulkan_q8_aligned_free(&artifact);
+    free_transient_pack();
     return ok;
 }
 
@@ -3179,6 +3287,20 @@ extern "C" void ds4_gpu_execution_artifact_report(void) {
                 (unsigned long long)s.unsupported,
                 (unsigned long long)s.failures,
                 execution_artifact_required(i) ? " required=1" : "");
+        fprintf(stderr,
+                "ds4: execution artifact %s raw_release_attempts=%llu "
+                "raw_release_successes=%llu raw_release_bytes=%llu "
+                "raw_release_failures=%llu transient_pack_peak=%llu "
+                "transient_pack_freed=%llu range_peak_residency=%llu\n",
+                names[i], (unsigned long long)s.raw_release_attempts,
+                (unsigned long long)s.raw_release_successes,
+                (unsigned long long)s.raw_release_bytes,
+                (unsigned long long)s.raw_release_failures,
+                (unsigned long long)s.transient_pack_peak_bytes,
+                (unsigned long long)s.transient_pack_freed_bytes,
+                (unsigned long long)s.range_peak_residency_bytes);
+        fprintf(stderr, "ds4: execution artifact %s transient_pack_live=%llu\n",
+                names[i], (unsigned long long)s.transient_pack_live_bytes);
     }
     if (!g_vk.q8_execution_coverage.empty()) {
         fprintf(stderr, "ds4: Q8 execution coverage by shape\n");
@@ -10504,9 +10626,29 @@ extern "C" int ds4_gpu_build_derived_artifacts(
 
 extern "C" int ds4_gpu_model_range_replaced(
         const void *model_map, uint64_t offset, uint64_t bytes) {
-    (void)model_map;
-    (void)offset;
-    (void)bytes;
+    if (!model_map || model_map != g_vk.model_map || bytes == 0 ||
+        offset > UINT64_MAX - bytes)
+        return 0;
+    for (const auto &[_, artifact] : g_vk.execution_artifacts) {
+        if (offset < artifact.source_offset ||
+            offset - artifact.source_offset > artifact.source_bytes ||
+            bytes > artifact.source_bytes - (offset - artifact.source_offset))
+            continue;
+        return 1;
+    }
+    for (const auto &[_, artifact] : g_vk.aligned_cache) {
+        if (artifact.blocks == 0 ||
+            artifact.out_dim > UINT64_MAX / artifact.blocks)
+            continue;
+        const uint64_t rows_blocks = artifact.out_dim * artifact.blocks;
+        if (rows_blocks > UINT64_MAX / 34u) continue;
+        const uint64_t source_bytes = rows_blocks * 34u;
+        if (offset < artifact.source_offset ||
+            offset - artifact.source_offset > source_bytes ||
+            bytes > source_bytes - (offset - artifact.source_offset))
+            continue;
+        return 1;
+    }
     return 0;
 }
 

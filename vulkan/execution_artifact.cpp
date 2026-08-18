@@ -185,6 +185,27 @@ extern "C" uint64_t ds4_vulkan_execution_artifact_index(
            entry * artifact->plane_element_bytes[plane];
 }
 
+extern "C" int ds4_vulkan_execution_artifact_release_window(
+    uint64_t model_size,
+    uint64_t source_offset,
+    uint64_t source_bytes,
+    uint64_t page_size,
+    uint64_t *release_offset,
+    uint64_t *release_bytes) {
+    if (!release_offset || !release_bytes || page_size == 0 ||
+        (page_size & (page_size - 1u)) != 0 || source_bytes == 0 ||
+        source_offset > model_size || source_bytes > model_size - source_offset ||
+        source_offset > UINT64_MAX - (page_size - 1u))
+        return 0;
+    const uint64_t end = source_offset + source_bytes;
+    const uint64_t begin = (source_offset + page_size - 1u) &
+                           ~(page_size - 1u);
+    const uint64_t aligned_end = end & ~(page_size - 1u);
+    *release_offset = begin;
+    *release_bytes = aligned_end > begin ? aligned_end - begin : 0;
+    return 1;
+}
+
 extern "C" int ds4_vulkan_execution_arena_init(
     ds4_vulkan_execution_arena *arena, uint64_t alignment) {
     if (!arena || alignment == 0 || alignment > UINT32_MAX) return 0;

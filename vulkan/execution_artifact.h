@@ -94,6 +94,17 @@ uint64_t ds4_vulkan_execution_artifact_index(
     uint32_t block,
     uint32_t row_in_tile);
 
+/* Return the page-aligned interior of a source range that can be advised
+ * without touching either neighboring range.  Boundary pages are retained
+ * because a GGUF tensor may share them with another tensor. */
+int ds4_vulkan_execution_artifact_release_window(
+    uint64_t model_size,
+    uint64_t source_offset,
+    uint64_t source_bytes,
+    uint64_t page_size,
+    uint64_t *release_offset,
+    uint64_t *release_bytes);
+
 int ds4_vulkan_execution_arena_init(
     struct ds4_vulkan_execution_arena *arena,
     uint64_t alignment);

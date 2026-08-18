@@ -100,10 +100,34 @@ static void check_arena() {
     ds4_vulkan_execution_artifact_free(&artifact);
 }
 
+static void check_release_windows() {
+    uint64_t off = UINT64_MAX, bytes = UINT64_MAX;
+    assert(ds4_vulkan_execution_artifact_release_window(
+        16384, 100, 12000, 4096, &off, &bytes));
+    assert(off == 4096 && bytes == 4096);
+    uint64_t repeat_off = 0, repeat_bytes = 0;
+    assert(ds4_vulkan_execution_artifact_release_window(
+        16384, 100, 12000, 4096, &repeat_off, &repeat_bytes));
+    assert(repeat_off == off && repeat_bytes == bytes);
+    /* Boundary pages are retained so adjacent tensors cannot be discarded. */
+    assert(ds4_vulkan_execution_artifact_release_window(
+        16384, 4096, 8192, 4096, &off, &bytes));
+    assert(off == 4096 && bytes == 8192);
+    assert(ds4_vulkan_execution_artifact_release_window(
+        16384, 3000, 2000, 4096, &off, &bytes));
+    assert(bytes == 0);
+    assert(!ds4_vulkan_execution_artifact_release_window(
+        16384, 0, 1, 3000, &off, &bytes));
+    assert(!ds4_vulkan_execution_artifact_release_window(
+        16384, 16000, 1000, 4096, &off, &bytes));
+
+}
+
 int main() {
     check_format(DS4_VULKAN_EXEC_Q8_0);
     check_format(DS4_VULKAN_EXEC_IQ2_XXS);
     check_format(DS4_VULKAN_EXEC_Q2_K);
     check_arena();
+    check_release_windows();
     return 0;
 }

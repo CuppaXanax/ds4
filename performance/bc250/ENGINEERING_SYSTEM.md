@@ -2,14 +2,16 @@
 
 ## Scoreboard
 
-- Runtime restore point: `86840a1` (exact, production-activated 512-wide
-  indexed-attention checkpoint)
+- Runtime restore point: `474aa3a` (exact, production-activated indexed-layer
+  v2 checkpoint)
 - Previous canonical score: **2.41 sustained decode TPS / 414.94 ms per token**
 - Canonical samples: `2.40`, `2.41`, `2.42` TPS
-- Corrected checkpoint measurement: **2.94 steady TPS** over 63 steady tokens
-  at 4K with 128K allocated context. Per the user's direction, this is retained
-  as an exact LKG checkpoint without claiming the deferred 3x512 canonical
-  repetition gate.
+- Pre-v2 checkpoint measurement on `86840a1`: **2.94 steady TPS** over 63
+  steady tokens at 4K with 128K allocated context. It remains diagnostic; no
+  canonical 3x512 score has yet been recorded for `474aa3a`.
+- `474aa3a` is retained because it is exact, production-active, materially
+  faster in its causal unit, and explicitly user-approved. This is not a claim
+  that end-to-end TPS moved or that the 10/20 TPS milestones were reached.
 - Historical `a2fd02c` short-prompt samples: `5.58`, `5.50` TPS (diagnostic
   only; incompatible with the canonical 4K/128K denominator)
 - User-observed interactive start: approximately 5.0 TPS followed by session
@@ -101,41 +103,39 @@ removed. The historical `a2fd02c` gate used 17- and 12-token prompts and only
 16 generated tokens. It is valid evidence of shallow-context performance, not
 evidence of sustained performance after a session grows.
 
-The first actionable long-context attribution is now known:
+The indexed-layer v2 candidate is closed and promoted:
 
 - Flash has 512-wide attention heads, a 128-row raw window, and compression
   ratio 4 on even layers from layer 2 onward.
 - Vulkan's dense attention score array holds 1,024 rows. The runtime therefore
   switches a ratio-4 layer to indexed attention after 896 compressed rows. The
   first indexed token is approximately token 3,588.
-- `86840a1` adds the production `head_dim == 512`, ratio-4 Wave64 path. It is
-  bit-identical to fallback on every real indexed layer across all 12 blades
-  and produces the exact LKG first-token artifact. Its promoted-path dispatch
-  is `0.7018 ms`, down from approximately `5.33 ms` for fallback.
-- At the 4K frontier, indexer score and top-k now dominate the indexed
-  attention causal unit at approximately `1.78 ms` and `0.61 ms`. The complete
-  indexed layer remains approximately `7.98 ms`, above the `<=5.6 ms` layer
-  target. The next causal unit is therefore the exact score/selection path;
-  the attention kernel is no longer the blocker.
+- `86840a1` supplied the exact production `head_dim == 512`, ratio-4 Wave64
+  attention path. `474aa3a` adds the exact Wave64 selector plus the retained
+  grouped-output-A, output-B, and F16 projection kernels and wires the selector
+  into the real single-stream decode call site.
+- Focused production-shape measurements were selector `3.086 -> 0.722 ms`,
+  grouped output A `0.565 -> 0.290 ms`, output B `0.349 -> 0.305 ms`, and F16
+  projection `0.685 -> 0.614 ms`. The final selector repetition was
+  `3.058 -> 0.706 ms` (4.33x).
+- The matched complete indexed-layer capture was `7.358880 -> 5.453640 ms`,
+  saving `1.905240 ms` per indexed layer. A normal post-deployment repetition
+  measured `5.451120 ms`: compressor/indexer `1.182240 ms`, selector score
+  `0.355840 ms`, selector top-k `0.153600 ms`, indexed attention `0.703080 ms`,
+  grouped output A `0.219720 ms`, and output B `0.296560 ms`.
+- The first-token artifact remained bit-identical with SHA-256
+  `a31e2d480caf26ff51b05d6aae8a4b2ed05db04478b006f223a8c34590e9f815`.
+  Focused exactness, causal, 32K-row, disabled-fallback, and resource gates all
+  passed; the new shaders use Wave64 and reported zero scratch/spills.
+- A fresh 12/12 identity audit binds every blade to commit `474aa3a`, binary
+  `608f831d...0c91`, 128K context, 11 GiB weight budget, 24 CUs, 70 shaders,
+  clean source, one worker per worker blade, and the frozen role-specific
+  shader manifests recorded in `lkg.json`.
 
-The final timeline JSON must not be reported as one 18.50 ms layer. With
-`DS4_VULKAN_TIMELINE_LAYER_NO_WAIT=1`, dispatch capture remains enabled after
-the selected layer ends and stops only at token completion. The JSON therefore
-contains two consecutive local layer bodies:
-
-- target layer 2, ratio-4 indexed path, recording generations 366+367:
-  13.3202 ms dispatch sum (11.4741 ms attention/indexer, 1.6191 ms MoE,
-  0.2270 ms other);
-- following layer 3, ratio-128 non-indexed path, generation 368: 5.1775 ms
-  dispatch sum (3.0616 ms attention, 1.8929 ms MoE, 0.2231 ms other).
-
-Their 18.4978 ms combined dispatch sum is useful as a consecutive even/odd
-layer-pair sample, but it is neither one-layer latency nor a critical-path
-measurement. Repeating that pair shape across layers 2-41 and adding layer 42
-projects about 383 ms of GPU dispatch work before layers 0-1, output, runtime,
-and transport. That projection is diagnostic, not a score, but it accounts for
-roughly 92% of the measured 414.94 ms/token and identifies the context cliff as
-the primary lane.
+Twenty indexed layers times the captured `1.905240 ms` saving projects about
+`38.1 ms/token` recovered when all twenty paths are active. That is a causal
+projection, not an end-to-end score. No canonical three-run 4K/512 result has
+been recorded for `474aa3a`, so do not claim a TPS increase from this checkpoint.
 
 The 24-CU ceiling has not been proved. Do not run another `a2fd02c` versus
 `8fb6bd9` context ladder: the retained trace already identifies a production
@@ -143,13 +143,20 @@ path that is both active and actionable. Do not add instrumentation unless it
 is required to prove candidate activation or output correctness.
 
 The current lane is fixed-topology, 24-CU Vulkan decode optimization. The
-512-wide attention causal unit is complete and promoted. The next candidate
-must reduce the exact production `indexer_scores` plus `indexer_topk` path
-without changing raw-then-selected ordering or deterministic top-512 results.
-Change one causal mechanism, run the existing correctness and activation gates,
-and then run the score gate authorized by the user. A passing candidate becomes
-the restore point; a failing candidate is rolled back before another design is
-attempted.
+complete indexed-layer causal unit is now promoted. The next highest-leverage
+candidate is the routed MoE path: it is approximately `1.145 ms` in the
+promoted indexed layer and applies across the model, while the remaining
+compressor/indexer cost applies only to the twenty ratio-4 layers. Optimize one
+integrated routed-MoE causal unit, preserve exact routing/output, prove the real
+single-stream dispatch is active, and reuse the existing correctness/resource
+gates before any canonical score.
+
+Exact, production-active kernel wins do not get discarded merely because an
+end-to-end TPS movement is unresolved or below run noise. Retain them unless
+they cause output drift, instability/OOM/reset, unintended fallback, mixed
+fleet identity, a material resource regression in another production shape,
+or a matched canonical regression of at least 1%. Document deferred scoring
+honestly and keep the last exact restore point recoverable.
 
 Do not describe poor end-to-end performance as a 24-CU hardware ceiling merely
 because GPU dispatches account for most token time. A ceiling claim requires
@@ -181,7 +188,8 @@ directory containing:
 4. activation proof;
 5. compiler/occupancy evidence;
 6. exactness artifact hashes;
-7. three canonical scores;
+7. three canonical scores, or the explicit user-approved reason they were
+   deferred for an exact checkpoint;
 8. verdict and cleanup state.
 
 No new lane begins until the current candidate is promoted, rejected, or

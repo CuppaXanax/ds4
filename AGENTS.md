@@ -104,6 +104,13 @@ the disposable checkout. Do not ask the user to name internal Git objects.
 - `hold` is not permission to merge. It means the result needs a user decision.
 - Any exactness failure, unexpected fallback, mixed fleet identity, OOM, GPU
   reset, or canonical regression ends the candidate immediately.
+- Do not discard an exact, production-active kernel improvement solely because
+  its end-to-end TPS effect is unresolved or below run noise. Preserve it as a
+  user-approved checkpoint unless it causes output drift, instability,
+  unintended fallback, mixed fleet identity, a material resource regression
+  in another production shape, or a matched canonical regression of at least
+  1%. Record deferred scoring honestly; never convert a focused win into a
+  10/20 TPS claim.
 - After two invalid gates, stop and report the invariant that failed. Do not
   pivot into a new architecture in the same turn.
 - A user request to stop ends cluster and mutation activity immediately. Emit

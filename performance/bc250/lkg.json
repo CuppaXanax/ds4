@@ -2,17 +2,18 @@
   "schema_version": 2,
   "runtime_lkg": {
     "branch": "pr-557-merge",
-    "commit": "86840a1f7eecee79a45da797154bca76da793fa6",
-    "tree": "8b0a254f330ca502f0ebc2047f4af3586df879a3",
-    "fleet_binary_sha256": "588d62d3dbfe2bec6bf6adab46bde1eef7407b1af344dd1e9ff8765c8ed93865",
+    "commit": "474aa3a59c16ce54dc049c2961b27498b1972f37",
+    "tree": "d34be33d50309009ade5962d99df2590995a4f12",
+    "fleet_binary_sha256": "608f831d923b548b4299b2b5fcc841df27fc2e192e9eefbb14a57a2f5ff10c91",
+    "fleet_bench_binary_sha256": "d5c1f974755fa052e0731a43ab83bea4524df0013b7514e038401ef5db6d1c09",
     "runtime_shader_profiles": {
       "coordinator": {
-        "shader_count": 63,
-        "shader_manifest_sha256": "54c72f0e1810fd0d0d3649e227ab1eae1414dd49053da0b0ce0947e9f55d9a0a"
+        "shader_count": 70,
+        "shader_manifest_sha256": "3adf4fa86594d399d8e568fc276dd02f78cbcfa8291148a7709fc8b98638c5ca"
       },
       "worker": {
-        "shader_count": 63,
-        "shader_manifest_sha256": "9060062d42467adc1160584b0fa12ac76d2a32d53040dde665441c416cdc0243"
+        "shader_count": 70,
+        "shader_manifest_sha256": "5a6af0b028f630ecbacf870bb62f4f7c22fcf50c0a05b1166ecb88d02c137805"
       }
     },
     "performance_qualification": "user_approved_exact_checkpoint_canonical_512_repetition_deferred",
@@ -25,20 +26,37 @@
     },
     "previous_canonical_baseline_score": 2.41,
     "checkpoint_measurement": {
+      "runtime_commit": "86840a1f7eecee79a45da797154bca76da793fa6",
       "prompt_tokens": 4096,
       "generated_tokens": 64,
       "gen_steady_tokens": 63,
       "gen_steady_tps": 2.94,
-      "status": "diagnostic_checkpoint_not_canonical_3x512"
+      "status": "diagnostic_pre_indexed_layer_v2_not_canonical_3x512"
     },
     "known_context_regression": {
-      "status": "indexed_attention_fixed_remaining_layer_and_selector_cost_open",
+      "status": "indexed_layer_v2_promoted_next_causal_unit_open",
       "ratio4_sparse_threshold_rows": 896,
       "first_indexed_token_approx": 3588,
       "model_attention_head_dim": 512,
       "promoted_indexed_wave64_512_reachable": true,
-      "promoted_indexed_wave64_512_gpu_ms": 0.7018,
+      "promoted_indexed_wave64_512_gpu_ms": 0.70308,
+      "promoted_selector_score_gpu_ms": 0.35584,
+      "promoted_selector_topk_gpu_ms": 0.1536,
+      "promoted_compressor_indexer_gpu_ms": 1.18224,
+      "captured_control_indexed_layer_gpu_ms": 7.35888,
+      "candidate_indexed_layer_gpu_ms": 5.45364,
+      "promoted_repetition_indexed_layer_gpu_ms": 5.45112,
+      "captured_savings_per_indexed_layer_gpu_ms": 1.90524,
       "full_model_exactness_artifact_sha256": "a31e2d480caf26ff51b05d6aae8a4b2ed05db04478b006f223a8c34590e9f815"
+    },
+    "promotion_evidence": {
+      "base_commit": "86840a1f7eecee79a45da797154bca76da793fa6",
+      "runtime_patch_sha256": "bd8693f6fb1d3366df8b86e3202a3b9fcca40819bb2e6f500bb2ad450f3cf784",
+      "candidate_commit": "474aa3a59c16ce54dc049c2961b27498b1972f37",
+      "candidate_tree": "d34be33d50309009ade5962d99df2590995a4f12",
+      "production_activation_proved": true,
+      "exactness_match": true,
+      "canonical_3x512_score": "deferred_by_user"
     }
   },
   "model": {

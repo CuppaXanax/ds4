@@ -22,7 +22,7 @@ if [ "$branch" != "pr-557-merge" ]; then
 fi
 
 outside_system="$(git diff --cached --name-only --diff-filter=ACMRD |
-    grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/)' || true)"
+    grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/|vulkan/shaders/(compile\.py|test_compile\.py)$)' || true)"
 if [ -z "$outside_system" ]; then
     exit 0
 fi

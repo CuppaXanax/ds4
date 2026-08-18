@@ -2,10 +2,14 @@
 
 ## Scoreboard
 
-- Runtime restore point: `8fb6bd9` (operational reference only; its 4K
-  performance is regressed and it is not a performance-qualified LKG)
-- Canonical score: **2.41 sustained decode TPS / 414.94 ms per token**
+- Runtime restore point: `86840a1` (exact, production-activated 512-wide
+  indexed-attention checkpoint)
+- Previous canonical score: **2.41 sustained decode TPS / 414.94 ms per token**
 - Canonical samples: `2.40`, `2.41`, `2.42` TPS
+- Corrected checkpoint measurement: **2.94 steady TPS** over 63 steady tokens
+  at 4K with 128K allocated context. Per the user's direction, this is retained
+  as an exact LKG checkpoint without claiming the deferred 3x512 canonical
+  repetition gate.
 - Historical `a2fd02c` short-prompt samples: `5.58`, `5.50` TPS (diagnostic
   only; incompatible with the canonical 4K/128K denominator)
 - User-observed interactive start: approximately 5.0 TPS followed by session
@@ -104,13 +108,15 @@ The first actionable long-context attribution is now known:
 - Vulkan's dense attention score array holds 1,024 rows. The runtime therefore
   switches a ratio-4 layer to indexed attention after 896 compressed rows. The
   first indexed token is approximately token 3,588.
-- The indexed Wave64 shader promoted by `f85a909` requires `head_dim == 128`.
-  The real Flash call passes `head_dim == 512`, so the promoted shader cannot
-  activate for this model. Its focused exactness and timing tests also used
-  128-wide heads.
-- At the 4K frontier, the trace proves that the ratio-4 layer falls back to
-  `attention_mixed_online`: 6.0346 ms for that dispatch alone. Indexer score
-  and top-k add 1.7747 ms and 0.6060 ms.
+- `86840a1` adds the production `head_dim == 512`, ratio-4 Wave64 path. It is
+  bit-identical to fallback on every real indexed layer across all 12 blades
+  and produces the exact LKG first-token artifact. Its promoted-path dispatch
+  is `0.7018 ms`, down from approximately `5.33 ms` for fallback.
+- At the 4K frontier, indexer score and top-k now dominate the indexed
+  attention causal unit at approximately `1.78 ms` and `0.61 ms`. The complete
+  indexed layer remains approximately `7.98 ms`, above the `<=5.6 ms` layer
+  target. The next causal unit is therefore the exact score/selection path;
+  the attention kernel is no longer the blocker.
 
 The final timeline JSON must not be reported as one 18.50 ms layer. With
 `DS4_VULKAN_TIMELINE_LAYER_NO_WAIT=1`, dispatch capture remains enabled after
@@ -136,13 +142,14 @@ The 24-CU ceiling has not been proved. Do not run another `a2fd02c` versus
 path that is both active and actionable. Do not add instrumentation unless it
 is required to prove candidate activation or output correctness.
 
-The current lane is fixed-topology, 24-CU Vulkan decode optimization. The first
-candidate must make the real 512-wide, ratio-4 indexed-attention call use an
-optimized implementation instead of `attention_mixed_online`, or replace that
-fallback with a faster exact implementation. Change one causal mechanism, run
-the existing correctness and activation gates, and then run the canonical score
-gate. A passing candidate becomes the restore point; a failing candidate is
-rolled back before the next dominant production dispatch is addressed.
+The current lane is fixed-topology, 24-CU Vulkan decode optimization. The
+512-wide attention causal unit is complete and promoted. The next candidate
+must reduce the exact production `indexer_scores` plus `indexer_topk` path
+without changing raw-then-selected ordering or deterministic top-512 results.
+Change one causal mechanism, run the existing correctness and activation gates,
+and then run the score gate authorized by the user. A passing candidate becomes
+the restore point; a failing candidate is rolled back before another design is
+attempted.
 
 Do not describe poor end-to-end performance as a 24-CU hardware ceiling merely
 because GPU dispatches account for most token time. A ceiling claim requires

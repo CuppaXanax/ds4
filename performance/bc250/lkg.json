@@ -1,23 +1,21 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "runtime_lkg": {
     "branch": "pr-557-merge",
-    "commit": "8fb6bd9039dd207dd852c90b585742efff01d6a6",
-    "tree": "1076b98610160e25f3e6ffe12bc63cf6086ec380",
-    "fleet_binary_sha256": "f0d32af04aade31505ecb698514d703a2569c772fe1c98258e29d525455bb028",
-    "runtime_shader_count": 62,
-    "runtime_shader_manifest_sha256": "9bf6778944c194ef59fa1c1dbc37c3cad0fc87fe1bcb3ec7dcdc729844c39e10",
+    "commit": "86840a1f7eecee79a45da797154bca76da793fa6",
+    "tree": "8b0a254f330ca502f0ebc2047f4af3586df879a3",
+    "fleet_binary_sha256": "588d62d3dbfe2bec6bf6adab46bde1eef7407b1af344dd1e9ff8765c8ed93865",
     "runtime_shader_profiles": {
       "coordinator": {
-        "shader_count": 62,
-        "shader_manifest_sha256": "63f1af4eff6ba608a940ac566bd26f1e22fb4b41b89eda4601d45c506d4b8e3a"
+        "shader_count": 63,
+        "shader_manifest_sha256": "54c72f0e1810fd0d0d3649e227ab1eae1414dd49053da0b0ce0947e9f55d9a0a"
       },
       "worker": {
-        "shader_count": 62,
-        "shader_manifest_sha256": "9bf6778944c194ef59fa1c1dbc37c3cad0fc87fe1bcb3ec7dcdc729844c39e10"
+        "shader_count": 63,
+        "shader_manifest_sha256": "9060062d42467adc1160584b0fa12ac76d2a32d53040dde665441c416cdc0243"
       }
     },
-    "performance_qualification": "restore_point_only_context_regression_open",
+    "performance_qualification": "user_approved_exact_checkpoint_canonical_512_repetition_deferred",
     "historical_short_prompt": {
       "commit": "a2fd02c4627028dfc4cc13b141b49c4a887d25a2",
       "prompt_tokens": [17, 12],
@@ -25,14 +23,22 @@
       "decode_tps_samples": [5.58, 5.5],
       "status": "diagnostic_only"
     },
-    "canonical_baseline_score": 2.41,
+    "previous_canonical_baseline_score": 2.41,
+    "checkpoint_measurement": {
+      "prompt_tokens": 4096,
+      "generated_tokens": 64,
+      "gen_steady_tokens": 63,
+      "gen_steady_tps": 2.94,
+      "status": "diagnostic_checkpoint_not_canonical_3x512"
+    },
     "known_context_regression": {
-      "status": "open",
+      "status": "indexed_attention_fixed_remaining_layer_and_selector_cost_open",
       "ratio4_sparse_threshold_rows": 896,
       "first_indexed_token_approx": 3588,
       "model_attention_head_dim": 512,
-      "promoted_indexed_wave64_required_head_dim": 128,
-      "promoted_indexed_wave64_reachable": false
+      "promoted_indexed_wave64_512_reachable": true,
+      "promoted_indexed_wave64_512_gpu_ms": 0.7018,
+      "full_model_exactness_artifact_sha256": "a31e2d480caf26ff51b05d6aae8a4b2ed05db04478b006f223a8c34590e9f815"
     }
   },
   "model": {

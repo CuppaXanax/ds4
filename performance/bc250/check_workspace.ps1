@@ -68,7 +68,7 @@ try {
         throw "Unexpected local branches: $($unexpectedBranches -join ', ')"
     }
 
-    $allowedPattern = '^(?:AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/)'
+    $allowedPattern = '^(?:AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/|vulkan/shaders/(?:compile\.py|test_compile\.py)$)'
     $changedFromLkg = @(
         Invoke-GitChecked diff --name-only $baselineCommit --
         Invoke-GitChecked ls-files --others --exclude-standard

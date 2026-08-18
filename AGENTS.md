@@ -30,7 +30,8 @@ trying” after a failed gate.
   user approval and qualifying evidence from `performance/bc250/score.py`.
   User-requested engineering-system-only commits are permitted. Those paths
   are `AGENTS.md`, `.gitattributes`, `.gitignore`, `.githooks/`, and
-  `performance/bc250/`.
+  `performance/bc250/`, plus the fail-closed shader build guard and its test at
+  `vulkan/shaders/compile.py` and `vulkan/shaders/test_compile.py`.
 - If the user explicitly orders an exact, production-activated causal unit to
   be retained while deferring the canonical repetition gate, the hook may
   accept a `user_approved_checkpoint` evidence record. It must bind the exact

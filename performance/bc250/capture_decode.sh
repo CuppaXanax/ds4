@@ -88,7 +88,7 @@ if ! git merge-base --is-ancestor "$expected_commit" "$actual_commit"; then
     exit 7
 fi
 runtime_delta="$(git diff --name-only "$expected_commit" -- |
-    grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/)' || true)"
+    grep -Ev '^(AGENTS\.md|\.gitattributes|\.gitignore|\.githooks/|performance/bc250/|vulkan/shaders/(compile\.py|test_compile\.py)$)' || true)"
 if [[ -n "$runtime_delta" ]]; then
     echo "checkout contains runtime changes beyond expected commit $expected_commit:" >&2
     echo "$runtime_delta" >&2

@@ -60191,6 +60191,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 #ifdef DS4_VULKAN_BUILD
         if (ok) {
             const bool use_worker_slice_scope =
+                n_tokens == 1 &&
                 !g->quality && g->placement == NULL && g->tp_world < 2 &&
                 !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
             if (use_worker_slice_scope) {

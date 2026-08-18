@@ -318,8 +318,11 @@ REGISTER_TEST(dsv4_fp8_kv_quantize, test_fp8_kv_quantize);
 /* ---------- store_raw_kv_batch ---------- */
 
 static int test_store_raw_kv_batch(void) {
-    const uint32_t raw_cap = 8, head_dim = 16, n_tokens = 5, pos0 = 6;
-    /* pos0 + n_tokens = 11 > raw_cap, so rows wrap: 6,7,0,1,2. */
+    /* Match the production 4096-token prefill frontier: raw_cap is the
+     * 128K-context sliding-window span and the KV head is 512-wide.  This
+     * must exercise the full batch store dispatch, rather than only the
+     * small wraparound diagnostic that preceded the coordinator failure. */
+    const uint32_t raw_cap = 4352, head_dim = 512, n_tokens = 4096, pos0 = 0;
     ds4_gpu_tensor *cache = ds4_gpu_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
     ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc((uint64_t)n_tokens * head_dim * sizeof(float));
     if (!cache || !kv) {

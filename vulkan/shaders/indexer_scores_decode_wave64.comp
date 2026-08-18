@@ -1,0 +1,61 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/* Production decode score kernel for the 64 x 128 DS4 indexer.
+ *
+ * Four Wave64 subgroups share a workgroup; each subgroup owns one compressed
+ * row and each lane owns one indexer head.  The dot-product dimension order,
+ * head reduction order, ReLU, weight multiply, and final scale match
+ * indexer_scores.comp exactly.  subgroupShuffle is used only to expose each
+ * lane's completed head score to lane zero in canonical head order.
+ */
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Scores { float scores[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 2) readonly buffer Weights { float weights[]; };
+layout(set = 0, binding = 3) readonly buffer IndexComp { float index_comp[]; };
+
+layout(push_constant) uniform PC {
+    uint n_comp;
+    uint n_tokens;
+    uint pos0;
+    uint n_head;
+    uint head_dim;
+    uint ratio;
+    uint causal;
+    float scale;
+} pc;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wave = gl_SubgroupID;
+    const uint c = gl_WorkGroupID.x * 4u + wave;
+
+    if (c >= pc.n_comp || pc.n_tokens != 1u || pc.n_head != 64u ||
+        pc.head_dim != 128u || pc.ratio != 4u) return;
+
+    if (pc.causal != 0u) {
+        const uint visible = min(pc.n_comp, pc.pos0 / pc.ratio +
+            (pc.pos0 % pc.ratio + 1u) / pc.ratio);
+        if (c >= visible) {
+            if (lane == 0u) scores[c] = -1.0 / 0.0;
+            return;
+        }
+    }
+
+    const uint q_base = lane * 128u;
+    const uint k_base = c * 128u;
+    float dot = 0.0;
+    for (uint d = 0u; d < 128u; ++d)
+        dot += q[q_base + d] * index_comp[k_base + d];
+    const float head_score = max(dot, 0.0) * weights[lane];
+
+    float total = 0.0;
+    for (uint h = 0u; h < 64u; ++h) {
+        const float value = subgroupShuffle(head_score, h);
+        if (lane == 0u) total += value;
+    }
+    if (lane == 0u) scores[c] = total * pc.scale;
+}

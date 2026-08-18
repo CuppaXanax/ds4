@@ -14,6 +14,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <string>
+#include <chrono>
 
 /* f32 -> IEEE half (round toward zero; test values are normal-range). */
 static uint16_t f32_to_f16(float f) {
@@ -156,3 +160,131 @@ static int test_matmul_f16(void) {
     return rc;
 }
 REGISTER_TEST(matmul_f16, test_matmul_f16);
+
+static void set_f16_unpack_env(const char *value) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_F16_UNPACK", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_F16_UNPACK", value, 1);
+    else unsetenv("DS4_VULKAN_F16_UNPACK");
+#endif
+}
+
+static void set_f16_mode_env(const char *value) {
+#ifdef _WIN32
+    _putenv_s("DS4_VULKAN_F16_MODE", value ? value : "");
+#else
+    if (value) setenv("DS4_VULKAN_F16_MODE", value, 1);
+    else unsetenv("DS4_VULKAN_F16_MODE");
+#endif
+}
+
+static int run_matmul_f16_unpack(bool benchmark) {
+    if (benchmark && !std::getenv("DS4_TEST_BENCH_F16_UNPACK")) return 0;
+    const uint64_t in_dim = 1024u;
+    const uint64_t out_dim = 8192u;
+    const uint64_t weight_offset = 8192u;
+    const uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+    const uint64_t model_size = weight_offset + weight_bytes;
+    std::vector<unsigned char> model(model_size, 0u);
+    uint16_t *weights = reinterpret_cast<uint16_t *>(model.data() + weight_offset);
+    for (uint64_t o = 0; o < out_dim; o++) {
+        for (uint64_t i = 0; i < in_dim; i++) {
+            const int value = (int)((o * 17u + i * 13u) % 31u) - 15;
+            weights[o * in_dim + i] = f32_to_f16((float)value * (1.0f / 64.0f));
+        }
+    }
+    std::vector<float> input(in_dim);
+    for (uint64_t i = 0; i < in_dim; i++)
+        input[i] = (float)((int)(i % 29u) - 14) * (1.0f / 32.0f);
+    std::vector<float> reference(out_dim), candidate(out_dim);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    const char *saved_unpack = std::getenv("DS4_VULKAN_F16_UNPACK");
+    const char *saved_mode = std::getenv("DS4_VULKAN_F16_MODE");
+    const bool had_unpack = saved_unpack != nullptr, had_mode = saved_mode != nullptr;
+    const std::string unpack_value = saved_unpack ? saved_unpack : "";
+    const std::string mode_value = saved_mode ? saved_mode : "";
+    int rc = 1;
+    if (!x || !out || !ds4_gpu_set_model_map(model.data(), model.size()) ||
+        !ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)))
+        goto done;
+
+    set_f16_mode_env("chunk");
+    set_f16_unpack_env("0");
+    if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                   in_dim, out_dim, x, 1u) ||
+        ds4_gpu_matmul_f16_unpack_used() != 0 ||
+        !ds4_gpu_tensor_read(out, 0, reference.data(),
+                             reference.size() * sizeof(float))) goto done;
+    set_f16_unpack_env("1");
+    if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                   in_dim, out_dim, x, 1u) ||
+        ds4_gpu_matmul_f16_unpack_used() != 1 ||
+        !ds4_gpu_tensor_read(out, 0, candidate.data(),
+                             candidate.size() * sizeof(float))) goto done;
+    if (std::memcmp(reference.data(), candidate.data(),
+                    reference.size() * sizeof(float)) != 0) {
+        for (uint64_t o = 0; o < out_dim; o++) {
+            if (reference[o] != candidate[o]) {
+                fprintf(stderr,
+                        "matmul_f16_unpack: o=%llu reference=%a candidate=%a\n",
+                        (unsigned long long)o, reference[o], candidate[o]);
+                break;
+            }
+        }
+        goto done;
+    }
+
+    if (benchmark) {
+        const uint32_t warmups = 3u, rounds = 12u;
+        for (uint32_t i = 0; i < warmups; i++) {
+            set_f16_unpack_env("0");
+            if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                           in_dim, out_dim, x, 1u)) goto done;
+            set_f16_unpack_env("1");
+            if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                           in_dim, out_dim, x, 1u)) goto done;
+        }
+        set_f16_unpack_env("0");
+        const auto base_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < rounds; i++)
+            if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                           in_dim, out_dim, x, 1u)) goto done;
+        const auto base_end = std::chrono::steady_clock::now();
+        set_f16_unpack_env("1");
+        const auto unpack_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < rounds; i++)
+            if (!ds4_gpu_matmul_f16_tensor(out, model.data(), model.size(), weight_offset,
+                                           in_dim, out_dim, x, 1u)) goto done;
+        const auto unpack_end = std::chrono::steady_clock::now();
+        const double base_ms = std::chrono::duration<double, std::milli>(
+            base_end - base_begin).count() / rounds;
+        const double unpack_ms = std::chrono::duration<double, std::milli>(
+            unpack_end - unpack_begin).count() / rounds;
+        fprintf(stderr,
+                "matmul_f16_unpack_bench: shape=%llux%llu base_ms=%.3f "
+                "unpack_ms=%.3f speedup=%.3fx\n",
+                (unsigned long long)out_dim, (unsigned long long)in_dim,
+                base_ms, unpack_ms, unpack_ms != 0.0 ? base_ms / unpack_ms : 0.0);
+    }
+    rc = 0;
+done:
+    if (had_unpack) set_f16_unpack_env(unpack_value.c_str());
+    else set_f16_unpack_env(nullptr);
+    if (had_mode) set_f16_mode_env(mode_value.c_str());
+    else set_f16_mode_env(nullptr);
+    if (out) ds4_gpu_tensor_free(out);
+    if (x) ds4_gpu_tensor_free(x);
+    return rc;
+}
+
+static int test_matmul_f16_unpack_exact_ab(void) {
+    return run_matmul_f16_unpack(false);
+}
+REGISTER_TEST(matmul_f16_unpack_exact_ab, test_matmul_f16_unpack_exact_ab);
+
+static int test_matmul_f16_unpack_bench(void) {
+    return run_matmul_f16_unpack(true);
+}
+REGISTER_TEST(matmul_f16_unpack_bench, test_matmul_f16_unpack_bench);

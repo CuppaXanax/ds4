@@ -490,17 +490,20 @@ static int load_all_shaders(void) {
         {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_aligned_bfe", 20, 4},
         {"matmul_q8_0_wave64_bfe", 20, 4},
+        {"matmul_q8_0_wave64_unpack_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_hc_expand_rows2_bfe", 16, 7},
         {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_group_rows_bfe", 20, 4},
+        {"matmul_q8_0_group_wave64_rows8_bfe", 20, 4},
         {"matmul_q8_0_simple", 12, 6}, /* 3 x uint32: in_dim, out_dim, blocks */
         {"quantize_q8_0_prequant", 12, 2},
         {"matmul_q8_0_prequant", 20, 3},
         {"group_copy", 24, 6},
         {"matmul_f16", 12, 6},   /* 3 x uint32 */
         {"matmul_f16_fast", 12, 3}, /* FP64 lane dots with chunked reduction */
+        {"matmul_f16_fast_unpack", 12, 3}, /* exact reduction, native f16 unpack */
         {"rms_norm_weight_rows", 12, 6},
         {"head_rms_norm", 16, 6},  /* n_tok + n_head + head_dim + eps */
         {"rope_tail", 52, 6},      /* 7 x uint32 + 6 x float */
@@ -516,8 +519,12 @@ static int load_all_shaders(void) {
         {"attention_indexed_online_wave64_512", 108, 8},
         {"attention_decode_raw_batch", 32, 4},
         {"indexer_scores", 32, 4},
+        {"indexer_scores_decode_wave64", 32, 4},
         {"indexer_qat", 4, 1},
         {"indexer_topk", 12, 2},
+        {"indexer_topk_wave64", 12, 2},
+        {"indexer_topk_tile_wave64", 12, 2},
+        {"indexer_topk_merge_wave64", 8, 2},
         {"topk_mask", 12, 2},
         {"compressor_store", 32, 5},
         {"compressor_clear", 12, 2},
@@ -2473,6 +2480,9 @@ static bool shader_f32_domain(uint64_t a, uint64_t b, uint64_t c) {
 /* Set only around the production full-layer router call whose routed
  * consumer is guaranteed to carry the deferred selected/weights barrier. */
 static thread_local bool g_router_overlap_hint = false;
+static thread_local bool g_matmul_f16_unpack_used = false;
+static thread_local bool g_q8_group_wave64_rows8_used = false;
+static thread_local bool g_q8_wave64_unpack_used = false;
 
 extern "C" void ds4_gpu_router_overlap_hint(int active) {
     g_router_overlap_hint = active != 0;
@@ -2805,6 +2815,7 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                n_tok)
 {
     DS4_VK_TRACE_KERNEL("matmul_q8_0");
+    g_q8_wave64_unpack_used = false;
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (in_dim > 8192u || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
     uint64_t n_blocks = (in_dim + 31) / 32;
@@ -3014,6 +3025,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x_q8, uint64_t n_tok) {
     DS4_VK_TRACE_KERNEL("matmul_q8_0_prequant");
+    g_q8_wave64_unpack_used = false;
     if (!out || !x_q8 || !model_map || in_dim == 0 || out_dim == 0 ||
         n_tok == 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
         n_tok > 65535u) return 0;
@@ -3074,6 +3086,17 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(wave64_env && strcmp(wave64_env, "0") == 0) &&
         g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
         n_tok == 1 && in_dim == 8192 && blocks == 256 && out_dim == 4096;
+    const char *wave64_unpack_env = getenv("DS4_VULKAN_Q8_WAVE64_UNPACK");
+    const char *gpu_name = ds4_vulkan_gpu_name;
+    const bool wave64_unpack_default = gpu_name != nullptr &&
+        (strstr(gpu_name, "890M") != nullptr ||
+         strstr(gpu_name, "BC-250") != nullptr ||
+         strstr(gpu_name, "BC250") != nullptr);
+    const bool wave64_unpack_enabled = wave64_unpack_env != nullptr
+        ? strcmp(wave64_unpack_env, "0") != 0 : wave64_unpack_default;
+    bool use_wave64_unpack = use_wave64 && wave64_unpack_enabled &&
+        g_vk.shader_map.find("matmul_q8_0_wave64_unpack_bfe") !=
+            g_vk.shader_map.end();
     bool use_rows2 = use_aligned &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0) &&
         !(rows2_env && strcmp(rows2_env, "0") == 0) &&
@@ -3084,7 +3107,8 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
     const char *shader_name = use_wave64
-        ? "matmul_q8_0_wave64_bfe"
+        ? (use_wave64_unpack ? "matmul_q8_0_wave64_unpack_bfe"
+                             : "matmul_q8_0_wave64_bfe")
         : (use_rows2
         ? "matmul_q8_0_rows2_bfe"
         : (use_rows8
@@ -3096,6 +3120,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end() && use_wave64) {
         /* A stale shader bundle must preserve the aligned dispatch geometry. */
+        use_wave64_unpack = false;
         use_wave64 = false;
         shader_name = use_rows2
             ? "matmul_q8_0_rows2_bfe"
@@ -3156,15 +3181,23 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         use_wave64 ? 1u : (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale))};
     if (use_wave64 && getenv("DS4_VULKAN_TRACE_KERNELS"))
         fprintf(stderr,
-                "ds4: [trace] matmul_q8_0_wave64_bfe shape=%ux%u blocks=%u "
+                "ds4: [trace] %s shape=%ux%u blocks=%u "
                 "dispatch=%ux%ux%u\n",
+                shader_name,
                 (unsigned)in_dim, (unsigned)out_dim, (unsigned)blocks,
                 (unsigned)dispatch_x, (unsigned)dispatch_y, (unsigned)n_tok);
     if (sh.push_size != sizeof(pc) ||
         g_vk.caps.max_push_constants_size < sizeof(pc)) return 0;
-    return record_simple_shader(shader_name, &pc, sizeof(pc),
-                                buffers, descriptor_count, dispatch_x, dispatch_y,
-                                (uint32_t)n_tok, resume_recording);
+    const int ok = record_simple_shader(shader_name, &pc, sizeof(pc),
+                                        buffers, descriptor_count,
+                                        dispatch_x, dispatch_y,
+                                        (uint32_t)n_tok, resume_recording);
+    if (ok && use_wave64_unpack) g_q8_wave64_unpack_used = true;
+    return ok;
+}
+
+extern "C" int ds4_gpu_q8_wave64_unpack_used(void) {
+    return g_q8_wave64_unpack_used ? 1 : 0;
 }
 
 /* Grouped decode appliance for contiguous Q8_0 output rows.  The input has
@@ -3197,16 +3230,34 @@ static int ds4_gpu_matmul_q8_0_group_tensor(
      * shader keeps one lane per (row, Q8 block), so this is exact whenever
      * rows_per_workgroup * blocks <= 256.  Keep the old one-row shader as a
      * clean fallback for stale bundles or unusual devices. */
+    g_q8_group_wave64_rows8_used = false;
     const uint32_t rows_per_workgroup = std::max<uint32_t>(
         1u, std::min<uint32_t>(256u, 256u / (uint32_t)blocks));
+    const char *wave64_env = getenv("DS4_VULKAN_Q8_GROUP_WAVE64_ROWS8");
+    const char *gpu_name = ds4_vulkan_gpu_name;
+    const bool wave64_default = gpu_name != nullptr &&
+        (strstr(gpu_name, "890M") != nullptr ||
+         strstr(gpu_name, "BC-250") != nullptr ||
+         strstr(gpu_name, "BC250") != nullptr);
+    const bool wave64_enabled = wave64_env != nullptr
+        ? strcmp(wave64_env, "0") != 0 : wave64_default;
+    const bool use_wave64_rows8 = wave64_enabled && blocks == 128u &&
+        in_dim == 4096u && g_vk.caps.subgroup_size == 64u &&
+        g_vk.caps.max_compute_work_group_size[0] >= 256u &&
+        g_vk.caps.max_compute_work_group_invocations >= 256u &&
+        g_vk.caps.max_shared_memory_size >= 12800u &&
+        g_vk.shader_map.find("matmul_q8_0_group_wave64_rows8_bfe") !=
+            g_vk.shader_map.end();
+    const uint32_t dispatch_rows = use_wave64_rows8 ? 8u : rows_per_workgroup;
     const uint64_t packed_dispatch_x =
-        ((uint64_t)out_dim + rows_per_workgroup - 1u) / rows_per_workgroup;
+        ((uint64_t)out_dim + dispatch_rows - 1u) / dispatch_rows;
     if (packed_dispatch_x > g_vk.caps.max_compute_work_group_count[0] ||
         n_groups > g_vk.caps.max_compute_work_group_count[1]) return 0;
     auto rows_si = g_vk.shader_map.find("matmul_q8_0_group_rows_bfe");
     auto one_si = g_vk.shader_map.find("matmul_q8_0_group_bfe");
     const bool use_packed = rows_si != g_vk.shader_map.end();
-    auto si = use_packed ? rows_si : one_si;
+    auto wave64_si = g_vk.shader_map.find("matmul_q8_0_group_wave64_rows8_bfe");
+    auto si = use_wave64_rows8 ? wave64_si : (use_packed ? rows_si : one_si);
     if (si == g_vk.shader_map.end()) return 0;
 
     decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
@@ -3246,13 +3297,21 @@ static int ds4_gpu_matmul_q8_0_group_tensor(
     };
     struct { uint32_t in_dim, out_dim, n_groups, blocks_per_row, rows_per_workgroup; } pc = {
         (uint32_t)in_dim, (uint32_t)out_dim, n_groups, (uint32_t)blocks,
-        use_packed ? rows_per_workgroup : 1u};
-    const char *shader_name = use_packed ?
-        "matmul_q8_0_group_rows_bfe" : "matmul_q8_0_group_bfe";
-    return record_simple_shader(shader_name, &pc, sizeof(pc),
+        use_wave64_rows8 ? 8u : (use_packed ? rows_per_workgroup : 1u)};
+    const char *shader_name = use_wave64_rows8
+        ? "matmul_q8_0_group_wave64_rows8_bfe"
+        : (use_packed ? "matmul_q8_0_group_rows_bfe" : "matmul_q8_0_group_bfe");
+    const int ok = record_simple_shader(shader_name, &pc, sizeof(pc),
                                 buffers, 4,
-                                use_packed ? (uint32_t)packed_dispatch_x : (uint32_t)out_dim,
+                                (use_packed || use_wave64_rows8)
+                                    ? (uint32_t)packed_dispatch_x : (uint32_t)out_dim,
                                 n_groups, 1u, resume_recording);
+    if (ok && use_wave64_rows8) g_q8_group_wave64_rows8_used = true;
+    return ok;
+}
+
+extern "C" int ds4_gpu_q8_group_wave64_rows8_used(void) {
+    return g_q8_group_wave64_rows8_used ? 1 : 0;
 }
 
 /* ---- matmul_f32_tensor dispatch (host-side f32 matmul) ---- */
@@ -3291,6 +3350,7 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                n_tok)
 {
     DS4_VK_TRACE_KERNEL("matmul_f16");
+    g_matmul_f16_unpack_used = false;
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         if (getenv("DS4_VULKAN_DEBUG"))
@@ -3304,8 +3364,19 @@ int ds4_gpu_matmul_f16_tensor(
         return 0;
 
     const char *f16_mode = getenv("DS4_VULKAN_F16_MODE");
-    const char *shader_name = f16_mode && strcmp(f16_mode, "exact") == 0
-        ? "matmul_f16" : "matmul_f16_fast";
+    const bool use_fast = !(f16_mode && strcmp(f16_mode, "exact") == 0);
+    const char *unpack_env = getenv("DS4_VULKAN_F16_UNPACK");
+    const char *gpu_name = ds4_vulkan_gpu_name;
+    const bool unpack_default = gpu_name != nullptr &&
+        (strstr(gpu_name, "890M") != nullptr ||
+         strstr(gpu_name, "BC-250") != nullptr ||
+         strstr(gpu_name, "BC250") != nullptr);
+    const bool unpack_enabled = unpack_env != nullptr
+        ? strcmp(unpack_env, "0") != 0 : unpack_default;
+    const bool use_unpack = use_fast && unpack_enabled &&
+        g_vk.shader_map.find("matmul_f16_fast_unpack") != g_vk.shader_map.end();
+    const char *shader_name = !use_fast ? "matmul_f16" :
+        (use_unpack ? "matmul_f16_fast_unpack" : "matmul_f16_fast");
     auto si = g_vk.shader_map.find(shader_name);
     if (si == g_vk.shader_map.end()) {
         if (getenv("DS4_VULKAN_DEBUG"))
@@ -3414,9 +3485,14 @@ int ds4_gpu_matmul_f16_tensor(
         if (!record_simple_shader(shader_name, &pc, sizeof(pc), bufs, 3,
                                   (uint32_t)out_dim, tile_tokens, 1,
                                   more_tiles)) return 0;
+        if (use_unpack) g_matmul_f16_unpack_used = true;
         token_base += tile_tokens;
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_matmul_f16_unpack_used(void) {
+    return g_matmul_f16_unpack_used ? 1 : 0;
 }
 
 /* ---- rms_norm_weight_rows_tensor dispatch ---- */
@@ -4692,6 +4768,7 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
 
 static thread_local bool g_indexed_wave64_used = false;
 static thread_local bool g_indexed_wave64_inv_rope_used = false;
+static thread_local bool g_indexer_select_decode_wave64_used = false;
 
 /* BC-250 exposes the GFX1013/Radeon 890M identity through RADV.  Keep the
  * tuned indexed path opt-in on every other device, while allowing explicit
@@ -5991,6 +6068,133 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
     return record_indexer_scores(scores, q, weights, index_comp,
                                  n_comp, n_tokens, pos0, n_head, head_dim,
                                  ratio, scale, 1);
+}
+
+static bool indexer_select_decode_wave64_enabled(void) {
+    const char *env = getenv("DS4_VULKAN_INDEXER_SELECT_WAVE64");
+    return env != nullptr ? strcmp(env, "0") != 0
+                          : indexed_wave64_bc250_default();
+}
+
+extern "C" int ds4_gpu_indexer_select_decode_wave64_used(void) {
+    return g_indexer_select_decode_wave64_used ? 1 : 0;
+}
+
+int ds4_gpu_indexer_select_decode_wave64_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        ds4_gpu_tensor       *candidate_scratch,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                top_k,
+        float                   scale) {
+    g_indexer_select_decode_wave64_used = false;
+    if (!selected || !score_scratch || !candidate_scratch || !q || !weights ||
+        !index_comp || n_comp <= 512u || n_comp > 32768u || n_tokens != 1u ||
+        n_head != 64u || head_dim != 128u || ratio != 4u || top_k != 512u ||
+        !indexer_select_decode_wave64_enabled() ||
+        g_vk.caps.subgroup_size != 64u || !g_vk.caps.has_subgroup_shuffle ||
+        g_vk.caps.max_compute_work_group_size[0] < 256u ||
+        g_vk.caps.max_compute_work_group_invocations < 256u ||
+        g_vk.caps.max_shared_memory_size < 32768u ||
+        g_vk.shader_map.find("indexer_scores_decode_wave64") == g_vk.shader_map.end() ||
+        g_vk.shader_map.find("indexer_topk_wave64") == g_vk.shader_map.end() ||
+        g_vk.shader_map.find("indexer_topk_tile_wave64") == g_vk.shader_map.end() ||
+        g_vk.shader_map.find("indexer_topk_merge_wave64") == g_vk.shader_map.end())
+        return 0;
+
+    const uint32_t score_groups = (n_comp + 3u) / 4u;
+    const uint32_t tile_count = (n_comp + 4095u) / 4096u;
+    const uint32_t candidate_count = tile_count * 512u;
+    const uint64_t score_bytes = (uint64_t)n_comp * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t weight_bytes = (uint64_t)n_head * sizeof(float);
+    const uint64_t index_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)top_k * sizeof(uint32_t);
+    const uint64_t candidate_bytes = (uint64_t)candidate_count * 2u * sizeof(uint32_t);
+    if (score_scratch->bytes < score_bytes || q->bytes < q_bytes ||
+        weights->bytes < weight_bytes || index_comp->bytes < index_bytes ||
+        selected->bytes < selected_bytes ||
+        (n_comp > 4096u && candidate_scratch->bytes < candidate_bytes) ||
+        score_groups > g_vk.caps.max_compute_work_group_count[0] ||
+        tile_count > g_vk.caps.max_compute_work_group_count[0]) return 0;
+
+    VkBuffer obuf, sbuf, cbuf, qbuf, wbuf, kbuf;
+    VkDeviceSize ooff, soff, coff, qoff, woff, koff;
+    if (!find_tensor_buffer(selected, obuf, ooff) ||
+        !find_tensor_buffer(score_scratch, sbuf, soff) ||
+        !find_tensor_buffer(candidate_scratch, cbuf, coff) ||
+        !find_tensor_buffer(q, qbuf, qoff) ||
+        !find_tensor_buffer(weights, wbuf, woff) ||
+        !find_tensor_buffer(index_comp, kbuf, koff)) return 0;
+    const VkDeviceSize align = g_vk.caps.min_storage_buffer_offset_alignment;
+    if (align && ((ooff | soff | coff | qoff | woff | koff) % align) != 0)
+        return 0;
+
+    auto &ctx = get_cmd_ctx();
+    const bool resume_recording = ctx.recording;
+    if (ctx.recording && ctx.command_count != 0 && !submit_and_wait()) return 0;
+    if (!ctx.recording && !begin_cmd()) return 0;
+
+    VkDescriptorBufferInfo score_bufs[4] = {
+        {sbuf, soff, (VkDeviceSize)score_bytes},
+        {qbuf, qoff, (VkDeviceSize)q_bytes},
+        {wbuf, woff, (VkDeviceSize)weight_bytes},
+        {kbuf, koff, (VkDeviceSize)index_bytes},
+    };
+    struct {
+        uint32_t n_comp, n_tokens, pos0, n_head, head_dim, ratio, causal;
+        float scale;
+    } score_pc = {n_comp, n_tokens, pos0, n_head, head_dim, ratio, 1u, scale};
+    DS4_VK_TRACE_KERNEL("indexer_scores_decode_wave64");
+    if (!record_simple_shader("indexer_scores_decode_wave64", &score_pc,
+                              sizeof(score_pc), score_bufs, 4,
+                              score_groups, 1, 1, true)) return 0;
+
+    int ok = 0;
+    if (n_comp <= 4096u) {
+        VkDescriptorBufferInfo topk_bufs[2] = {
+            {obuf, ooff, (VkDeviceSize)selected_bytes},
+            {sbuf, soff, (VkDeviceSize)score_bytes},
+        };
+        struct { uint32_t n_comp, n_tokens, top_k; } topk_pc = {
+            n_comp, 1u, top_k};
+        DS4_VK_TRACE_KERNEL("indexer_topk_wave64");
+        ok = record_simple_shader("indexer_topk_wave64", &topk_pc,
+                                  sizeof(topk_pc), topk_bufs, 2,
+                                  1, 1, 1, resume_recording);
+    } else {
+        VkDescriptorBufferInfo tile_bufs[2] = {
+            {cbuf, coff, (VkDeviceSize)candidate_bytes},
+            {sbuf, soff, (VkDeviceSize)score_bytes},
+        };
+        struct { uint32_t n_comp, tile_count, top_k; } tile_pc = {
+            n_comp, tile_count, top_k};
+        DS4_VK_TRACE_KERNEL("indexer_topk_tile_wave64");
+        if (!record_simple_shader("indexer_topk_tile_wave64", &tile_pc,
+                                  sizeof(tile_pc), tile_bufs, 2,
+                                  tile_count, 1, 1, true)) return 0;
+
+        VkDescriptorBufferInfo merge_bufs[2] = {
+            {obuf, ooff, (VkDeviceSize)selected_bytes},
+            {cbuf, coff, (VkDeviceSize)candidate_bytes},
+        };
+        struct { uint32_t candidate_count, top_k; } merge_pc = {
+            candidate_count, top_k};
+        DS4_VK_TRACE_KERNEL("indexer_topk_merge_wave64");
+        ok = record_simple_shader("indexer_topk_merge_wave64", &merge_pc,
+                                  sizeof(merge_pc), merge_bufs, 2,
+                                  1, 1, 1, resume_recording);
+    }
+    if (ok) g_indexer_select_decode_wave64_used = true;
+    return ok;
 }
 
 int ds4_gpu_indexer_topk_tensor(

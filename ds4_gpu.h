@@ -508,6 +508,23 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+int ds4_gpu_indexer_select_decode_wave64_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        ds4_gpu_tensor       *candidate_scratch,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                top_k,
+        float                   scale);
+int ds4_gpu_indexer_select_decode_wave64_used(void);
+
 int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         const ds4_gpu_tensor *logits_row,
                                         const void *model_map,
@@ -813,6 +830,8 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+int ds4_gpu_q8_wave64_unpack_used(void);
+int ds4_gpu_matmul_f16_unpack_used(void);
 
 /* CUDA batch path: fold an input RMS normalization into the FP16 activation
  * conversion used by the following projection. Returns 0 without touching
@@ -2196,6 +2215,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
         uint64_t                rank,
         uint32_t                n_groups,
         const ds4_gpu_tensor *heads);
+int ds4_gpu_q8_group_wave64_rows8_used(void);
 int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

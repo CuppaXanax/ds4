@@ -3013,6 +3013,17 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     return true;
 }
 
+static bool accelerator_tensor_name_contains(const ds4_tensor *t,
+                                             const char *needle) {
+    if (!t || !needle) return false;
+    const size_t needle_len = strlen(needle);
+    if (needle_len == 0 || t->name.len < needle_len) return false;
+    for (size_t i = 0; i + needle_len <= t->name.len; i++) {
+        if (memcmp(t->name.ptr + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
 static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
                                          const uint64_t *span_offsets,
                                          const uint64_t *span_sizes,
@@ -3033,6 +3044,65 @@ static DS4_MAYBE_UNUSED bool accelerator_cache_q8_tensors(const ds4_model *m,
                     (int)t->name.len, t->name.ptr);
             return false;
         }
+#ifdef DS4_VULKAN_BUILD
+        if (t->type == DS4_TENSOR_IQ2_XXS && t->ndim == 3 &&
+            (accelerator_tensor_name_contains(t, "ffn_gate_exps") ||
+             accelerator_tensor_name_contains(t, "ffn_up_exps"))) {
+            if (t->dim[1] == 0 || t->dim[2] == 0 ||
+                t->dim[2] > UINT64_MAX / t->dim[1] ||
+                ds4_gpu_cache_iq2_expert_range(
+                    m->map, m->size, t->abs_offset, t->bytes,
+                    t->dim[0], t->dim[1] * t->dim[2], label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to cache routed IQ2 tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+        }
+#endif
+    }
+    return true;
+}
+
+static DS4_MAYBE_UNUSED bool accelerator_cache_q2_down_tensors(
+        const ds4_model *m, const uint64_t *span_offsets,
+        const uint64_t *span_sizes, uint32_t span_count) {
+    static const char suffix[] = "ffn_down_exps.weight";
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->type != DS4_TENSOR_Q2_K || t->ndim != 3 || t->bytes == 0 ||
+            t->dim[0] == 0 || t->dim[1] == 0 || t->dim[2] == 0 ||
+            !accelerator_span_filter_contains(t->abs_offset, t->bytes,
+                                              span_offsets, span_sizes, span_count))
+            continue;
+        bool is_down = false;
+        for (uint64_t j = 0; j + sizeof(suffix) - 1u <= t->name.len; j++) {
+            if (memcmp(t->name.ptr + j, suffix, sizeof(suffix) - 1u) == 0) {
+                is_down = true;
+                break;
+            }
+        }
+        if (!is_down || t->dim[0] % 256u != 0 ||
+            t->dim[2] > UINT64_MAX / t->dim[1])
+            continue;
+        const uint64_t total_rows = t->dim[1] * t->dim[2];
+        const uint64_t source_bytes = (t->dim[0] / 256u) * 84u;
+        if (total_rows > UINT64_MAX / source_bytes ||
+            total_rows * source_bytes != t->bytes)
+            continue;
+        char label[128];
+        snprintf(label, sizeof(label), "q2-execution:%.*s",
+                 (int)t->name.len, t->name.ptr);
+        if (!ds4_gpu_cache_q2_execution_range(
+                m->map, m->size, t->abs_offset, t->bytes,
+                t->dim[0], total_rows, label)) {
+            if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION")) {
+                fprintf(stderr, "ds4: required Q2 execution artifact failed for %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            fprintf(stderr, "ds4: Q2 execution artifact unavailable for %.*s; raw fallback\n",
+                    (int)t->name.len, t->name.ptr);
+        }
     }
     return true;
 }
@@ -3051,6 +3121,10 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
         return false;
     }
     if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    if (!accelerator_cache_q2_down_tensors(m, span_offsets, span_sizes, span_count)) return false;
+#ifdef DS4_VULKAN_BUILD
+    ds4_gpu_execution_artifact_report();
+#endif
     fprintf(stderr,
             "ds4: Vulkan startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             (double)prepared / 1073741824.0, now_sec() - t0);
@@ -24909,7 +24983,43 @@ static bool metal_graph_encode_decode_layer_phase(
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     }
 #endif
-    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+    bool routed_shared_hc_fused = false;
+    const bool routed_shared_hc_candidate =
+        phase == METAL_DECODE_LAYER_FULL &&
+        shared_gate_up_prelaunched && fuse_shared_down_hc &&
+        getenv("DS4_VULKAN_ROUTED_Q2_SHARED_HC_FUSE") != NULL &&
+        getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE") != NULL &&
+        !g->quality && !g->cuda_tp_moe && !g->cuda_tp_shared &&
+        !metal_graph_directional_steering_ffn_enabled(g) &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+        DS4_N_EXPERT == 256u && DS4_N_EXPERT_USED == 6u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        routed_out_dim == 4096u && shared_dim == 2048u;
+    if (ok && !tp_fold_ffn && !cuda_tp_moe && routed_shared_hc_candidate) {
+        ok = ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
+                metal_graph_after_ffn_hc(g), metal_graph_routed_out(g),
+                metal_graph_routed_gate(g), metal_graph_routed_up(g),
+                metal_graph_routed_mid(g), metal_graph_routed_down(g),
+                model->map, model->size,
+                layer->ffn_gate_exps->abs_offset,
+                layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                (uint32_t)expert_in_dim, (uint32_t)down_in_dim,
+                (uint32_t)routed_out_dim,
+                metal_graph_router_selected(g), metal_graph_router_weights(g),
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
+                metal_graph_ffn_norm(g),
+                layer->ffn_down_shexp->abs_offset,
+                (uint32_t)shared_dim, DS4_N_EMBD,
+                metal_graph_shared_mid(g), metal_graph_after_attn_hc(g),
+                metal_graph_hc_split(g), DS4_N_EMBD, DS4_N_HC, il, false) != 0;
+        routed_shared_hc_fused = ok;
+    } else if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
                                                  metal_graph_routed_mid(g),
@@ -25139,7 +25249,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
-    } else if (ok && fuse_shared_down_hc) {
+    } else if (ok && fuse_shared_down_hc && !routed_shared_hc_fused) {
         if (cuda_tp_moe_peer_tmp) {
             ok = ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
                     metal_graph_after_ffn_hc(g),
@@ -25267,7 +25377,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                         metal_graph_hc_comb(g),
                                         DS4_N_EMBD,
                                         DS4_N_HC) != 0;
-    } else if (ok && !cuda_tp_shared_fold && !fuse_shared_down_hc) {
+    } else if (ok && !cuda_tp_shared_fold && !fuse_shared_down_hc &&
+               !routed_shared_hc_fused) {
         ok = ds4_gpu_hc_expand_add_split_tensor(metal_graph_after_ffn_hc(g),
                                                   tp_ffn_a ? tp_ffn_a : metal_graph_routed_out(g),
                                                   tp_ffn_a ? tp_ffn_b :
@@ -59916,6 +60027,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
+#ifdef DS4_VULKAN_BUILD
+        bool worker_slice_scope = false;
+#endif
         if (g->ssd_streaming) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
@@ -59947,6 +60061,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
         } else {
+#ifdef DS4_VULKAN_BUILD
+            const bool use_worker_slice_scope =
+                split_after_layers == 0 &&
+                getenv("DS4_VULKAN_TIMELINE_LAYER") == NULL &&
+                g->placement == NULL && g->tp_world < 2 &&
+                !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
+            if (ok && use_worker_slice_scope) {
+                worker_slice_scope =
+                    ds4_gpu_batch_slice_begin(layer_start, layer_end) != 0;
+                ok = worker_slice_scope;
+            }
+#endif
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
                 ok = metal_graph_encode_decode_layer(g,
                                                      &e->model,
@@ -59973,6 +60099,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             if (ok && output_logits) {
                 ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
             }
+#ifdef DS4_VULKAN_BUILD
+            if (worker_slice_scope) {
+                if (ok) ok = ds4_gpu_batch_slice_end(layer_start, layer_end) != 0;
+                else (void)ds4_gpu_batch_slice_end(layer_start, layer_end);
+                worker_slice_scope = false;
+            } else
+#endif
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
         if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
@@ -60028,6 +60161,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         layer_start == 0 &&
         (metal_graph_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens) ||
          metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(g, &e->weights, n_tokens));
+#ifdef DS4_VULKAN_BUILD
+    bool worker_slice_scope = false;
+#endif
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             g->streaming_static_decode_map_current = false;
@@ -60052,6 +60188,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+#ifdef DS4_VULKAN_BUILD
+        if (ok) {
+            const bool use_worker_slice_scope =
+                !g->quality && g->placement == NULL && g->tp_world < 2 &&
+                !g->cuda_tp_decode && !g->cuda_tp_moe && !g->cuda_tp_shared;
+            if (use_worker_slice_scope) {
+                worker_slice_scope =
+                    ds4_gpu_batch_slice_begin(layer_start, layer_end) != 0;
+                ok = worker_slice_scope;
+            }
+        }
+#endif
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             ok = metal_graph_encode_layer_batch(g,
                                                 &e->model,
@@ -60077,7 +60225,16 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             g->cur_hc_by_tier[src_tier] = saved_cur;
         }
     }
-    if (ok && !g->ssd_streaming) ok = ds4_gpu_end_commands() != 0;
+#ifdef DS4_VULKAN_BUILD
+    if (worker_slice_scope) {
+        if (ok) ok = ds4_gpu_batch_slice_end(layer_start, layer_end) != 0;
+        else (void)ds4_gpu_batch_slice_end(layer_start, layer_end);
+        worker_slice_scope = false;
+    } else
+#endif
+    if (ok && !g->ssd_streaming) {
+        ok = ds4_gpu_end_commands() != 0;
+    }
     if (saved_cur) g->cur_hc_by_tier[src_tier] = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 

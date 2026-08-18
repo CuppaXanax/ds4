@@ -3,6 +3,9 @@
 #ifndef DS4_ROUTED_WAVE64
 #define DS4_ROUTED_WAVE64 0
 #endif
+#ifndef DS4_EXECUTION_ARTIFACT_IQ2
+#define DS4_EXECUTION_ARTIFACT_IQ2 0
+#endif
 #if DS4_ROUTED_WAVE64
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
@@ -15,12 +18,23 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
+#if DS4_EXECUTION_ARTIFACT_IQ2
+layout(set = 0, binding = 1) readonly buffer GateScale { uint gate_scale_buf[]; };
+layout(set = 0, binding = 2) readonly buffer GatePayload { uint gate_payload_buf[]; };
+layout(set = 0, binding = 3) readonly buffer UpScale { uint up_scale_buf[]; };
+layout(set = 0, binding = 4) readonly buffer UpPayload { uint up_payload_buf[]; };
+layout(set = 0, binding = 5) readonly buffer B3 { uint b3[]; };
+layout(set = 0, binding = 6) buffer B4 { uint b4[]; };
+layout(set = 0, binding = 7) readonly buffer B5 { uint b5[]; };
+layout(set = 0, binding = 8) readonly buffer B6 { uint b6[]; };
+#else
 layout(set = 0, binding = 1) readonly buffer B1 { uint b1[]; };
 layout(set = 0, binding = 2) readonly buffer B2 { uint b2[]; };
 layout(set = 0, binding = 3) readonly buffer B3 { uint b3[]; };
 layout(set = 0, binding = 4) buffer B4 { uint b4[]; };
 layout(set = 0, binding = 5) readonly buffer B5 { uint b5[]; };
 layout(set = 0, binding = 6) readonly buffer B6 { uint b6[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint mode;
@@ -53,6 +67,7 @@ shared uint iq2_lut[544];
 shared uint q8_cache[1168]; /* 16 Q8_K blocks x 73 words */
 #endif
 
+#if !DS4_EXECUTION_ARTIFACT_IQ2
 uint weight_u32(uint byte_idx) {
     uint word_idx = byte_idx >> 2u;
     uint shift = (byte_idx & 3u) * 8u;
@@ -68,6 +83,39 @@ uint up_weight_u32(uint byte_idx) {
     if (shift == 0u) return lo;
     return (lo >> shift) | (b2[word_idx + 1u] << (32u - shift));
 }
+#endif
+
+#if DS4_EXECUTION_ARTIFACT_IQ2
+uint gate_artifact_u32(uint entry, uint byte_idx) {
+    uint byte = entry * 64u + byte_idx;
+    uint word = byte >> 2u;
+    uint shift = (byte & 3u) * 8u;
+    uint lo = gate_payload_buf[word];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (gate_payload_buf[word + 1u] << (32u - shift));
+}
+
+uint up_artifact_u32(uint entry, uint byte_idx) {
+    uint byte = entry * 64u + byte_idx;
+    uint word = byte >> 2u;
+    uint shift = (byte & 3u) * 8u;
+    uint lo = up_payload_buf[word];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (up_payload_buf[word + 1u] << (32u - shift));
+}
+
+uint gate_artifact_scale(uint entry) {
+    uint byte = entry * 2u;
+    uint word = gate_scale_buf[byte >> 2u];
+    return (word >> ((byte & 3u) * 8u)) & 0xffffu;
+}
+
+uint up_artifact_scale(uint entry) {
+    uint byte = entry * 2u;
+    uint word = up_scale_buf[byte >> 2u];
+    return (word >> ((byte & 3u) * 8u)) & 0xffffu;
+}
+#endif
 
 int packed_i8(uint word, uint byte_idx) {
     return bitfieldExtract(int(word), int((byte_idx & 3u) * 8u), 8);
@@ -89,23 +137,44 @@ uint iq2_sign_mask(uint index) {
 
 void iq2_block_dot_pair(uint row_byte, uint input_token, uint input_blocks,
                         uint block, out float gate, out float up) {
+#if DS4_EXECUTION_ARTIFACT_IQ2
+    uint global_row = row_byte;
+    uint artifact_tile = global_row >> 2u;
+    uint row_in_tile = global_row & 3u;
+    uint entry = ((artifact_tile * (pc.in_dim / 256u) + block) * 4u) + row_in_tile;
+#else
     uint wb = row_byte + block * 66u;
+#endif
     uint xb = (input_token * input_blocks + block) * 73u;
 #if DS4_ROUTED_WAVE64
     float input_scale = uintBitsToFloat(q8_cache[block * 73u]);
 #else
     float input_scale = uintBitsToFloat(b0[xb]);
 #endif
-    float gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
-    float up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
+    float gate_scale;
+    float up_scale;
+#if DS4_EXECUTION_ARTIFACT_IQ2
+    gate_scale = input_scale * f16(gate_artifact_scale(entry));
+    up_scale = input_scale * f16(up_artifact_scale(entry));
+#else
+    gate_scale = input_scale * f16(weight_u32(wb) & 0xffffu);
+    up_scale = input_scale * f16(up_weight_u32(wb) & 0xffffu);
+#endif
     int gate_sum = 0;
     int up_sum = 0;
     for (uint ib = 0u; ib < 8u; ++ib) {
+#if DS4_EXECUTION_ARTIFACT_IQ2
+        uint gate_q = gate_artifact_u32(entry, ib * 8u);
+        uint gate_aux = gate_artifact_u32(entry, ib * 8u + 4u);
+        uint up_q = up_artifact_u32(entry, ib * 8u);
+        uint up_aux = up_artifact_u32(entry, ib * 8u + 4u);
+#else
         uint qbase = wb + 2u + ib * 8u;
         uint gate_q = weight_u32(qbase);
         uint gate_aux = weight_u32(qbase + 4u);
         uint up_q = up_weight_u32(qbase);
         uint up_aux = up_weight_u32(qbase + 4u);
+#endif
         int gate_ls = int(2u * (gate_aux >> 28u) + 1u);
         int up_ls = int(2u * (up_aux >> 28u) + 1u);
         for (uint pair = 0u; pair < 2u; ++pair) {
@@ -285,10 +354,20 @@ void main() {
         float gate_partial = 0.0;
         float up_partial = 0.0;
         if (expert < pc.n_total_expert) {
+#if DS4_EXECUTION_ARTIFACT_IQ2
+            uint row_arg = expert * pc.mid_dim + row;
+#else
             uint row_byte = expert * pc.gate_expert_bytes +
                             row * pc.gate_row_bytes;
+#endif
             float gate_block, up_block;
-            iq2_block_dot_pair(row_byte, token, pc.q8_blocks, lane,
+            iq2_block_dot_pair(
+#if DS4_EXECUTION_ARTIFACT_IQ2
+                               row_arg,
+#else
+                               row_byte,
+#endif
+                               token, pc.q8_blocks, lane,
                                gate_block, up_block);
             gate_partial += gate_block;
             up_partial += up_block;

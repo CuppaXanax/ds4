@@ -18,6 +18,7 @@
 #include "../ds4_gpu.h"
 #include "../ds4_vulkan.h"
 #include "q8_aligned_artifact.h"
+#include "execution_artifact.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -40,6 +41,40 @@
 struct RoutedTimestamp {
     const char *stage = nullptr;
     uint32_t first_query = 0;
+};
+
+/* Descriptor sets are immutable after binding into a command buffer.  Keep a
+ * small exact-key cache for the current recording generation, then recycle
+ * completed sets by descriptor-set layout.  The generation boundary matters:
+ * a cached set is never rewritten while an earlier command buffer can still
+ * reference it. */
+struct DescriptorCacheKey {
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    std::vector<VkDescriptorBufferInfo> buffers;
+
+    bool operator==(const DescriptorCacheKey &other) const {
+        if (layout != other.layout || buffers.size() != other.buffers.size())
+            return false;
+        for (size_t i = 0; i < buffers.size(); i++) {
+            const auto &a = buffers[i];
+            const auto &b = other.buffers[i];
+            if (a.buffer != b.buffer || a.offset != b.offset || a.range != b.range)
+                return false;
+        }
+        return true;
+    }
+};
+
+struct DescriptorCacheKeyHash {
+    size_t operator()(const DescriptorCacheKey &key) const {
+        size_t h = std::hash<VkDescriptorSetLayout>{}(key.layout);
+        for (const auto &buffer : key.buffers) {
+            h ^= std::hash<VkBuffer>{}(buffer.buffer) + (h << 6) + (h >> 2);
+            h ^= std::hash<VkDeviceSize>{}(buffer.offset) + (h << 6) + (h >> 2);
+            h ^= std::hash<VkDeviceSize>{}(buffer.range) + (h << 6) + (h >> 2);
+        }
+        return h;
+    }
 };
 
 enum class TimelineEventKind : uint8_t {
@@ -76,6 +111,19 @@ struct TimelineEvent {
     uint32_t count = 0;
 };
 
+/* Per-command-buffer storage hazards.  The old backend put a global
+ * compute->compute barrier after every dispatch.  Keep the access footprint
+ * of each recorded dispatch instead, and insert a range barrier only when a
+ * later dispatch overlaps an earlier write (RAW/WAR/WAW).  A range is tied
+ * to its VkBuffer and views naturally share that handle; allocation aliases
+ * are treated conservatively as a global dependency (see below). */
+struct HazardAccess {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    bool write = false;
+};
+
 static constexpr uint32_t DS4_VK_COMMAND_RING_SIZE = 4;
 static constexpr uint32_t DS4_VK_TIMELINE_QUERY_COUNT = 2048;
 static constexpr uint64_t DS4_VK_TIMELINE_MAX_DISPATCHES =
@@ -101,6 +149,13 @@ struct VulkanCommandCtx {
     uint32_t slot_timestamp_counts[DS4_VK_COMMAND_RING_SIZE] = {};
     std::vector<RoutedTimestamp> slot_routed_timestamps[DS4_VK_COMMAND_RING_SIZE];
     std::vector<VkDescriptorSet> slot_descriptors[DS4_VK_COMMAND_RING_SIZE];
+    std::unordered_map<DescriptorCacheKey, VkDescriptorSet,
+                       DescriptorCacheKeyHash> recording_descriptors;
+    std::unordered_map<DescriptorCacheKey, VkDescriptorSet,
+                       DescriptorCacheKeyHash> persistent_descriptors;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>
+        reusable_descriptors;
+    std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout> descriptor_layouts;
     std::vector<ds4_gpu_tensor *> slot_tensors[DS4_VK_COMMAND_RING_SIZE];
     std::vector<void *> slot_in_place_ptrs[DS4_VK_COMMAND_RING_SIZE];
     uint32_t cmd_rot_idx = 0;
@@ -127,6 +182,19 @@ struct VulkanCommandCtx {
     uint64_t layer_timeline_stop_ns = 0;
     size_t layer_timeline_stage_cursor = 0;
     bool layer_batch_active = false;
+    bool slice_batch_active = false;
+    uint32_t slice_active_layer = UINT32_MAX;
+    uint32_t slice_scratch_cursor = 0;
+    struct SliceScratchLease {
+        ds4_gpu_tensor *owner = nullptr;
+        uint64_t bytes = 0;
+        bool device_local = false;
+    };
+    std::unordered_map<uint64_t, SliceScratchLease> slice_scratch_leases;
+    std::vector<HazardAccess> hazard_accesses;
+    uint64_t hazard_barriers_emitted = 0;
+    uint64_t hazard_barriers_elided = 0;
+    uint64_t hazard_unknown_dispatches = 0;
     std::vector<VkDescriptorSet> layer_batch_descriptors;
     std::vector<ds4_gpu_tensor *> layer_batch_tensors;
     std::vector<void *> layer_batch_in_place_ptrs;
@@ -177,6 +245,8 @@ struct TensorHeader {
     fprintf(stderr, "ds4: VULKAN error %d at %s:%d\n", _r, __FILE__, __LINE__); return; } } while(0)
 
 /* Global state */
+enum ExecutionArtifactKind : uint32_t { ExecQ8 = 0, ExecIQ2 = 1, ExecQ2 = 2 };
+
 static struct {
     VkInstance          instance       = VK_NULL_HANDLE;
     VkPhysicalDevice    phys_device    = VK_NULL_HANDLE;
@@ -228,11 +298,41 @@ static struct {
         uint64_t payload_bytes = 0;
         WeightCacheEntry gpu;
     };
+    struct ExecutionArtifactEntry {
+        ds4_vulkan_execution_arena_entry arena_entry{};
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        uint64_t source_offset = 0;
+        uint64_t source_bytes = 0;
+        uint64_t plane_offset[3] = {};
+        uint64_t plane_bytes[3] = {};
+        uint32_t plane_element_bytes[3] = {};
+        uint32_t plane_count = 0;
+        uint32_t block_elements = 0;
+        uint32_t source_blocks_per_tile = 0;
+    };
+    std::unordered_map<uint64_t, ExecutionArtifactEntry> execution_artifacts;
+    struct ExecutionArtifactStats {
+        uint64_t cache_calls = 0;
+        uint64_t artifact_hits = 0;
+        uint64_t dispatches = 0;
+        uint64_t dispatch_hits = 0;
+        uint64_t dispatch_fallbacks = 0;
+        uint64_t fallbacks = 0;
+        uint64_t unsupported = 0;
+        uint64_t failures = 0;
+    } execution_artifact_stats[3];
+    struct ExecutionCoverageShape {
+        uint64_t dispatches = 0;
+        uint64_t artifact_hits = 0;
+        uint64_t fallbacks = 0;
+    };
+    std::unordered_map<uint64_t, ExecutionCoverageShape> q8_execution_coverage;
     std::unordered_map<uint64_t, WeightCacheEntry> weight_cache;
     std::unordered_map<uint64_t, AlignedWeightEntry> aligned_cache; /* source offset -> artifact */
     /* Model tensor ranges registered by cache_model_range (metadata only). */
     std::unordered_map<uint64_t, uint64_t> range_registry; /* offset -> bytes */
-    uint64_t weight_budget = 40ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
+    uint64_t weight_budget = 11ull * 1024 * 1024 * 1024;   /* bytes; DS4_VULKAN_WEIGHT_BUDGET_GB overrides */
     uint64_t weight_used = 0;
     uint64_t lru_counter = 0;
     uint64_t cmd_gen = 0;   /* incremented each begin_cmd; guards in-flight eviction */
@@ -254,6 +354,198 @@ static struct {
     uint32_t            timestamp_valid_bits = 0;
     bool                initialized    = false;
 } g_vk;
+
+static void execution_arena_clear(void);
+static void timeline_barrier(VulkanCommandCtx &ctx, const char *name);
+
+static bool hazard_tracker_enabled(const VulkanCommandCtx &ctx) {
+    const char *env = getenv("DS4_VULKAN_HAZARD_TRACKER");
+    /* Allocation aliases are conservatively recognized when VMA owns both
+     * handles. The model-wide external buffer is read-only, and all views of
+     * it share one VkBuffer handle, so range overlap remains explicit. */
+    /* The complete GFX1013 suite passed with tracking enabled. Make it the
+     * bounded worker-slice contract while retaining an explicit kill switch
+     * and the legacy layer/unbatched path. A slice is the only scope large
+     * enough for barrier elimination to address the orchestration budget. */
+    if (env && strcmp(env, "0") == 0) return false;
+    if ((!env || strcmp(env, "1") != 0) && !ctx.slice_batch_active)
+        return false;
+    /* Keep the optimization scoped to the bounded worker/layer graph.  The
+     * legacy path remains unchanged outside an explicit lifetime scope. */
+    return ctx.layer_batch_active || ctx.slice_batch_active;
+}
+
+static uint64_t hazard_all_bindings(uint32_t count) {
+    return count >= 64 ? UINT64_MAX : (count == 0 ? 0 : (1ull << count) - 1ull);
+}
+
+/* Writable storage bindings, derived from the source shader interfaces.  A
+ * missing entry is deliberately conservative: treating every binding as a
+ * write can only retain a barrier, never make a dependency unsafe. */
+static uint64_t hazard_write_mask(const char *name, uint32_t count,
+                                  bool &known) {
+    known = true;
+    const uint64_t all = hazard_all_bindings(count);
+    if (!name || !name[0]) { known = false; return all; }
+    if (!strncmp(name, "routed_moe", 10)) {
+        /* Routed dispatches already carry explicit input/output range
+         * barriers, including host-produced selected IDs. */
+        return 0;
+    }
+    if (!strncmp(name, "attention", 9) ||
+        !strncmp(name, "indexer_scores", 14) ||
+        !strncmp(name, "indexer_topk", 12) ||
+        !strcmp(name, "indexer_qat") || !strcmp(name, "topk_mask"))
+        return 1ull;
+    if (!strcmp(name, "router_select")) return all & 7ull;
+    if (!strcmp(name, "group_copy")) return 1ull << 1;
+    if (!strcmp(name, "add_f32")) return 1ull << 2;
+    if (!strcmp(name, "swiglu")) return 1ull << 2;
+    if (!strcmp(name, "quantize_q8_0_prequant")) return 1ull << 1;
+    if (!strcmp(name, "fill_f32") || !strcmp(name, "fp8_kv_quantize") ||
+        !strcmp(name, "compressor_rope_stride") ||
+        !strcmp(name, "head_rms_norm") ||
+        !strcmp(name, "head_rms_norm_rope_tail") ||
+        !strcmp(name, "rope_tail") || !strcmp(name, "store_raw_kv_f16"))
+        return 1ull;
+    if (!strcmp(name, "compressor_clear") ||
+        !strcmp(name, "compressor_shift_ratio4")) return all;
+    if (!strcmp(name, "compressor_pool") ||
+        !strcmp(name, "compressor_pool_state") ||
+        !strcmp(name, "hc_expand") || !strcmp(name, "hc_weighted_sum") ||
+        !strcmp(name, "output_hc_weights")) return 1ull;
+    if (!strcmp(name, "compressor_set_rows") ||
+        !strcmp(name, "compressor_store") ||
+        !strcmp(name, "hc_split_weighted_sum")) return all & 7ull;
+    if (!strncmp(name, "matmul_q8_0_hc_expand_rows2", 27))
+        return all & ((1ull << 3) | (1ull << 4));
+    if (!strncmp(name, "matmul", 6) ||
+        !strncmp(name, "rms_norm", 8))
+        return count ? 1ull << (count - 1) : 0;
+    /* These are the only shader names not covered by the patterns above in
+     * the current generated shader table.  Keep future additions safe. */
+    known = false;
+    return all;
+}
+
+static VmaAllocation hazard_allocation_for_buffer(VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    for (const auto &[_, header] : g_vk.tensor_headers)
+        if (header && header->buffer == buffer) return header->allocation;
+    for (const auto &[_, value] : g_vk.weight_cache)
+        if (value.buffer == buffer) return value.allocation;
+    for (const auto &[_, value] : g_vk.aligned_cache)
+        if (value.gpu.buffer == buffer) return value.gpu.allocation;
+    for (const auto &[_, value] : g_vk.execution_artifacts)
+        if (value.buffer == buffer) return value.allocation;
+    return VK_NULL_HANDLE;
+}
+
+static bool hazard_buffers_alias(VkBuffer left, VkBuffer right) {
+    if (left == right) return true;
+    const VmaAllocation la = hazard_allocation_for_buffer(left);
+    const VmaAllocation ra = hazard_allocation_for_buffer(right);
+    /* Distinct buffers sharing an allocation are an alias even when their
+     * VkBuffer handles differ.  We conservatively consider the full
+     * allocation overlapping because VMA does not expose a stable per-view
+     * base offset through this ABI. */
+    return la != VK_NULL_HANDLE && la == ra;
+}
+
+static bool hazard_ranges_overlap(const HazardAccess &old_access,
+                                  const VkDescriptorBufferInfo &current) {
+    if (!hazard_buffers_alias(old_access.buffer, current.buffer)) return false;
+    if (old_access.buffer != current.buffer) return true;
+    if (old_access.size == VK_WHOLE_SIZE || current.range == VK_WHOLE_SIZE)
+        return true;
+    if (old_access.offset > UINT64_MAX - old_access.size ||
+        current.offset > UINT64_MAX - current.range) return true;
+    const uint64_t old_end = (uint64_t)old_access.offset + old_access.size;
+    const uint64_t current_end = (uint64_t)current.offset + current.range;
+    return (uint64_t)old_access.offset < current_end &&
+           (uint64_t)current.offset < old_end;
+}
+
+static void hazard_dependency(VulkanCommandCtx &ctx, const char *name,
+                              VkDescriptorBufferInfo *buffers, uint32_t count) {
+    if (!hazard_tracker_enabled(ctx)) return;
+    bool known = false;
+    const uint64_t writes = hazard_write_mask(name, count, known);
+    if (!known) ctx.hazard_unknown_dispatches++;
+    bool needs_barrier = false;
+    bool alias_barrier = false;
+    for (uint32_t i = 0; i < count; i++) {
+        const bool current_write = (writes & (1ull << i)) != 0;
+        for (const HazardAccess &old_access : ctx.hazard_accesses) {
+            if (!hazard_ranges_overlap(old_access, buffers[i])) continue;
+            if (old_access.write && (current_write || !current_write)) {
+                needs_barrier = true;
+                alias_barrier |= old_access.buffer != buffers[i].buffer;
+            } else if (current_write && !old_access.write) {
+                needs_barrier = true;
+                alias_barrier |= old_access.buffer != buffers[i].buffer;
+            }
+        }
+    }
+    if (!needs_barrier) {
+        ctx.hazard_barriers_elided++;
+        return;
+    }
+
+    std::vector<VkBufferMemoryBarrier> barriers;
+    bool global = alias_barrier;
+    for (uint32_t i = 0; i < count && !global; i++) {
+        const bool current_write = (writes & (1ull << i)) != 0;
+        VkAccessFlags src = 0, dst = current_write
+            ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+        for (const HazardAccess &old_access : ctx.hazard_accesses) {
+            if (!hazard_ranges_overlap(old_access, buffers[i])) continue;
+            if (!old_access.write && !current_write) continue;
+            src |= old_access.write ? VK_ACCESS_SHADER_WRITE_BIT
+                                    : VK_ACCESS_SHADER_READ_BIT;
+        }
+        if (src == 0) continue;
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = src;
+        barrier.dstAccessMask = dst;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffers[i].buffer;
+        barrier.offset = buffers[i].offset;
+        barrier.size = buffers[i].range;
+        barriers.push_back(barrier);
+    }
+    timeline_barrier(ctx, "resource_hazard_dependency");
+    if (global || barriers.empty()) {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &barrier, 0, nullptr, 0, nullptr);
+    } else {
+        vkCmdPipelineBarrier(ctx.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                             nullptr, (uint32_t)barriers.size(), barriers.data(),
+                             0, nullptr);
+    }
+    ctx.hazard_barriers_emitted++;
+}
+
+static void hazard_record(VulkanCommandCtx &ctx, const char *name,
+                          VkDescriptorBufferInfo *buffers, uint32_t count) {
+    if (!hazard_tracker_enabled(ctx)) return;
+    bool known = false;
+    const uint64_t writes = hazard_write_mask(name, count, known);
+    for (uint32_t i = 0; i < count; i++)
+        ctx.hazard_accesses.push_back({buffers[i].buffer, buffers[i].offset,
+                                       buffers[i].range,
+                                       (writes & (1ull << i)) != 0});
+}
 
 const char *ds4_vulkan_gpu_name = "unknown";
 const char *ds4_vulkan_driver_version = "unknown";
@@ -447,7 +739,11 @@ static int load_spirv(const std::string &path, std::vector<uint32_t> &out) {
 }
 
 static int create_compute_pipeline(ShaderEntry &entry) {
-    VkDescriptorSetLayoutBinding bindings[9] = {};
+    /* Several fused appliance kernels legitimately bind more than the old
+     * nine-slot helper ceiling (the mixed routed/shared HC tail has twelve).
+     * A fixed stack array silently overflowed here and crashed RADV while
+     * creating the layout, before model loading. */
+    std::vector<VkDescriptorSetLayoutBinding> bindings(entry.binding_count);
     for (uint32_t i = 0; i < entry.binding_count; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -456,7 +752,8 @@ static int create_compute_pipeline(ShaderEntry &entry) {
     }
     VkDescriptorSetLayoutCreateInfo dslci{};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = entry.binding_count; dslci.pBindings = bindings;
+    dslci.bindingCount = entry.binding_count;
+    dslci.pBindings = bindings.data();
     VK_CHECK_RAW(vkCreateDescriptorSetLayout(g_vk.device, &dslci, nullptr, &entry.desc_layout));
 
     VkPushConstantRange pr{};
@@ -489,11 +786,16 @@ static int load_all_shaders(void) {
         {"matmul_q8_0", 20, 6},  /* 5 x uint32: in_dim, out_dim, n_tok, blocks, y_scale */
         {"matmul_q8_0_aligned", 20, 4},
         {"matmul_q8_0_aligned_bfe", 20, 4},
+        {"matmul_q8_0_exec", 20, 4},
+        {"matmul_q8_0_exec_128", 20, 4},
+        {"matmul_q8_0_exec_wave64", 20, 4},
+        {"matmul_q8_0_exec_hc_expand_add_wave64", 20, 7},
         {"matmul_q8_0_wave64_bfe", 20, 4},
         {"matmul_q8_0_wave64_unpack_bfe", 20, 4},
         {"matmul_q8_0_rows2_bfe", 20, 4},
         {"matmul_q8_0_rows8_bfe", 20, 4},
         {"matmul_q8_0_hc_expand_rows2_bfe", 16, 7},
+        {"matmul_q8_0_hc_expand_add_rows2_bfe", 16, 7},
         {"matmul_q8_0_group_bfe", 20, 4},
         {"matmul_q8_0_group_rows_bfe", 20, 4},
         {"matmul_q8_0_group_wave64_rows8_bfe", 20, 4},
@@ -545,8 +847,12 @@ static int load_all_shaders(void) {
         {"routed_moe_fused", 68, 9}, /* fused IQ2 gate/up/SwiGLU */
         {"routed_moe_fused_mid", 68, 7}, /* exact fused IQ2/SwiGLU -> Q8 mid */
         {"routed_moe_fused_mid_wave64", 68, 7}, /* Wave64 fused mid */
+        {"routed_moe_fused_mid_exec", 68, 9}, /* IQ2 execution-artifact fused mid */
+        {"routed_moe_fused_mid_exec_wave64", 68, 9},
         {"routed_moe_down_reduce_q2", 68, 5}, /* exact Flash Q2 down+reduce */
         {"routed_moe_down_reduce_q2_wave64", 68, 5}, /* Wave64 Q2 down */
+        {"routed_moe_down_reduce_q2_exec", 68, 7}, /* Q2 execution artifact */
+        {"routed_moe_q2_shared_hc_exec", 68, 12}, /* bounded Q2+Q8+HC tail */
     };
     for (auto &l : list) {
         std::string path = std::string("vulkan/shaders/spv/") + l.name + ".spv";
@@ -862,6 +1168,7 @@ static void timeline_barrier(VulkanCommandCtx &ctx, const char *name) {
 static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
                               VkDescriptorBufferInfo *buffers, uint32_t count,
                               uint32_t x, uint32_t y, uint32_t z) {
+    hazard_dependency(ctx, name, buffers, count);
     const uint64_t dispatch_index = ctx.timeline_seen_dispatches++;
     const bool capture = ctx.timeline_enabled &&
         dispatch_index >= ctx.timeline_skip_dispatches &&
@@ -871,6 +1178,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
             ctx.timeline_captured_dispatches >= ctx.timeline_max_dispatches)
             timeline_dump(ctx);
         vkCmdDispatch(ctx.cmd, x, y, z);
+        hazard_record(ctx, name, buffers, count);
         return;
     }
     ctx.timeline_collecting = true;
@@ -891,6 +1199,7 @@ static void timeline_dispatch(VulkanCommandCtx &ctx, const char *name,
         }
     }
     vkCmdDispatch(ctx.cmd, x, y, z);
+    hazard_record(ctx, name, buffers, count);
     if (event) event->host_end_ns = timeline_now_ns();
     if (event && event->first_query != UINT32_MAX)
         vkCmdWriteTimestamp(ctx.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1011,16 +1320,67 @@ static void report_slot_timestamps(VulkanCommandCtx &ctx, uint32_t slot) {
 
 static bool release_tensor_header(TensorHeader *header);
 
+static bool persistent_descriptors_enabled(const VulkanCommandCtx &ctx) {
+    const char *env = getenv("DS4_VULKAN_PERSIST_DESCRIPTORS");
+    return ctx.slice_batch_active && (!env || strcmp(env, "0") != 0);
+}
+
+static void invalidate_persistent_descriptors_for_buffer(VkBuffer buffer) {
+    if (buffer == VK_NULL_HANDLE) return;
+    for (auto &[_, ctx] : g_vk.cmd_ctxs) {
+        for (auto it = ctx.persistent_descriptors.begin();
+             it != ctx.persistent_descriptors.end();) {
+            bool references = false;
+            for (const auto &info : it->first.buffers)
+                references |= info.buffer == buffer;
+            if (!references) {
+                ++it;
+                continue;
+            }
+            VkDescriptorSet set = it->second;
+            ctx.descriptor_layouts.erase(set);
+            (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+            it = ctx.persistent_descriptors.erase(it);
+        }
+    }
+}
+
+static void recycle_descriptor_set(VulkanCommandCtx &ctx, VkDescriptorSet set) {
+    if (set == VK_NULL_HANDLE) return;
+    auto it = ctx.descriptor_layouts.find(set);
+    if (it == ctx.descriptor_layouts.end()) {
+        /* A legacy caller may have allocated a set outside the common helper.
+         * Preserve the old behavior for that path rather than retaining an
+         * unkeyed set that cannot be safely reused. */
+        (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set);
+        return;
+    }
+    ctx.reusable_descriptors[it->second].push_back(set);
+}
+
+static bool descriptor_set_deferred(const VulkanCommandCtx &ctx,
+                                    VkDescriptorSet set) {
+    for (const auto &[_, cached] : ctx.persistent_descriptors)
+        if (cached == set) return true;
+    for (const auto &[_, cached] : ctx.recording_descriptors)
+        if (cached == set) return true;
+    for (uint32_t slot = 0; slot < DS4_VK_COMMAND_RING_SIZE; slot++)
+        for (VkDescriptorSet deferred : ctx.slot_descriptors[slot])
+            if (deferred == set) return true;
+    for (VkDescriptorSet deferred : ctx.layer_batch_descriptors)
+        if (deferred == set) return true;
+    for (VkDescriptorSet deferred : ctx.attention_output_descriptors)
+        if (deferred == set) return true;
+    return false;
+}
+
 static int retire_slot_resources(VulkanCommandCtx &ctx, uint32_t slot) {
     int ok = 1;
     const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.slot_descriptors[slot]) {
-        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
-            ok = 0;
+        recycle_descriptor_set(ctx, set);
     }
-    if (!ctx.slot_descriptors[slot].empty())
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
+    (void)descriptor_start;
     for (ds4_gpu_tensor *tensor : ctx.slot_tensors[slot]) {
         if (!tensor) continue;
         if (tensor->owner && tensor->ptr) {
@@ -1130,6 +1490,10 @@ static int begin_cmd(void) {
     VK_CHECK_BOOL(vkBeginCommandBuffer(c.cmd, &bi));
     c.recording = true;
     c.command_count = 0;
+    c.hazard_accesses.clear();
+    c.hazard_barriers_emitted = 0;
+    c.hazard_barriers_elided = 0;
+    c.hazard_unknown_dispatches = 0;
     c.recording_generation = ++g_vk.cmd_gen;
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] begin_cmd rot=%u gen=%llu\n",
@@ -1146,10 +1510,23 @@ static int end_and_submit(void) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     if (!c.recording) return 1;
     if (c.command_count == 0) {
+        /* A validation failure can allocate a descriptor before recording a
+         * dispatch.  It was never submitted, so return it to the reusable
+         * pool instead of carrying a stale generation across begin_cmd. */
+        for (const auto &[_, set] : c.recording_descriptors)
+            recycle_descriptor_set(c, set);
+        c.recording_descriptors.clear();
         VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
         c.recording = false;
         return 1;
     }
+    if (getenv("DS4_VULKAN_TRACE_HAZARDS"))
+        fprintf(stderr, "ds4: VULKAN hazard_tracker emitted=%llu elided=%llu "
+                        "unknown=%llu accesses=%zu commands=%u\n",
+                (unsigned long long)c.hazard_barriers_emitted,
+                (unsigned long long)c.hazard_barriers_elided,
+                (unsigned long long)c.hazard_unknown_dispatches,
+                c.hazard_accesses.size(), c.command_count);
     if (getenv("DS4_VULKAN_DEBUG"))
         fprintf(stderr, "ds4: [dbg] end_and_submit cc=%u rot=%u gen=%llu\n",
                 (unsigned)c.command_count, c.cmd_rot_idx,
@@ -1162,6 +1539,10 @@ static int end_and_submit(void) {
     }
     timeline_duration_current(TimelineEventKind::HostFlush, "flush_live_tensors",
                               flush_start);
+    const uint32_t slot = c.cmd_rot_idx;
+    for (const auto &[_, set] : c.recording_descriptors)
+        c.slot_descriptors[slot].push_back(set);
+    c.recording_descriptors.clear();
     VK_CHECK_BOOL(vkEndCommandBuffer(c.cmd));
     c.recording = false;
     const uint64_t wait_value = c.last_submit_value;
@@ -1193,7 +1574,6 @@ static int end_and_submit(void) {
             event->count = c.command_count;
         }
     }
-    const uint32_t slot = c.cmd_rot_idx;
     c.last_submit_value = signal_value;
     c.slot_submit_values[slot] = signal_value;
     c.slot_generations[slot] = c.recording_generation;
@@ -1264,7 +1644,8 @@ static int defer_layer_batch_resources(VulkanCommandCtx &ctx) {
     return 1;
 }
 
-static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
+static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume,
+                                   bool force_wait = false) {
     std::lock_guard<std::recursive_mutex> lock(g_vk.cmd_mutex);
     const bool was_active = ctx.layer_batch_active;
     ctx.layer_batch_active = false;
@@ -1275,7 +1656,7 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
      * enclosing token completion. */
     const bool nonblocking_timeline = ctx.layer_timeline_active &&
         getenv("DS4_VULKAN_TIMELINE_LAYER_NO_WAIT") != nullptr;
-    const bool defer = ctx.command_count != 0 && !resume &&
+    const bool defer = !force_wait && ctx.command_count != 0 && !resume &&
         (!ctx.layer_timeline_active || nonblocking_timeline) &&
         command_ring_enabled();
     int ok = defer ? end_and_submit() : submit_and_wait_force();
@@ -1283,12 +1664,9 @@ static int retire_layer_batch_span(VulkanCommandCtx &ctx, bool resume) {
     if (defer) return ok;
     const uint64_t descriptor_start = timeline_now_ns();
     for (VkDescriptorSet set : ctx.layer_batch_descriptors) {
-        if (vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) != VK_SUCCESS)
-            ok = 0;
+        recycle_descriptor_set(ctx, set);
     }
-    if (!ctx.layer_batch_descriptors.empty())
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
+    (void)descriptor_start;
     for (ds4_gpu_tensor *tensor : ctx.layer_batch_tensors)
         ds4_gpu_tensor_free(tensor);
     for (void *ptr : ctx.layer_batch_in_place_ptrs) {
@@ -1329,6 +1707,10 @@ static void maybe_submit(void) {
 
 static void mark_bound_weight_buffers(VkDescriptorBufferInfo *buffers,
                                       uint32_t count, uint64_t generation);
+static int allocate_simple_descriptors(const ShaderEntry &shader,
+                                       VkDescriptorBufferInfo *buffers,
+                                       uint32_t count, VkDescriptorSet &set);
+static int release_simple_descriptors(VkDescriptorSet set);
 
 static int dispatch_shader(const char *name,
                            const void *push, uint32_t push_size,
@@ -1342,26 +1724,8 @@ static int dispatch_shader(const char *name,
 
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, e.pipeline);
 
-    /* Allocate + update descriptor set */
-    VkDescriptorSetAllocateInfo dai{};
-    dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = g_vk.desc_pool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &e.desc_layout;
-    VkDescriptorSet ds;
-    VK_CHECK_RAW(vkAllocateDescriptorSets(g_vk.device, &dai, &ds));
-
-    std::vector<VkWriteDescriptorSet> writes(n_bufs);
-    for (uint32_t i = 0; i < n_bufs; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = ds; writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufs[i];
-    }
-    if (n_bufs) vkUpdateDescriptorSets(g_vk.device, n_bufs, writes.data(), 0, nullptr);
-    mark_bound_weight_buffers(bufs, n_bufs, c.recording_generation);
-    timeline_descriptors(c, name, bufs, n_bufs);
+    VkDescriptorSet ds = VK_NULL_HANDLE;
+    if (!allocate_simple_descriptors(e, bufs, n_bufs, ds)) return -1;
 
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             e.layout, 0, 1, &ds, 0, nullptr);
@@ -1370,11 +1734,12 @@ static int dispatch_shader(const char *name,
         vkCmdPushConstants(c.cmd, e.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
 
     timeline_dispatch(c, name, bufs, n_bufs, gx, gy, gz);
+    c.command_count++;
 
     /* Reset descriptor pool periodically (simplified: reset each time) */
     /* In production, use multiple pools or recycle sets */
     maybe_submit();
-    return 0;
+    return release_simple_descriptors(ds) ? 0 : -1;
 }
 
 /* =====================================================================
@@ -1409,6 +1774,9 @@ int ds4_gpu_init(void) {
     load_all_shaders();
     const char *bg = getenv("DS4_VULKAN_WEIGHT_BUDGET_GB");
     if (bg && *bg) g_vk.weight_budget = (uint64_t)atoll(bg) * 1024ull * 1024ull * 1024ull;
+    if (g_vk.caps.device_memory_total != 0 &&
+        g_vk.weight_budget > g_vk.caps.device_memory_total)
+        g_vk.weight_budget = g_vk.caps.device_memory_total;
     g_vk.initialized = true;
     fprintf(stderr, "ds4: VULKAN backend ready\n");
     return 1;  /* DS4 convention: 1 = success, 0 = failure */
@@ -1421,6 +1789,19 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, c] : g_vk.cmd_ctxs) {
         (void)retire_completed_slots(c, c.last_submit_value);
         timeline_dump(c);
+        /* Lease owners are only lightweight public tensor wrappers.  Their
+         * Vulkan allocations remain registered in tensor_headers and are
+         * destroyed by the common allocation teardown below. */
+        for (auto &[__, lease] : c.slice_scratch_leases)
+            free(lease.owner);
+        c.slice_scratch_leases.clear();
+        for (const auto &[__, set] : c.persistent_descriptors) {
+            VkDescriptorSet mutable_set = set;
+            (void)vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1,
+                                       &mutable_set);
+            c.descriptor_layouts.erase(set);
+        }
+        c.persistent_descriptors.clear();
         for (VkQueryPool pool : c.timestamp_pools)
             if (pool) vkDestroyQueryPool(g_vk.device, pool, nullptr);
         if (c.semaphore) vkDestroySemaphore(g_vk.device, c.semaphore, nullptr);
@@ -1446,6 +1827,7 @@ void ds4_gpu_cleanup(void) {
     for (auto &[_, e] : g_vk.weight_cache)
         if (e.buffer) vmaDestroyBuffer(g_vk.allocator, e.buffer, e.allocation);
     g_vk.weight_cache.clear();
+    execution_arena_clear();
     for (auto &[_, e] : g_vk.aligned_cache)
         if (e.gpu.buffer) vmaDestroyBuffer(g_vk.allocator, e.gpu.buffer, e.gpu.allocation);
     g_vk.aligned_cache.clear();
@@ -1565,14 +1947,74 @@ static bool release_tensor_header(TensorHeader *header) {
         pool[header->bytes].push_back(header);
         return true;
     }
-    if (header->buffer)
+    if (header->buffer) {
+        invalidate_persistent_descriptors_for_buffer(header->buffer);
         vmaDestroyBuffer(g_vk.allocator, header->buffer, header->allocation);
+    }
     free(header);
     return false;
 }
 
 static ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_scratch(uint64_t bytes) {
     return alloc_tensor_kind(bytes, true, true);
+}
+
+/* A worker slice records several layers before the output fence.  Returning
+ * ordinary scratch to the size pool during that scope cannot make it reusable:
+ * an earlier command may still consume it.  Give each (layer, allocation
+ * sequence) a persistent backing instead.  The owner remains in the command
+ * context across tokens; callers receive a non-owning tensor wrapper, so their
+ * existing free calls only retire the wrapper.  Stable identities are also a
+ * prerequisite for persistent descriptor/graph reuse.
+ *
+ * A shape/order mismatch deliberately falls back to ordinary scratch rather
+ * than resizing a lease while commands may reference it. */
+static ds4_gpu_tensor *alloc_slice_scratch(uint64_t bytes,
+                                           bool device_local) {
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.slice_batch_active || ctx.slice_active_layer == UINT32_MAX)
+        return alloc_tensor_kind(bytes, device_local, true);
+
+    const uint32_t cursor = ctx.slice_scratch_cursor++;
+    const uint64_t key = (uint64_t(ctx.slice_active_layer) << 32u) |
+                         (uint64_t(device_local ? 1u : 0u) << 31u) |
+                         uint64_t(cursor);
+    auto it = ctx.slice_scratch_leases.find(key);
+    if (it == ctx.slice_scratch_leases.end()) {
+        ds4_gpu_tensor *owner = alloc_tensor_kind(bytes, device_local, false);
+        if (!owner) return nullptr;
+        VulkanCommandCtx::SliceScratchLease lease{};
+        lease.owner = owner;
+        lease.bytes = bytes;
+        lease.device_local = device_local;
+        it = ctx.slice_scratch_leases.emplace(key, lease).first;
+    } else if (it->second.bytes != bytes ||
+               it->second.device_local != device_local) {
+        return alloc_tensor_kind(bytes, device_local, true);
+    }
+
+    ds4_gpu_tensor *view = (ds4_gpu_tensor*)calloc(1, sizeof(ds4_gpu_tensor));
+    if (!view) return nullptr;
+    view->ptr = it->second.owner->ptr;
+    view->bytes = it->second.owner->bytes;
+    view->owner = 0;
+    view->device_id = it->second.owner->device_id;
+    return view;
+}
+
+static ds4_gpu_tensor *ds4_gpu_tensor_alloc_slice_device_scratch(
+        uint64_t bytes) {
+    return alloc_slice_scratch(bytes, true);
+}
+
+static int ds4_gpu_tensor_alloc_slice_host_scratch_in_place(
+        ds4_gpu_tensor *t, uint64_t bytes) {
+    if (!t) return 1;
+    ds4_gpu_tensor *a = alloc_slice_scratch(bytes, false);
+    if (!a) return 2;
+    *t = *a;
+    free(a);
+    return 0;
 }
 
 static int ds4_gpu_tensor_alloc_host_scratch_in_place(ds4_gpu_tensor *t,
@@ -1763,8 +2205,14 @@ extern "C" void ds4_gpu_timeline_stage_end(const char *stage) {
 }
 
 extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
+    /* A worker slice owns the enclosing lifetime scope.  Keep the per-layer
+     * encoder contract successful without opening a nested retirement scope. */
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = layer;
+        ctx.slice_scratch_cursor = 0;
+        return 1;
+    }
     if (ctx.layer_batch_active) return 0;
     if (ctx.recording && ctx.command_count != 0) {
         /* Decode records token embedding before opening the first layer
@@ -1788,8 +2236,12 @@ extern "C" int ds4_gpu_batch_layer_begin(uint32_t layer) {
 }
 
 extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
-    (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = layer;
+        ctx.slice_scratch_cursor = 0;
+        return 1;
+    }
     if (ctx.layer_batch_active) return 0;
     /* Prefill already owns an ordered layer-major stream.  Attaching the
      * lifetime scope must not submit/wait on the preceding layer; the next
@@ -1809,8 +2261,47 @@ extern "C" int ds4_gpu_batch_prefill_layer_begin(uint32_t layer) {
 extern "C" int ds4_gpu_batch_layer_end(uint32_t layer) {
     (void)layer;
     auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active) {
+        ctx.slice_active_layer = UINT32_MAX;
+        return 1;
+    }
     if (!ctx.layer_batch_active) return 1;
     return retire_layer_batch_span(ctx, false);
+}
+
+extern "C" int ds4_gpu_batch_slice_begin(uint32_t first_layer,
+                                           uint32_t last_layer) {
+    (void)first_layer;
+    (void)last_layer;
+    auto &ctx = get_cmd_ctx();
+    if (ctx.slice_batch_active || ctx.layer_batch_active) return 0;
+    /* Do not submit setup work already recorded in this command epoch. */
+    if (!ctx.recording && !begin_cmd()) return 0;
+    ctx.layer_batch_descriptors.clear();
+    ctx.layer_batch_tensors.clear();
+    ctx.layer_batch_in_place_ptrs.clear();
+    ctx.layer_batch_descriptors.reserve(128);
+    ctx.layer_batch_tensors.reserve(32);
+    ctx.layer_batch_in_place_ptrs.reserve(16);
+    ctx.layer_batch_active = true;
+    ctx.slice_batch_active = true;
+    ctx.slice_active_layer = UINT32_MAX;
+    ctx.slice_scratch_cursor = 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_batch_slice_end(uint32_t first_layer,
+                                         uint32_t last_layer) {
+    (void)first_layer;
+    (void)last_layer;
+    auto &ctx = get_cmd_ctx();
+    if (!ctx.slice_batch_active) return 1;
+    /* The worker output boundary: force completion of every command-ring
+     * segment belonging to this logical slice before mapped output is read,
+     * while retaining the existing descriptor/tensor retirement path. */
+    ctx.slice_batch_active = false;
+    ctx.slice_active_layer = UINT32_MAX;
+    return retire_layer_batch_span(ctx, false, true);
 }
 
 int ds4_gpu_signal_selected_readback_ready(uint64_t *ev) {
@@ -1854,6 +2345,7 @@ static void clear_weight_cache(void) {
         for (auto &[offset, entry] : g_vk.weight_cache) {
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "weight_cache_clear", entry.size, offset);
+            invalidate_persistent_descriptors_for_buffer(entry.buffer);
             vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
         }
         g_vk.weight_cache.clear();
@@ -1863,10 +2355,12 @@ static void clear_weight_cache(void) {
         for (auto &[offset, entry] : g_vk.aligned_cache) {
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "aligned_cache_clear", entry.gpu.size, offset);
+            invalidate_persistent_descriptors_for_buffer(entry.gpu.buffer);
             vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
         }
         g_vk.aligned_cache.clear();
     }
+    execution_arena_clear();
     g_vk.weight_used = 0;
     g_vk.range_registry.clear();
 }
@@ -1908,6 +2402,217 @@ int ds4_gpu_set_model_map_spans(const void *m, uint64_t s, const uint64_t *o, co
     set_model_map_identity(m, s);
     return 1;  /* DS4 convention: 1 = success */
 }
+
+/* Execution artifacts are immutable, exact-size device-local buffers.  Each
+ * artifact is uploaded once during warmup and consumers bind its plane ranges
+ * through the entry table; the runtime never binds GGUF records directly on
+ * this path.  Keeping buffers per artifact avoids arena growth and a retained
+ * host-side packed mirror while preserving command-buffer lifetime safety. */
+static bool execution_one_time_copy(VkBuffer src, VkBuffer dst,
+                                    VkDeviceSize src_offset,
+                                    VkDeviceSize dst_offset,
+                                    VkDeviceSize bytes,
+                                    const char *label) {
+    static VkCommandPool pool = VK_NULL_HANDLE;
+    if (!pool) {
+        VkCommandPoolCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        ci.queueFamilyIndex = g_vk.queue_family;
+        ci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+                   VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (vkCreateCommandPool(g_vk.device, &ci, nullptr, &pool) != VK_SUCCESS)
+            return false;
+    }
+    VkCommandBufferAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    ai.commandPool = pool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(g_vk.device, &ai, &cb) != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    bool ok = vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS;
+    if (ok) {
+        VkBufferCopy copy{};
+        copy.srcOffset = src_offset;
+        copy.dstOffset = dst_offset;
+        copy.size = bytes;
+        vkCmdCopyBuffer(cb, src, dst, 1, &copy);
+        ok = vkEndCommandBuffer(cb) == VK_SUCCESS;
+    }
+    VkFence fence = VK_NULL_HANDLE;
+    if (ok) {
+        VkFenceCreateInfo fci{}; fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        ok = vkCreateFence(g_vk.device, &fci, nullptr, &fence) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        std::lock_guard<std::mutex> lock(g_vk.queue_mutex);
+        ok = vkQueueSubmit(g_vk.queue, 1, &si, fence) == VK_SUCCESS;
+    }
+    if (ok) ok = vkWaitForFences(g_vk.device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    if (fence) vkDestroyFence(g_vk.device, fence, nullptr);
+    vkFreeCommandBuffers(g_vk.device, pool, 1, &cb);
+    if (!ok && getenv("DS4_VULKAN_DEBUG"))
+        fprintf(stderr, "ds4: execution artifact copy failed (%s)\n", label ? label : "copy");
+    return ok;
+}
+
+static bool execution_artifact_upload(const void *data, uint64_t bytes,
+                                      VkBuffer &buffer, VmaAllocation &allocation) {
+    if (!data || bytes == 0) return false;
+    VkBufferCreateInfo dbi{}; dbi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    dbi.size = bytes;
+    dbi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VmaAllocationCreateInfo daci{}; daci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaAllocationInfo dinfo{};
+    if (vmaCreateBuffer(g_vk.allocator, &dbi, &daci, &buffer, &allocation, &dinfo) != VK_SUCCESS)
+        return false;
+    VkBufferCreateInfo bci{}; bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo aci{}; aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer staging = VK_NULL_HANDLE; VmaAllocation staging_allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(g_vk.allocator, &bci, &aci, &staging, &staging_allocation, &info) != VK_SUCCESS ||
+        !info.pMappedData) {
+        if (staging) vmaDestroyBuffer(g_vk.allocator, staging, staging_allocation);
+        vmaDestroyBuffer(g_vk.allocator, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        return false;
+    }
+    memcpy(info.pMappedData, data, (size_t)bytes);
+    const bool ok = execution_one_time_copy(staging, buffer, 0, 0, bytes,
+                                            "execution_artifact_upload");
+    vmaDestroyBuffer(g_vk.allocator, staging, staging_allocation);
+    if (!ok) {
+        vmaDestroyBuffer(g_vk.allocator, buffer, allocation);
+        buffer = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+    }
+    return ok;
+}
+
+static void execution_arena_clear(void) {
+    if (!g_vk.execution_artifacts.empty()) {
+        (void)timeline_device_wait_idle("execution_artifact_clear");
+        for (auto &[_, entry] : g_vk.execution_artifacts) {
+            if (entry.buffer) {
+                timeline_resource_current(TimelineEventKind::BufferFree,
+                                          "execution_artifact_clear",
+                                          entry.arena_entry.bytes,
+                                          entry.source_offset);
+                invalidate_persistent_descriptors_for_buffer(entry.buffer);
+                vmaDestroyBuffer(g_vk.allocator, entry.buffer, entry.allocation);
+            }
+            g_vk.weight_used -= std::min(g_vk.weight_used,
+                                         entry.arena_entry.bytes);
+        }
+    }
+    g_vk.execution_artifacts.clear();
+    g_vk.q8_execution_coverage.clear();
+}
+
+static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes);
+static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_offset);
+static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes);
+
+static bool ensure_execution_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim, uint32_t format,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    if (!model_map || in_dim == 0 || out_dim == 0) return false;
+    if (g_vk.model_map != model_map || g_vk.model_size != model_size)
+        set_model_map_identity(model_map, model_size);
+    auto found = g_vk.execution_artifacts.find(source_offset);
+    if (found != g_vk.execution_artifacts.end()) {
+        const auto &old = found->second.arena_entry;
+        if (old.in_dim != in_dim || old.out_dim < out_dim || old.format != format)
+            return false;
+        entry = &found->second;
+        return true;
+    }
+    ds4_vulkan_execution_artifact artifact{};
+    if (!ds4_vulkan_execution_artifact_build(
+            &artifact, model_map, model_size, source_offset, in_dim, out_dim,
+            format,
+            g_vk.caps.min_storage_buffer_offset_alignment))
+        return false;
+    if (g_vk.caps.max_storage_buffer_range != 0) {
+        for (uint32_t p = 0; p < artifact.plane_count; ++p)
+            if (artifact.plane_bytes[p] > g_vk.caps.max_storage_buffer_range) {
+                ds4_vulkan_execution_artifact_free(&artifact);
+                return false;
+            }
+    }
+    if (!remove_raw_weight_overlap(source_offset, artifact.source_bytes) ||
+        !remove_aligned_weight_overlap(source_offset, artifact.source_bytes) ||
+        !reserve_aligned_weight_budget(artifact.bytes, source_offset)) {
+        ds4_vulkan_execution_artifact_free(&artifact);
+        return false;
+    }
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    if (!execution_artifact_upload(artifact.data, artifact.bytes,
+                                   buffer, allocation)) {
+        ds4_vulkan_execution_artifact_free(&artifact);
+        return false;
+    }
+    timeline_resource_current(TimelineEventKind::BufferAlloc,
+                              "execution_artifact", artifact.bytes,
+                              source_offset);
+    decltype(g_vk.execution_artifacts)::mapped_type value{};
+    value.arena_entry = {
+        0, static_cast<uint32_t>(g_vk.execution_artifacts.size()),
+        artifact.format, 0, 0, artifact.bytes, artifact.in_dim, artifact.out_dim};
+    value.buffer = buffer;
+    value.allocation = allocation;
+    value.source_offset = source_offset;
+    value.source_bytes = artifact.source_bytes;
+    value.plane_count = artifact.plane_count;
+    value.block_elements = artifact.block_elements;
+    value.source_blocks_per_tile = artifact.source_blocks_per_tile;
+    for (uint32_t i = 0; i < artifact.plane_count && i < 3; i++) {
+        value.plane_offset[i] = artifact.plane_offset[i];
+        value.plane_bytes[i] = artifact.plane_bytes[i];
+        value.plane_element_bytes[i] = artifact.plane_element_bytes[i];
+    }
+    g_vk.execution_artifacts[source_offset] = value;
+    g_vk.weight_used += artifact.bytes;
+    entry = &g_vk.execution_artifacts.find(source_offset)->second;
+    ds4_vulkan_execution_artifact_free(&artifact);
+    return true;
+}
+
+static bool ensure_execution_q8_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_Q8_0, entry);
+}
+
+static bool ensure_execution_iq2_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_IQ2_XXS, entry);
+}
+
+static bool ensure_execution_q2_down_artifact(
+        const void *model_map, uint64_t model_size, uint64_t source_offset,
+        uint64_t in_dim, uint64_t out_dim,
+        decltype(g_vk.execution_artifacts)::mapped_type *&entry) {
+    return ensure_execution_artifact(model_map, model_size, source_offset,
+                                     in_dim, out_dim, DS4_VULKAN_EXEC_Q2_K, entry);
+}
+
 
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes);
 
@@ -2121,6 +2826,7 @@ static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
         auto it = g_vk.weight_cache.find(lru_base);
         timeline_resource_current(TimelineEventKind::BufferFree,
                       "weight_cache_evict", it->second.size, lru_base);
+        invalidate_persistent_descriptors_for_buffer(it->second.buffer);
         vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
         g_vk.weight_used -= it->second.size;
         g_vk.weight_cache.erase(it);
@@ -2156,9 +2862,78 @@ static bool remove_raw_weight_overlap(uint64_t offset, uint64_t bytes) {
         }
         timeline_resource_current(TimelineEventKind::BufferFree,
                       "weight_overlap_remove", it->second.size, it->first);
+        invalidate_persistent_descriptors_for_buffer(it->second.buffer);
         vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
         g_vk.weight_used -= std::min(g_vk.weight_used, it->second.size);
         it = g_vk.weight_cache.erase(it);
+    }
+    return true;
+}
+
+static bool remove_aligned_weight_overlap(uint64_t offset, uint64_t bytes) {
+    bool found = false;
+    for (const auto &[base, value] : g_vk.aligned_cache) {
+        const uint64_t blocks = value.blocks;
+        if (value.out_dim != 0 && blocks != 0 &&
+            value.out_dim <= UINT64_MAX / blocks &&
+            value.out_dim * blocks <= UINT64_MAX / 34u &&
+            ranges_overlap(offset, bytes, value.source_offset,
+                           value.out_dim * blocks * 34u))
+            found = true;
+    }
+    if (!found) return true;
+    if (current_commands_reference_weights() ||
+        timeline_device_wait_idle("aligned_weight_overlap_remove") != VK_SUCCESS)
+        return false;
+    for (auto it = g_vk.aligned_cache.begin(); it != g_vk.aligned_cache.end();) {
+        const auto &value = it->second;
+        const uint64_t blocks = value.blocks;
+        const bool valid = value.out_dim != 0 && blocks != 0 &&
+            value.out_dim <= UINT64_MAX / blocks &&
+            value.out_dim * blocks <= UINT64_MAX / 34u;
+        const uint64_t source_size = valid ? value.out_dim * blocks * 34u : 0;
+        if (!valid || !ranges_overlap(offset, bytes, value.source_offset, source_size)) {
+            ++it;
+            continue;
+        }
+        timeline_resource_current(TimelineEventKind::BufferFree,
+                                  "aligned_weight_overlap_remove",
+                                  value.gpu.size, value.source_offset);
+        invalidate_persistent_descriptors_for_buffer(value.gpu.buffer);
+        vmaDestroyBuffer(g_vk.allocator, value.gpu.buffer, value.gpu.allocation);
+        g_vk.weight_used -= std::min(g_vk.weight_used, value.gpu.size);
+        it = g_vk.aligned_cache.erase(it);
+    }
+    return true;
+}
+
+static bool remove_execution_artifact_overlap(uint64_t offset, uint64_t bytes) {
+    bool found = false;
+    for (const auto &[_, value] : g_vk.execution_artifacts)
+        if (ranges_overlap(offset, bytes, value.source_offset, value.source_bytes))
+            found = true;
+    if (!found) return true;
+    if (current_commands_reference_weights() ||
+        timeline_device_wait_idle("execution_artifact_overlap_remove") != VK_SUCCESS)
+        return false;
+    for (auto it = g_vk.execution_artifacts.begin(); it != g_vk.execution_artifacts.end();) {
+        if (!ranges_overlap(offset, bytes, it->second.source_offset,
+                            it->second.source_bytes)) {
+            ++it;
+            continue;
+        }
+        timeline_resource_current(TimelineEventKind::BufferFree,
+                                  "execution_artifact_overlap_remove",
+                                  it->second.arena_entry.bytes,
+                                  it->second.source_offset);
+        if (it->second.buffer) {
+            invalidate_persistent_descriptors_for_buffer(it->second.buffer);
+            vmaDestroyBuffer(g_vk.allocator, it->second.buffer,
+                             it->second.allocation);
+        }
+        g_vk.weight_used -= std::min(g_vk.weight_used,
+                                     it->second.arena_entry.bytes);
+        it = g_vk.execution_artifacts.erase(it);
     }
     return true;
 }
@@ -2190,6 +2965,7 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
             auto it = g_vk.aligned_cache.find(victim);
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "aligned_cache_evict", it->second.gpu.size, victim);
+            invalidate_persistent_descriptors_for_buffer(it->second.gpu.buffer);
             vmaDestroyBuffer(g_vk.allocator, it->second.gpu.buffer, it->second.gpu.allocation);
             g_vk.weight_used -= it->second.gpu.size;
             g_vk.aligned_cache.erase(it);
@@ -2197,6 +2973,7 @@ static bool reserve_aligned_weight_budget(uint64_t bytes, uint64_t protected_off
             auto it = g_vk.weight_cache.find(victim);
             timeline_resource_current(TimelineEventKind::BufferFree,
                                       "weight_cache_evict", it->second.size, victim);
+            invalidate_persistent_descriptors_for_buffer(it->second.buffer);
             vmaDestroyBuffer(g_vk.allocator, it->second.buffer, it->second.allocation);
             g_vk.weight_used -= it->second.size;
             g_vk.weight_cache.erase(it);
@@ -2316,6 +3093,7 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     }
     const uint64_t raw_bytes = out_dim * artifact.blocks_per_row * 34u;
     if (!remove_raw_weight_overlap(offset, raw_bytes) ||
+        !remove_execution_artifact_overlap(offset, raw_bytes) ||
         !reserve_aligned_weight_budget(artifact.bytes, offset)) {
         if (getenv("DS4_VULKAN_DEBUG"))
             fprintf(stderr,
@@ -2347,17 +3125,212 @@ static bool ensure_aligned_weight(const void *model_map, uint64_t model_size,
     return ok;
 }
 
+static bool execution_artifact_required(uint32_t kind) {
+    const char *name = kind == ExecQ8
+        ? "DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q8"
+        : kind == ExecIQ2
+            ? "DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2"
+            : nullptr;
+    if (name && getenv(name)) return true;
+    return kind == ExecQ2 &&
+        (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION") ||
+         getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_Q2"));
+}
+
+static void execution_artifact_failure(uint32_t kind, const char *label,
+                                       const char *reason) {
+    const char *name = kind == ExecQ8 ? "Q8" :
+                       kind == ExecIQ2 ? "IQ2" : "Q2";
+    fprintf(stderr, "ds4: required %s execution artifact unavailable (%s)%s%s\n",
+            name, reason ? reason : "unknown", label ? " for " : "",
+            label ? label : "");
+}
+
+static void execution_artifact_count_fallback(uint32_t kind, const char *label) {
+    g_vk.execution_artifact_stats[kind].fallbacks++;
+    if (getenv("DS4_VULKAN_TRACE_KERNELS")) {
+        const char *name = kind == ExecQ8 ? "Q8" :
+                           kind == ExecIQ2 ? "IQ2" : "Q2";
+        fprintf(stderr, "ds4: [trace] %s execution artifact fallback%s%s\n",
+                name, label ? " for " : "", label ? label : "");
+    }
+}
+
+extern "C" void ds4_gpu_execution_artifact_report(void) {
+    const bool report = getenv("DS4_VULKAN_TRACE_KERNELS") ||
+        execution_artifact_required(ExecQ8) ||
+        execution_artifact_required(ExecIQ2) ||
+        execution_artifact_required(ExecQ2);
+    if (!report) return;
+    static const char *names[] = {"Q8", "IQ2", "Q2"};
+    fprintf(stderr, "ds4: execution artifacts live=%llu\n",
+            (unsigned long long)g_vk.execution_artifacts.size());
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto &s = g_vk.execution_artifact_stats[i];
+        fprintf(stderr, "ds4: execution artifact %s cache_calls=%llu hits=%llu "
+                       "dispatches=%llu dispatch_hits=%llu dispatch_fallbacks=%llu "
+                       "fallbacks=%llu unsupported=%llu failures=%llu%s\n",
+                names[i], (unsigned long long)s.cache_calls,
+                (unsigned long long)s.artifact_hits,
+                (unsigned long long)s.dispatches,
+                (unsigned long long)s.dispatch_hits,
+                (unsigned long long)s.dispatch_fallbacks,
+                (unsigned long long)s.fallbacks,
+                (unsigned long long)s.unsupported,
+                (unsigned long long)s.failures,
+                execution_artifact_required(i) ? " required=1" : "");
+    }
+    if (!g_vk.q8_execution_coverage.empty()) {
+        fprintf(stderr, "ds4: Q8 execution coverage by shape\n");
+        for (const auto &[shape, coverage] : g_vk.q8_execution_coverage) {
+            const uint32_t in_dim = uint32_t(shape >> 32u);
+            const uint32_t out_dim = uint32_t(shape);
+            fprintf(stderr,
+                    "ds4: Q8 shape %ux%u dispatches=%llu artifact_hits=%llu "
+                    "fallbacks=%llu%s\n",
+                    in_dim, out_dim,
+                    (unsigned long long)coverage.dispatches,
+                    (unsigned long long)coverage.artifact_hits,
+                    (unsigned long long)coverage.fallbacks,
+                    coverage.fallbacks ? " INCOMPLETE" : "");
+        }
+    }
+}
+
 int ds4_gpu_cache_q8_f16_range(const void *m, uint64_t s, uint64_t off, uint64_t bytes,
                                  uint64_t idim, uint64_t odim, const char *label) {
-    (void)label;
     if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off || idim == 0 || odim == 0)
         return 0;
     const uint64_t blocks = (idim + 31u) / 32u;
     if (idim > 8192u || odim > UINT64_MAX / blocks ||
         odim * blocks > UINT64_MAX / 34u || bytes != odim * blocks * 34u) return 0;
     set_model_map_identity(m, s);
+    const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
+    const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
+    auto &stats = g_vk.execution_artifact_stats[ExecQ8];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecQ8);
+    const bool candidate = g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
+        idim % 256u == 0u && odim % 4u == 0u &&
+        !(exec_env && strcmp(exec_env, "0") == 0) &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0);
+    if (!candidate) stats.unsupported++;
+    if (required && !candidate) {
+        stats.failures++;
+        execution_artifact_failure(ExecQ8, label, "shape/mode/shader");
+        return 0;
+    }
+    if (candidate) {
+        decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
+        if (ensure_execution_q8_artifact(m, s, off, idim, odim, execution)) {
+            stats.artifact_hits++;
+            if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                fprintf(stderr, "ds4: [trace] Q8 execution artifact hit off=%llu shape=%llux%llu%s%s\n",
+                        (unsigned long long)off, (unsigned long long)idim,
+                        (unsigned long long)odim, label ? " " : "", label ? label : "");
+            return 1;
+        }
+        stats.failures++;
+        if (required) {
+            execution_artifact_failure(ExecQ8, label, "build/upload");
+            return 0;
+        }
+    }
+    if (!required) execution_artifact_count_fallback(ExecQ8, label);
     decltype(g_vk.aligned_cache)::mapped_type *entry = nullptr;
     return ensure_aligned_weight(m, s, off, idim, odim, entry) || ensure_weight(off, bytes);
+}
+
+int ds4_gpu_cache_iq2_expert_range(const void *m, uint64_t s, uint64_t off,
+                                   uint64_t bytes, uint64_t idim, uint64_t odim,
+                                   const char *label) {
+    if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off ||
+        idim == 0 || odim == 0 || idim % 256u != 0 ||
+        odim > UINT64_MAX / (idim / 256u) ||
+        odim * (idim / 256u) > UINT64_MAX / 66u ||
+        bytes != odim * (idim / 256u) * 66u)
+        return 0;
+    set_model_map_identity(m, s);
+    const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
+    auto &stats = g_vk.execution_artifact_stats[ExecIQ2];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecIQ2);
+    const bool candidate = g_vk.shader_map.find("routed_moe_fused_mid_exec") != g_vk.shader_map.end() &&
+        !(exec_env && strcmp(exec_env, "0") == 0);
+    if (!candidate) {
+        stats.unsupported++;
+        if (required) {
+            stats.failures++;
+            execution_artifact_failure(ExecIQ2, label, "mode/shader");
+            return 0;
+        }
+        execution_artifact_count_fallback(ExecIQ2, label);
+        return ensure_weight(off, bytes);
+    }
+    decltype(g_vk.execution_artifacts)::mapped_type *entry = nullptr;
+    if (ensure_execution_iq2_artifact(m, s, off, idim, odim, entry)) {
+        stats.artifact_hits++;
+        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+            fprintf(stderr,
+                    "ds4: [trace] routed IQ2 execution artifact hit off=%llu in=%llu out=%llu%s%s\n",
+                    (unsigned long long)off, (unsigned long long)idim,
+                    (unsigned long long)odim, label ? " " : "", label ? label : "");
+        return 1;
+    }
+    stats.failures++;
+    if (required) {
+        execution_artifact_failure(ExecIQ2, label, "build/upload");
+        return 0;
+    }
+    execution_artifact_count_fallback(ExecIQ2, label);
+    return ensure_weight(off, bytes);
+}
+
+int ds4_gpu_cache_q2_execution_range(const void *m, uint64_t s, uint64_t off,
+                                     uint64_t bytes, uint64_t idim, uint64_t odim,
+                                     const char *label) {
+    if (!m || s == 0 || bytes == 0 || off > s || bytes > s - off ||
+        idim == 0 || odim == 0 || idim % 256u != 0 ||
+        odim > UINT64_MAX / (idim / 256u) ||
+        odim * (idim / 256u) > UINT64_MAX / 84u ||
+        bytes != odim * (idim / 256u) * 84u)
+        return 0;
+    set_model_map_identity(m, s);
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_Q2_EXECUTION");
+    const char *mode = getenv("DS4_VULKAN_Q2_MODE");
+    const char *down = getenv("DS4_VULKAN_ROUTED_DOWN_REDUCE");
+    auto &stats = g_vk.execution_artifact_stats[ExecQ2];
+    stats.cache_calls++;
+    const bool required = execution_artifact_required(ExecQ2);
+    const bool candidate = !((enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N')) ||
+        (mode && strcmp(mode, "exact") == 0) ||
+        (down && (*down == '0' || *down == 'n' || *down == 'N')));
+    if (!candidate || g_vk.shader_map.find("routed_moe_down_reduce_q2_exec") == g_vk.shader_map.end()) {
+        stats.unsupported++;
+        if (required) {
+            stats.failures++;
+            execution_artifact_failure(ExecQ2, label, "mode/shader");
+            return 0;
+        }
+        execution_artifact_count_fallback(ExecQ2, label);
+        return ensure_weight(off, bytes);
+    }
+    decltype(g_vk.execution_artifacts)::mapped_type *entry = nullptr;
+    if (ensure_execution_q2_down_artifact(m, s, off, idim, odim, entry)) {
+        stats.artifact_hits++;
+        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+            fprintf(stderr, "ds4: [trace] Q2 execution artifact hit off=%llu in=%llu out=%llu%s%s\n",
+                    (unsigned long long)off, (unsigned long long)idim,
+                    (unsigned long long)odim, label ? " " : "", label ? label : "");
+        return 1;
+    }
+    stats.failures++;
+    if (required) {
+        execution_artifact_failure(ExecQ2, label, "build/upload");
+        return 0;
+    }
+    execution_artifact_count_fallback(ExecQ2, label);
+    return ensure_weight(off, bytes);
 }
 
 void ds4_gpu_release_q8_f16_cache(void) {
@@ -2366,6 +3339,7 @@ void ds4_gpu_release_q8_f16_cache(void) {
     for (auto &[offset, entry] : g_vk.aligned_cache) {
         timeline_resource_current(TimelineEventKind::BufferFree,
                                   "aligned_cache_release", entry.gpu.size, offset);
+        invalidate_persistent_descriptors_for_buffer(entry.gpu.buffer);
         vmaDestroyBuffer(g_vk.allocator, entry.gpu.buffer, entry.gpu.allocation);
         g_vk.weight_used -= std::min(g_vk.weight_used, entry.gpu.size);
     }
@@ -2490,9 +3464,13 @@ extern "C" void ds4_gpu_router_overlap_hint(int active) {
 
 static int finish_simple_dispatch(VulkanCommandCtx &ctx, bool resume_recording,
                                   bool allow_router_defer = false) {
+    const bool tracked = hazard_tracker_enabled(ctx);
     const bool defer_router_dependency =
         allow_router_defer && g_router_overlap_hint && ctx.layer_batch_active;
-    if (!defer_router_dependency) {
+    if (!tracked && !defer_router_dependency) {
+        /* Preserve the known-good legacy path until the tracker is explicitly
+         * enabled.  Once enabled, timeline_dispatch() has already emitted the
+         * narrow RAW/WAR/WAW dependency for this dispatch. */
         VkMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2519,14 +3497,42 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
         for (uint32_t i = 0; i < count; i++)
             if (buffers[i].offset % alignment != 0) return 0;
     }
+    auto &ctx = get_cmd_ctx();
+    DescriptorCacheKey key;
+    key.layout = shader.desc_layout;
+    key.buffers.assign(buffers, buffers + count);
+    auto cached = ctx.recording_descriptors.find(key);
+    if (cached != ctx.recording_descriptors.end()) {
+        set = cached->second;
+        mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
+        timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+        return 1;
+    }
+    if (persistent_descriptors_enabled(ctx)) {
+        auto persistent = ctx.persistent_descriptors.find(key);
+        if (persistent != ctx.persistent_descriptors.end()) {
+            set = persistent->second;
+            mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
+            timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+            return 1;
+        }
+    }
     VkDescriptorSetAllocateInfo allocate{};
     allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocate.descriptorPool = g_vk.desc_pool;
     allocate.descriptorSetCount = 1;
     allocate.pSetLayouts = &shader.desc_layout;
     const uint64_t descriptor_start = timeline_now_ns();
-    if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS)
+    bool reused = false;
+    auto reusable = ctx.reusable_descriptors.find(shader.desc_layout);
+    if (reusable != ctx.reusable_descriptors.end() && !reusable->second.empty()) {
+        set = reusable->second.back();
+        reusable->second.pop_back();
+        reused = true;
+    } else if (vkAllocateDescriptorSets(g_vk.device, &allocate, &set) != VK_SUCCESS) {
         return 0;
+    }
+    ctx.descriptor_layouts[set] = shader.desc_layout;
 
     std::vector<VkWriteDescriptorSet> writes(count);
     for (uint32_t i = 0; i < count; i++) {
@@ -2540,38 +3546,31 @@ static int allocate_simple_descriptors(const ShaderEntry &shader,
     }
     vkUpdateDescriptorSets(g_vk.device, count, writes.data(), 0, nullptr);
     timeline_duration_current(TimelineEventKind::DescriptorAlloc,
-                              "descriptor_cpu", descriptor_start);
-    auto &ctx = get_cmd_ctx();
+                              reused ? "descriptor_reuse_cpu" : "descriptor_cpu",
+                              descriptor_start);
     mark_bound_weight_buffers(buffers, count, ctx.recording_generation);
     timeline_descriptors(ctx, shader.name.c_str(), buffers, count);
+    if (persistent_descriptors_enabled(ctx) &&
+        ctx.persistent_descriptors.size() < 8192u)
+        ctx.persistent_descriptors.emplace(std::move(key), set);
+    else
+        ctx.recording_descriptors.emplace(std::move(key), set);
     return 1;
 }
 
 static int release_simple_descriptors(VkDescriptorSet set) {
     auto &ctx = get_cmd_ctx();
-    if (ctx.layer_batch_active) {
-        ctx.layer_batch_descriptors.push_back(set);
-        maybe_submit();
-        return 1;
-    }
+    if (descriptor_set_deferred(ctx, set)) return 1;
     const uint64_t descriptor_start = timeline_now_ns();
-    const bool ok = vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &set) == VK_SUCCESS;
-    if (ok) {
-        timeline_resource(get_cmd_ctx(), TimelineEventKind::DescriptorFree,
-                          "descriptor_set", 0);
-        timeline_duration_current(TimelineEventKind::DescriptorFree,
-                                  "descriptor_free_cpu", descriptor_start);
-    }
-    return ok;
+    recycle_descriptor_set(ctx, set);
+    timeline_duration_current(TimelineEventKind::DescriptorFree,
+                              "descriptor_recycle_cpu", descriptor_start);
+    return 1;
 }
 
 static int release_or_defer_simple_descriptors(VulkanCommandCtx &ctx,
                                                VkDescriptorSet set) {
-    if (ctx.attention_output_batch) {
-        ctx.attention_output_descriptors.push_back(set);
-        maybe_submit();
-        return 1;
-    }
+    (void)ctx;
     return release_simple_descriptors(set);
 }
 
@@ -2641,7 +3640,10 @@ static int record_simple_shader(const char *name, const void *push, uint32_t pus
         vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, push_size, push);
     timeline_dispatch(ctx, name, buffers, count, gx, gy, gz);
-    ctx.command_count++;
+    /* finish_simple_dispatch accounts for this dispatch and applies the
+     * dependency barrier.  Do not increment here as well: the duplicate
+     * count halves the command-ring batch size and creates avoidable submit /
+     * host-flush boundaries in a worker slice. */
     int ok = finish_simple_dispatch(ctx, resume_recording);
     if (!release_or_defer_simple_descriptors(ctx, set)) ok = 0;
     return ok;
@@ -2680,7 +3682,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
     struct { uint32_t n, rows; float eps; } push = {n, rows, eps};
     vkCmdPushConstants(ctx.cmd, shader.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push), &push);
-    timeline_dispatch(ctx, "rms_norm_weight_rows", buffers, 3, rows, 1, 1);
+    timeline_dispatch(ctx, "rms_norm", buffers, 2, rows, 1, 1);
     int ok = finish_simple_dispatch(ctx, resume_recording);
     if (!release_simple_descriptors(set)) ok = 0;
     return ok;
@@ -2840,7 +3842,7 @@ int ds4_gpu_matmul_q8_0_tensor(
          * keeping it device-local removes a per-projection host-visible VMA
          * allocation while the existing synchronous/layer-ring lifetime rules
          * remain unchanged. */
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
             n_tok * n_blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -2921,12 +3923,6 @@ int ds4_gpu_matmul_q8_0_tensor(
             (uint64_t)tile_n * out_dim > UINT32_MAX) return 0;
         if (c.recording && c.command_count != 0 && !submit_and_wait()) return 0;
         if (!c.recording && !begin_cmd()) return 0;
-        VkDescriptorSetAllocateInfo dai{};
-        dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dai.descriptorPool = g_vk.desc_pool; dai.descriptorSetCount = 1;
-        dai.pSetLayouts = &sh.desc_layout;
-        VkDescriptorSet ds;
-        if (vkAllocateDescriptorSets(g_vk.device, &dai, &ds) != VK_SUCCESS) return 0;
         const VkDeviceSize x_size = (VkDeviceSize)tile_n * in_dim * sizeof(float);
         const VkDeviceSize o_size = (VkDeviceSize)tile_n * out_dim * sizeof(float);
         const VkDeviceSize tile_x_off =
@@ -2936,7 +3932,6 @@ int ds4_gpu_matmul_q8_0_tensor(
         if (storage_align != 0 &&
             ((tile_x_off % storage_align) != 0 ||
              (tile_o_off % storage_align) != 0)) {
-            vkFreeDescriptorSets(g_vk.device, g_vk.desc_pool, 1, &ds);
             return 0;
         }
         VkDescriptorBufferInfo bufs[3] = {
@@ -2944,14 +3939,8 @@ int ds4_gpu_matmul_q8_0_tensor(
             {wbuf, wbuf_off, w_size},
             {obuf, tile_o_off, o_size},
         };
-        VkWriteDescriptorSet w[3];
-        for (int i = 0; i < 3; i++) {
-            w[i] = {}; w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[i].dstSet = ds; w[i].dstBinding = i; w[i].descriptorCount = 1;
-            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bufs[i];
-        }
-        vkUpdateDescriptorSets(g_vk.device, 3, w, 0, nullptr);
-        timeline_descriptors(c, "matmul_q8_0", bufs, 3);
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+        if (!allocate_simple_descriptors(sh, bufs, 3, ds)) return 0;
         vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.pipeline);
         vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sh.layout, 0, 1, &ds, 0, nullptr);
         const uint32_t y_scale = std::min((uint32_t)out_dim, 65534u);
@@ -2972,8 +3961,6 @@ int ds4_gpu_matmul_q8_0_tensor(
                              0, nullptr, 0, nullptr);
         if (!submit_and_wait()) return 0;
         if (!release_simple_descriptors(ds)) return 0;
-        timeline_resource(c, TimelineEventKind::DescriptorFree,
-                          "matmul_q8_0", 0);
     }
     return 1;
 }
@@ -3067,9 +4054,45 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     const uint64_t requested_records = out_dim * blocks;
     const uint64_t requested_scale_bytes = (requested_records * 2u + 3u) & ~3ull;
     const uint64_t requested_payload_bytes = requested_records * 32u;
+    const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
     decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
-    bool use_aligned = ensure_aligned_weight(model_map, model_size, weight_offset,
-                                              in_dim, out_dim, aligned);
+    decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
+    const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
+    bool use_execution = g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
+        n_tok == 1u && in_dim <= 8192u && blocks <= 256u &&
+        (in_dim % 256u) == 0u && (out_dim % 4u) == 0u &&
+        !(exec_env && strcmp(exec_env, "0") == 0) &&
+        !(q8_mode && strcmp(q8_mode, "exact") == 0);
+    if (use_execution)
+        use_execution = ensure_execution_q8_artifact(
+            model_map, model_size, weight_offset, in_dim, out_dim, execution);
+    auto &q8_stats = g_vk.execution_artifact_stats[ExecQ8];
+    q8_stats.dispatches++;
+    if (use_execution) q8_stats.dispatch_hits++;
+    else q8_stats.dispatch_fallbacks++;
+    const uint64_t coverage_key = (uint64_t(uint32_t(in_dim)) << 32u) |
+                                  uint64_t(uint32_t(out_dim));
+    auto &coverage = g_vk.q8_execution_coverage[coverage_key];
+    coverage.dispatches++;
+    if (use_execution) coverage.artifact_hits++;
+    else coverage.fallbacks++;
+    if (use_execution && getenv("DS4_VULKAN_TRACE_KERNELS"))
+        fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
+                (unsigned long long)weight_offset,
+                (unsigned long long)in_dim, (unsigned long long)out_dim);
+    /* The execution artifact consumer is deliberately the decode (n_tok=1)
+     * stream. Prefill still uses its token-batched Q8 path; requiring the
+     * decode artifact must not make that separate path fail closed before a
+     * decode token is reached. Keep counting the prefill fallback so coverage
+     * remains visible, but enforce strictness on the intended decode shape. */
+    if (!use_execution && n_tok == 1u && execution_artifact_required(ExecQ8)) {
+        g_vk.execution_artifact_stats[ExecQ8].failures++;
+        execution_artifact_failure(ExecQ8, nullptr, "runtime dispatch");
+        return 0;
+    }
+    bool use_aligned = !use_execution &&
+        ensure_aligned_weight(model_map, model_size, weight_offset,
+                              in_dim, out_dim, aligned);
     if (use_aligned &&
         (requested_scale_bytes > aligned->scale_bytes ||
          requested_payload_bytes > aligned->payload_bytes ||
@@ -3077,7 +4100,6 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
           (requested_scale_bytes > g_vk.caps.max_storage_buffer_range ||
            requested_payload_bytes > g_vk.caps.max_storage_buffer_range))))
         use_aligned = false;
-    const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
     const char *rows8_env = getenv("DS4_VULKAN_Q8_ROWS8");
     const char *rows2_env = getenv("DS4_VULKAN_Q8_ROWS2");
     const char *wave64_env = getenv("DS4_VULKAN_Q8_WAVE64");
@@ -3106,7 +4128,15 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         !(rows8_env && strcmp(rows8_env, "0") == 0) &&
         n_tok == 1 && in_dim == 1024 && blocks == 32 &&
         out_dim == 32768;
-    const char *shader_name = use_wave64
+    bool use_execution_128 = use_execution && blocks <= 128u &&
+        g_vk.shader_map.find("matmul_q8_0_exec_128") != g_vk.shader_map.end();
+    bool use_execution_wave64 = use_execution &&
+        g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
+        g_vk.shader_map.find("matmul_q8_0_exec_wave64") != g_vk.shader_map.end();
+    const char *shader_name = use_execution
+        ? (use_execution_wave64 ? "matmul_q8_0_exec_wave64"
+           : (use_execution_128 ? "matmul_q8_0_exec_128" : "matmul_q8_0_exec"))
+        : (use_wave64
         ? (use_wave64_unpack ? "matmul_q8_0_wave64_unpack_bfe"
                              : "matmul_q8_0_wave64_bfe")
         : (use_rows2
@@ -3116,8 +4146,15 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         : (use_aligned
             ? (q8_mode && strcmp(q8_mode, "exact") == 0
                 ? "matmul_q8_0_aligned" : "matmul_q8_0_aligned_bfe")
-            : "matmul_q8_0_prequant")));
+            : "matmul_q8_0_prequant"))));
     auto si = g_vk.shader_map.find(shader_name);
+    if (si == g_vk.shader_map.end() && use_execution && use_execution_wave64) {
+        /* A stale shader bundle may omit only the Wave64 artifact variant. */
+        use_execution_wave64 = false;
+        shader_name = use_execution_128 ? "matmul_q8_0_exec_128" :
+                                          "matmul_q8_0_exec";
+        si = g_vk.shader_map.find(shader_name);
+    }
     if (si == g_vk.shader_map.end() && use_wave64) {
         /* A stale shader bundle must preserve the aligned dispatch geometry. */
         use_wave64_unpack = false;
@@ -3145,12 +4182,37 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         shader_name = "matmul_q8_0_prequant";
         si = g_vk.shader_map.find(shader_name);
     }
+    if (si == g_vk.shader_map.end() && use_execution) {
+        if (use_execution_128) {
+            /* A stale bundle may omit only the narrow 128-lane variant. */
+            use_execution_128 = false;
+            shader_name = "matmul_q8_0_exec";
+            si = g_vk.shader_map.find(shader_name);
+        }
+    }
+    if (si == g_vk.shader_map.end() && use_execution) {
+        use_execution = false;
+        execution = nullptr;
+        use_aligned = ensure_aligned_weight(model_map, model_size, weight_offset,
+                                            in_dim, out_dim, aligned);
+        shader_name = use_aligned ? "matmul_q8_0_aligned_bfe" : "matmul_q8_0_prequant";
+        si = g_vk.shader_map.find(shader_name);
+    }
     if (si == g_vk.shader_map.end()) return 0;
     auto &sh = g_vk.shaders[si->second];
     VkDescriptorBufferInfo buffers[4] = {};
     uint32_t descriptor_count = 0;
     buffers[descriptor_count++] = {xbuf, xoff, (VkDeviceSize)q_bytes};
-    if (use_aligned) {
+    if (use_execution) {
+        buffers[descriptor_count++] = {
+            execution->buffer,
+            (VkDeviceSize)execution->plane_offset[0],
+            (VkDeviceSize)execution->plane_bytes[0]};
+        buffers[descriptor_count++] = {
+            execution->buffer,
+            (VkDeviceSize)execution->plane_offset[1],
+            (VkDeviceSize)execution->plane_bytes[1]};
+    } else if (use_aligned) {
         buffers[descriptor_count++] = {aligned->gpu.buffer, 0,
                                        (VkDeviceSize)requested_scale_bytes};
         buffers[descriptor_count++] = {aligned->gpu.buffer,
@@ -3169,16 +4231,20 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     }
     buffers[descriptor_count++] = {obuf, ooff,
         (VkDeviceSize)(n_tok * out_dim * sizeof(float))};
-    const uint32_t dispatch_x = use_wave64
+    const uint32_t dispatch_x = use_execution
+        ? (uint32_t)((out_dim + 3u) / 4u)
+        : (use_wave64
         ? (uint32_t)out_dim
         : (use_rows2
         ? (uint32_t)((out_dim + 1u) / 2u)
-        : (use_rows8 ? (uint32_t)((out_dim + 7u) / 8u) : y_scale));
-    const uint32_t dispatch_y = (use_wave64 || use_rows2 || use_rows8)
+        : (use_rows8 ? (uint32_t)((out_dim + 7u) / 8u) : y_scale)));
+    const uint32_t dispatch_y = (use_execution || use_wave64 || use_rows2 || use_rows8)
         ? 1u : (uint32_t)y_count64;
     struct { uint32_t in_dim, out_dim, n_tok, blocks_per_row, y_scale; } pc = {
-        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)blocks,
-        use_wave64 ? 1u : (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale))};
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok,
+        use_execution ? (uint32_t)(blocks / 8u) : (uint32_t)blocks,
+        use_execution ? 8u :
+        (use_wave64 ? 1u : (use_rows2 ? 2u : (use_rows8 ? 8u : y_scale)))};
     if (use_wave64 && getenv("DS4_VULKAN_TRACE_KERNELS"))
         fprintf(stderr,
                 "ds4: [trace] %s shape=%ux%u blocks=%u "
@@ -5488,7 +6554,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         g_vk.caps.max_compute_work_group_size[0] >= 256u &&
         g_vk.caps.max_compute_work_group_invocations >= 256u;
     if (prequant_eligible) {
-        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
             n_tok * blocks * 36u);
         if (!q) return 0;
         int ok = ds4_gpu_quantize_q8_0_tensor(q, x, in_dim, n_tok);
@@ -5576,7 +6642,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
             (!g_vk.caps.max_storage_buffer_range ||
              (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
               payload_bytes <= g_vk.caps.max_storage_buffer_range))) {
-            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_device_scratch(q_bytes);
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(q_bytes);
             if (q) {
                 auto &ctx = get_cmd_ctx();
                 const bool resume_recording = ctx.recording;
@@ -7006,6 +8072,13 @@ static bool ds4gk_routed_mid_only_appliance(
         return false;
     const char *iq2_words = getenv("DS4_VULKAN_ROUTED_IQ2_WORDS");
     if (iq2_words && strcmp(iq2_words, "0") == 0) return false;
+    const char *exec_test = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2_TEST");
+    if (exec_test && strcmp(exec_test, "1") == 0 &&
+        gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 256u && expert_mid_dim == 256u &&
+        out_dim == 256u && n_total_expert == 1u && n_expert == 1u)
+        return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
+            get_cmd_ctx().layer_batch_active && n_tokens == 1u;
     return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
         get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
         gate_type == 16u && down_type == 10u &&
@@ -7030,6 +8103,37 @@ static bool ds4gk_routed_down_reduce_appliance(
         expert_mid_dim == 2048u && out_dim == 4096u &&
         n_total_expert == 256u && n_expert == 6u;
 }
+
+static bool ds4gk_routed_down_reduce_execution_requested(
+        uint32_t down_type, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert) {
+    const char *enabled = getenv("DS4_VULKAN_ROUTED_Q2_EXECUTION");
+    const char *mode = getenv("DS4_VULKAN_Q2_MODE");
+    const char *down = getenv("DS4_VULKAN_ROUTED_DOWN_REDUCE");
+    if ((enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N')) ||
+        (mode && strcmp(mode, "exact") == 0) ||
+        (down && (*down == '0' || *down == 'n' || *down == 'N')))
+        return false;
+    return g_vk.shader_map.find("routed_moe_down_reduce_q2_exec") != g_vk.shader_map.end() &&
+        down_type == 10u && expert_in_dim != 0u && expert_mid_dim != 0u &&
+        out_dim != 0u && n_total_expert != 0u && n_expert >= 1u && n_expert <= 32u;
+}
+
+/* Optional exact tail supplied by the single-GPU decode caller.  It is kept
+ * out of the ordinary routed ABI so every legacy/prefill caller retains its
+ * established output buffers and synchronization. */
+struct RoutedSharedHcTail {
+    ds4_gpu_tensor *out_hc = nullptr;
+    const ds4_gpu_tensor *shared_mid = nullptr;
+    const ds4_gpu_tensor *residual_hc = nullptr;
+    const ds4_gpu_tensor *split = nullptr;
+    uint64_t shared_weight_offset = 0;
+    uint32_t shared_in_dim = 0;
+    uint32_t shared_out_dim = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_hc = 0;
+};
 
 /* Canonical routed stages use a fixed descriptor ABI: b4 is the stage output,
  * while the generic fused gate/up shader additionally writes b5 and b6. The
@@ -7059,8 +8163,19 @@ static void ds4gk_routed_output_barrier(
     const bool down_reduce = shader_name &&
         (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
-    add(down_reduce
-            ? 3u : 4u);
+    const bool execution_down = shader_name &&
+        strcmp(shader_name, "routed_moe_down_reduce_q2_exec") == 0;
+    const bool shared_hc_tail = shader_name &&
+        strcmp(shader_name, "routed_moe_q2_shared_hc_exec") == 0;
+    const bool exec_mid = shader_name &&
+        (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+         strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
+    if (shared_hc_tail) {
+        add(8u);
+        add(9u);
+    } else {
+        add(execution_down ? 5u : (down_reduce ? 3u : exec_mid ? 6u : 4u));
+    }
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0) {
         add(5);
         add(6);
@@ -7079,11 +8194,11 @@ static void ds4gk_routed_input_barrier(
         VulkanCommandCtx &ctx, const char *shader_name,
         const ds4gk_routed_pc &pc, VkDescriptorBufferInfo *buffers,
         uint32_t buffer_count) {
-    VkBufferMemoryBarrier barriers[2] = {};
+    VkBufferMemoryBarrier barriers[5] = {};
     uint32_t count = 0;
     auto add = [&](uint32_t binding) {
         if (binding >= buffer_count || buffers[binding].buffer == VK_NULL_HANDLE ||
-            buffers[binding].range == 0 || count >= 2) return;
+            buffers[binding].range == 0 || count >= 5) return;
         VkBufferMemoryBarrier &barrier = barriers[count++];
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
@@ -7097,9 +8212,21 @@ static void ds4gk_routed_input_barrier(
     const bool down_reduce = shader_name &&
         (strcmp(shader_name, "routed_moe_down_reduce_q2") == 0 ||
          strcmp(shader_name, "routed_moe_down_reduce_q2_wave64") == 0);
-    if (pc.mode == 1u || pc.mode == 3u) {
-        add(down_reduce
-                ? 2u : 3u); /* selected IDs */
+    const bool execution_down = shader_name &&
+        strcmp(shader_name, "routed_moe_down_reduce_q2_exec") == 0;
+    const bool shared_hc_tail = shader_name &&
+        strcmp(shader_name, "routed_moe_q2_shared_hc_exec") == 0;
+    const bool exec_mid = shader_name &&
+        (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+         strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0);
+    if (shared_hc_tail) {
+        add(0u);
+        add(1u);
+        add(7u);
+        add(10u); /* residual HC state */
+        add(11u); /* HC post/combination coefficients */
+    } else if (pc.mode == 1u || pc.mode == 3u) {
+        add(execution_down ? 4u : (exec_mid ? 5u : (down_reduce ? 2u : 3u)));
     }
     if (pc.mode == 2u) add(2);                  /* router weights */
     if (shader_name && strcmp(shader_name, "routed_moe_fused") == 0)
@@ -7107,6 +8234,9 @@ static void ds4gk_routed_input_barrier(
     if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid") == 0 ||
                         strcmp(shader_name, "routed_moe_fused_mid_wave64") == 0))
         add(5);                                 /* compact fused weights */
+    if (shader_name && (strcmp(shader_name, "routed_moe_fused_mid_exec") == 0 ||
+                        strcmp(shader_name, "routed_moe_fused_mid_exec_wave64") == 0))
+        add(7);                                 /* artifact weights */
     if (count == 0) return;
     timeline_barrier(ctx, "routed_moe_input_dependency");
     vkCmdPipelineBarrier(ctx.cmd,
@@ -7203,14 +8333,18 @@ static bool ds4gk_routed_common(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t n_tokens, bool *mid_is_f16, bool validate_selected) {
+        uint32_t n_tokens, bool *mid_is_f16, bool validate_selected,
+        const RoutedSharedHcTail *shared_hc_tail = nullptr) {
     /* A layer command batch consumes GPU-produced IDs; the routed shaders
      * already bounds-check them, so its one-token and batched calls pass
      * validate_selected=false.  Calls outside a batch retain validation for
      * focused CPU-written invalid-ID tests. */
-    const bool fused_down_reduce = ds4gk_routed_down_reduce_appliance(
+    bool fused_down_reduce = ds4gk_routed_down_reduce_appliance(
         down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
+    bool use_down_execution = ds4gk_routed_down_reduce_execution_requested(
+        down_type, expert_in_dim, expert_mid_dim, out_dim,
+        n_total_expert, n_expert);
     const bool mid_only = ds4gk_routed_mid_only_appliance(
         gate_type, down_type, expert_in_dim, expert_mid_dim, out_dim,
         n_total_expert, n_expert, n_tokens);
@@ -7269,7 +8403,9 @@ static bool ds4gk_routed_common(
      * generic stages. The destructor also covers every early-return path. */
     struct RoutedOwnedScratch {
         ds4_gpu_tensor gate{}, up{}, mid{}, experts{};
+        ds4_gpu_tensor *shared_q8 = nullptr;
         ~RoutedOwnedScratch() {
+            ds4_gpu_tensor_free(shared_q8);
             ds4_gpu_tensor_free_in_place(&experts);
             ds4_gpu_tensor_free_in_place(&mid);
             ds4_gpu_tensor_free_in_place(&up);
@@ -7301,6 +8437,38 @@ static bool ds4gk_routed_common(
 
     VkDescriptorBufferInfo x_info, out_info, gate_info, up_info, mid_info, exp_info;
     VkDescriptorBufferInfo gate_model, up_model, down_model;
+    decltype(g_vk.execution_artifacts)::mapped_type *down_execution = nullptr;
+    decltype(g_vk.execution_artifacts)::mapped_type *gate_execution = nullptr;
+    decltype(g_vk.execution_artifacts)::mapped_type *up_execution = nullptr;
+    const char *iq2_execution_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
+    bool use_iq2_execution = mid_only && gate_type == 16u &&
+        g_vk.shader_map.find("routed_moe_fused_mid_exec") != g_vk.shader_map.end() &&
+        !(iq2_execution_env && strcmp(iq2_execution_env, "0") == 0);
+    if (use_iq2_execution) {
+        auto gate_found = g_vk.execution_artifacts.find(gate_offset);
+        auto up_found = g_vk.execution_artifacts.find(up_offset);
+        const uint64_t artifact_rows = (uint64_t)n_total_expert * expert_mid_dim;
+        use_iq2_execution = gate_found != g_vk.execution_artifacts.end() &&
+            up_found != g_vk.execution_artifacts.end() &&
+            gate_found->second.arena_entry.format == DS4_VULKAN_EXEC_IQ2_XXS &&
+            up_found->second.arena_entry.format == DS4_VULKAN_EXEC_IQ2_XXS &&
+            gate_found->second.arena_entry.in_dim == expert_in_dim &&
+            up_found->second.arena_entry.in_dim == expert_in_dim &&
+            gate_found->second.arena_entry.out_dim >= artifact_rows &&
+            up_found->second.arena_entry.out_dim >= artifact_rows;
+        if (use_iq2_execution) {
+            gate_execution = &gate_found->second;
+            up_execution = &up_found->second;
+        } else if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2")) {
+            return false;
+        }
+    }
+    if (mid_only && gate_type == 16u) {
+        auto &iq2_stats = g_vk.execution_artifact_stats[ExecIQ2];
+        iq2_stats.dispatches++;
+        if (use_iq2_execution) iq2_stats.dispatch_hits++;
+        else iq2_stats.dispatch_fallbacks++;
+    }
     VkDescriptorBufferInfo selected_info, weights_info, add_info;
     if (!ds4gk_routed_buffer(x, x_info) || !ds4gk_routed_buffer(out, out_info) ||
         (!mid_only && (!ds4gk_routed_buffer(gate, gate_info) ||
@@ -7311,10 +8479,84 @@ static bool ds4gk_routed_common(
         return false;
     if (add_in && !ds4gk_routed_buffer(add_in, add_info)) return false;
     if (!add_in) add_info = out_info;
-    if (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
-        !ds4gk_routed_model(up_offset, gate_bytes, up_model) ||
+    if ((!use_iq2_execution &&
+         (!ds4gk_routed_model(gate_offset, gate_bytes, gate_model) ||
+          !ds4gk_routed_model(up_offset, gate_bytes, up_model))))
+        return false;
+    if (use_down_execution) {
+        auto found = g_vk.execution_artifacts.find(down_offset);
+        const uint64_t artifact_rows = (uint64_t)n_total_expert * out_dim;
+        if (found == g_vk.execution_artifacts.end() ||
+            found->second.arena_entry.format != DS4_VULKAN_EXEC_Q2_K ||
+            found->second.arena_entry.in_dim != expert_mid_dim ||
+            found->second.arena_entry.out_dim < artifact_rows) {
+            if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_EXECUTION")) return false;
+            use_down_execution = false;
+        } else {
+            down_execution = &found->second;
+            fused_down_reduce = true;
+        }
+    }
+    if (down_type == 10u) {
+        auto &q2_stats = g_vk.execution_artifact_stats[ExecQ2];
+        q2_stats.dispatches++;
+        if (use_down_execution) q2_stats.dispatch_hits++;
+        else q2_stats.dispatch_fallbacks++;
+    }
+    if (!use_down_execution && execution_artifact_required(ExecQ2)) {
+        g_vk.execution_artifact_stats[ExecQ2].failures++;
+        execution_artifact_failure(ExecQ2, nullptr, "runtime dispatch");
+        return false;
+    }
+    if (!use_down_execution &&
         !ds4gk_routed_model(down_offset, down_bytes, down_model))
         return false;
+
+    decltype(g_vk.execution_artifacts)::mapped_type *shared_execution = nullptr;
+    bool use_shared_hc_tail = shared_hc_tail &&
+        getenv("DS4_VULKAN_ROUTED_Q2_SHARED_HC_FUSE") != nullptr &&
+        use_down_execution && n_tokens == 1u && mid_only &&
+        gate_type == 16u && down_type == 10u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+        out_dim == 4096u && n_total_expert == 256u && n_expert == 6u &&
+        shared_hc_tail->shared_in_dim == 2048u &&
+        shared_hc_tail->shared_out_dim == 4096u &&
+        shared_hc_tail->n_embd == 4096u && shared_hc_tail->n_hc == 4u &&
+        g_vk.shader_map.find("routed_moe_q2_shared_hc_exec") !=
+            g_vk.shader_map.end();
+    if (getenv("DS4_VULKAN_TRACE_KERNELS") && shared_hc_tail) {
+        fprintf(stderr,
+                "ds4: [trace] mixed routed/shared HC candidate admitted=%u "
+                "shared=%u->%u routed=%u->%u->%u selected=%u\n",
+                use_shared_hc_tail ? 1u : 0u,
+                shared_hc_tail->shared_in_dim,
+                shared_hc_tail->shared_out_dim,
+                expert_in_dim, expert_mid_dim, out_dim, n_expert);
+    }
+    /* The caller's REQUIRE switch is a hard admission gate.  Do not let a
+     * missing Q2/Q8 artifact silently return success through the ordinary
+     * routed path: the C graph would then suppress the later shared-down/HC
+     * dispatch and leave out_hc unwritten while believing the fused tail ran.
+     */
+    const bool require_shared_hc_tail =
+        shared_hc_tail &&
+        getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE") != nullptr;
+    if (require_shared_hc_tail && !use_shared_hc_tail)
+        return false;
+    if (use_shared_hc_tail) {
+        use_shared_hc_tail = shared_hc_tail->out_hc &&
+            shared_hc_tail->shared_mid && shared_hc_tail->residual_hc &&
+            shared_hc_tail->split &&
+            shared_hc_tail->shared_mid->bytes >= 2048u * sizeof(float) &&
+            shared_hc_tail->out_hc->bytes >= 4096u * 4u * sizeof(float) &&
+            shared_hc_tail->residual_hc->bytes >= 4096u * 4u * sizeof(float) &&
+            shared_hc_tail->split->bytes >= 32u * sizeof(float) &&
+            ensure_execution_q8_artifact(
+                model_map, model_size, shared_hc_tail->shared_weight_offset,
+                2048u, 4096u, shared_execution);
+        if (!use_shared_hc_tail && getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE"))
+            return false;
+    }
 
     uint64_t q8_blocks = 0, q8_bytes = 0;
     uint64_t input_q8_bytes = 0, mid_q8_bytes = 0;
@@ -7362,7 +8604,7 @@ static bool ds4gk_routed_common(
         compact_mid_q8.device_id = mid->device_id;
     }
     if ((!persistent_q8 &&
-         ds4_gpu_tensor_alloc_host_scratch_in_place(&q8, q8_bytes) != 0) ||
+         ds4_gpu_tensor_alloc_slice_host_scratch_in_place(&q8, q8_bytes) != 0) ||
         (validate_selected &&
          ds4_gpu_tensor_alloc_host_scratch_in_place(&invalid,
                                                     sizeof(uint32_t)) != 0)) {
@@ -7435,17 +8677,43 @@ static bool ds4gk_routed_common(
         fused_gate_up = iq2_words && (mid_only ||
             g_vk.shader_map.find("routed_moe_fused") != g_vk.shader_map.end());
         if (mid_only) {
-            VkDescriptorBufferInfo fused_buffers[7] = {
-                q8_info, gate_model, up_model, selected_info,
-                compact_mid_q8_info,
-                weights_info, iq2_lut_info};
-            const char *fused_mid_shader = ds4gk_routed_shape_shader(
-                "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
-            ok = ds4gk_routed_dispatch_shader(
-                fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
-                fused_buffers, 7,
-                (expert_mid_dim + 255u) / 256u,
-                n_tokens, n_expert, sets);
+            if (use_iq2_execution) {
+                VkDescriptorBufferInfo fused_buffers[9] = {
+                    q8_info,
+                    {gate_execution->buffer,
+                     (VkDeviceSize)gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {gate_execution->buffer,
+                     (VkDeviceSize)gate_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)gate_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {up_execution->buffer,
+                     (VkDeviceSize)up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {up_execution->buffer,
+                     (VkDeviceSize)up_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)up_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    selected_info, compact_mid_q8_info, weights_info, iq2_lut_info};
+                const char *fused_mid_shader = ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid_exec",
+                    "routed_moe_fused_mid_exec_wave64");
+                ok = ds4gk_routed_dispatch_shader(
+                    fused_mid_shader, "gate_up_swiglu_iq2_q8_exec", pc,
+                    fused_buffers, 9,
+                    (expert_mid_dim + 255u) / 256u,
+                    n_tokens, n_expert, sets);
+            } else {
+                VkDescriptorBufferInfo fused_buffers[7] = {
+                    q8_info, gate_model, up_model, selected_info,
+                    compact_mid_q8_info,
+                    weights_info, iq2_lut_info};
+                const char *fused_mid_shader = ds4gk_routed_shape_shader(
+                    "routed_moe_fused_mid", "routed_moe_fused_mid_wave64");
+                ok = ds4gk_routed_dispatch_shader(
+                    fused_mid_shader, "gate_up_swiglu_iq2_q8", pc,
+                    fused_buffers, 7,
+                    (expert_mid_dim + 255u) / 256u,
+                    n_tokens, n_expert, sets);
+            }
         } else if (fused_gate_up) {
             VkDescriptorBufferInfo fused_buffers[9] = {
                 q8_info, gate_model, up_model, selected_info, gate_info,
@@ -7510,23 +8778,114 @@ static bool ds4gk_routed_common(
         pc.in_dim = expert_mid_dim;
         pc.q8_blocks = (uint32_t)mid_blocks;
     }
+    if (ok && use_shared_hc_tail) {
+        const uint64_t shared_q8_blocks =
+            (shared_hc_tail->shared_in_dim + 31u) / 32u;
+        const uint64_t shared_q8_bytes = shared_q8_blocks * 36u;
+        owned.shared_q8 = ds4_gpu_tensor_alloc_slice_device_scratch(shared_q8_bytes);
+        if (!owned.shared_q8 ||
+            ds4_gpu_quantize_q8_0_tensor(owned.shared_q8,
+                                         shared_hc_tail->shared_mid,
+                                         shared_hc_tail->shared_in_dim,
+                                         1u) == 0) {
+            ds4_gpu_tensor_free(owned.shared_q8);
+            owned.shared_q8 = nullptr;
+            use_shared_hc_tail = false;
+            shared_execution = nullptr;
+            if (getenv("DS4_VULKAN_REQUIRE_ROUTED_Q2_SHARED_HC_FUSE"))
+                ok = false;
+        }
+    }
     if (ok) {
         pc.mode = 3; pc.n_tokens = n_tokens;
         pc.q2_words = down_type == 10;
-        if (fused_down_reduce) {
+        if (use_shared_hc_tail) {
+            VkDescriptorBufferInfo shared_q8_info, tail_out_hc_info,
+                tail_residual_info, tail_split_info;
+            const bool tail_buffers = owned.shared_q8 &&
+                ds4gk_routed_buffer(owned.shared_q8, shared_q8_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->out_hc, tail_out_hc_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->residual_hc,
+                                    tail_residual_info) &&
+                ds4gk_routed_buffer(shared_hc_tail->split, tail_split_info);
+            if (!tail_buffers) {
+                ok = false;
+            } else {
+                VkDescriptorBufferInfo tail_buffers_info[12] = {
+                    compact_mid_q8_info,
+                    shared_q8_info,
+                    {shared_execution->buffer,
+                     (VkDeviceSize)shared_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)shared_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {shared_execution->buffer,
+                     (VkDeviceSize)shared_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)shared_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[
+                         DS4_VULKAN_EXEC_PLANE_Q2_D],
+                     (VkDeviceSize)down_execution->plane_bytes[
+                         DS4_VULKAN_EXEC_PLANE_Q2_D]},
+                    selected_info, out_info, tail_out_hc_info,
+                    tail_residual_info, tail_split_info};
+                const uint32_t rows_per_group = 32u / n_expert;
+                ok = rows_per_group != 0u &&
+                    ds4gk_routed_dispatch_shader(
+                        "routed_moe_q2_shared_hc_exec",
+                        "down_reduce_q2_shared_hc_exec", pc,
+                        tail_buffers_info, 12,
+                        (out_dim + rows_per_group - 1u) / rows_per_group,
+                        n_tokens, 1, sets);
+            }
+        } else if (fused_down_reduce) {
             pc.add_enabled = add_in ? 1u : 0u;
-            VkDescriptorBufferInfo down_reduce_buffers[5] = {
-                mid_only ? compact_mid_q8_info : q8_info,
-                down_model, selected_info, out_info, add_info};
-            const char *down_reduce_shader = ds4gk_routed_shape_shader(
-                "routed_moe_down_reduce_q2",
-                "routed_moe_down_reduce_q2_wave64");
             const uint32_t rows_per_group = 32u / n_expert;
-            ok = ds4gk_routed_dispatch_shader(
-                down_reduce_shader, "down_reduce_q2", pc,
-                down_reduce_buffers, 5,
-                (out_dim + rows_per_group - 1u) / rows_per_group,
-                n_tokens, 1, sets);
+            if (rows_per_group == 0u) {
+                ok = false;
+            } else if (use_down_execution) {
+                VkDescriptorBufferInfo down_reduce_buffers[7] = {
+                    mid_only ? compact_mid_q8_info : q8_info,
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_SCALE],
+                     (VkDeviceSize)down_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_SCALE]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_PAYLOAD],
+                     (VkDeviceSize)down_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_PAYLOAD]},
+                    {down_execution->buffer,
+                     (VkDeviceSize)down_execution->plane_offset[DS4_VULKAN_EXEC_PLANE_Q2_D],
+                     (VkDeviceSize)down_execution->plane_bytes[DS4_VULKAN_EXEC_PLANE_Q2_D]},
+                    selected_info, out_info, add_info};
+                ok = ds4gk_routed_dispatch_shader(
+                    "routed_moe_down_reduce_q2_exec", "down_reduce_q2_exec", pc,
+                    down_reduce_buffers, 7,
+                    (out_dim + rows_per_group - 1u) / rows_per_group,
+                    n_tokens, 1, sets);
+            } else {
+                VkDescriptorBufferInfo down_reduce_buffers[5] = {
+                    mid_only ? compact_mid_q8_info : q8_info,
+                    down_model, selected_info, out_info, add_info};
+                const char *down_reduce_shader = ds4gk_routed_shape_shader(
+                    "routed_moe_down_reduce_q2",
+                    "routed_moe_down_reduce_q2_wave64");
+                ok = ds4gk_routed_dispatch_shader(
+                    down_reduce_shader, "down_reduce_q2", pc,
+                    down_reduce_buffers, 5,
+                    (out_dim + rows_per_group - 1u) / rows_per_group,
+                    n_tokens, 1, sets);
+            }
         } else {
             VkDescriptorBufferInfo down_buffers[6] = {
                 mid_only ? compact_mid_q8_info : q8_info,
@@ -7603,6 +8962,68 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim, selected, weights,
         n_total_expert, n_expert, clamp, x, add_in, 1, &mid_is_f16,
         !get_cmd_ctx().layer_batch_active) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *routed_out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint64_t                shared_weight_offset,
+        uint32_t                shared_in_dim,
+        uint32_t                shared_out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                layer_index,
+        bool                    force_resident) {
+    DS4_VK_TRACE_KERNEL("routed_moe_q2_shared_hc_exec");
+    (void)layer_index;
+    (void)force_resident;
+    if (!out_hc || !routed_out || !shared_mid || !residual_hc || !split)
+        return 0;
+    RoutedSharedHcTail tail{};
+    tail.out_hc = out_hc;
+    tail.shared_mid = shared_mid;
+    tail.residual_hc = residual_hc;
+    tail.split = split;
+    tail.shared_weight_offset = shared_weight_offset;
+    tail.shared_in_dim = shared_in_dim;
+    tail.shared_out_dim = shared_out_dim;
+    tail.n_embd = n_embd;
+    tail.n_hc = n_hc;
+    bool mid_is_f16 = false;
+    return ds4gk_routed_common(
+        routed_out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, nullptr, 1, &mid_is_f16,
+        !get_cmd_ctx().layer_batch_active, &tail) ? 1 : 0;
 }
 
 /* Prefill routed MoE over n_tokens tokens.  Same math as the single-token
@@ -7947,6 +9368,181 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     rows = std::min(rows, split->bytes / (mix_hc * sizeof(float)));
     rows = std::min(rows, out_hc->bytes / (hc_values * sizeof(float)));
     if (rows == 0 || rows > UINT32_MAX) return 0;
+
+    /* Opt-in exact appliance candidate: the common single-token Flash shape
+     * can consume routed_out directly while computing the shared Q8 down row,
+     * eliminating shared_out plus the separate HC-expand dispatch.  Keep it
+     * opt-in until the full-model artifact gate measures it; the established
+     * path remains the default and is also the fallback for every other shape.
+     */
+    const bool add_rows2_fuse =
+        getenv("DS4_VULKAN_Q8_HC_ADD_FUSE") != nullptr &&
+        in_dim == 4096u && out_dim == 4096u && n_embd == 4096u &&
+        n_hc == 4u && rows == 1u;
+    if (add_rows2_fuse) {
+        const uint64_t blocks = (in_dim + 31u) / 32u;
+        /* Prefer the immutable execution artifact used by the ordinary
+         * decode path.  The legacy aligned cache overlaps the same GGUF
+         * range and would evict the artifact; never silently switch storage
+         * representation just because this fusion is enabled. */
+        const char *q8_mode = getenv("DS4_VULKAN_Q8_MODE");
+        const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
+        const bool execution_candidate =
+            g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
+            !(exec_env && strcmp(exec_env, "0") == 0) &&
+            !(q8_mode && strcmp(q8_mode, "exact") == 0);
+        bool execution_available = false;
+        if (execution_candidate) {
+            auto exec_shader_it = g_vk.shader_map.find(
+                "matmul_q8_0_exec_hc_expand_add_wave64");
+            decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
+            execution_available = ensure_execution_q8_artifact(
+                model_map, model_size, weight_offset, in_dim, out_dim, execution);
+            if (execution_available &&
+                g_vk.caps.subgroup_size == 64 && g_vk.caps.has_subgroup_shuffle &&
+                exec_shader_it != g_vk.shader_map.end()) {
+                ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(
+                    blocks * 36u);
+                if (q) {
+                    auto &ctx = get_cmd_ctx();
+                    const bool resume_recording = ctx.recording;
+                    int fused_ok = ds4_gpu_quantize_q8_0_tensor(q, shared_mid,
+                                                                  in_dim, 1);
+                    VkBuffer xbuf, hbuf, rbuf, sbuf, routed_buf;
+                    VkDeviceSize xoff, hoff, roff, soff, routed_off;
+                    if (fused_ok && find_tensor_buffer(q, xbuf, xoff) &&
+                        find_tensor_buffer(out_hc, hbuf, hoff) &&
+                        find_tensor_buffer(residual_hc, rbuf, roff) &&
+                        find_tensor_buffer(split, sbuf, soff) &&
+                        find_tensor_buffer(routed_out, routed_buf, routed_off)) {
+                        const VkDeviceSize align =
+                            g_vk.caps.min_storage_buffer_offset_alignment;
+                        if (align && ((xoff | hoff | roff | soff | routed_off) % align) != 0) {
+                            fused_ok = 0;
+                        } else {
+                            VkDescriptorBufferInfo buffers[7] = {
+                                {xbuf, xoff, (VkDeviceSize)(blocks * 36u)},
+                                {execution->buffer,
+                                 (VkDeviceSize)execution->plane_offset[0],
+                                 (VkDeviceSize)execution->plane_bytes[0]},
+                                {execution->buffer,
+                                 (VkDeviceSize)execution->plane_offset[1],
+                                 (VkDeviceSize)execution->plane_bytes[1]},
+                                {hbuf, hoff, (VkDeviceSize)hc_values * sizeof(float)},
+                                {rbuf, roff, (VkDeviceSize)hc_values * sizeof(float)},
+                                {sbuf, soff, (VkDeviceSize)mix_hc * sizeof(float)},
+                                {routed_buf, routed_off,
+                                 (VkDeviceSize)embd_values * sizeof(float)}};
+                            struct {
+                                uint32_t in_dim, out_dim, n_hc;
+                                uint32_t artifact_blocks, source_blocks_per_tile;
+                            } pc = {(uint32_t)in_dim, (uint32_t)out_dim, n_hc,
+                                    (uint32_t)(blocks / 8u), 8u};
+                            if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                                fprintf(stderr,
+                                        "ds4: [trace] matmul_q8_0_exec_hc_expand_add_wave64 "
+                                        "shape=%llux%llu\n",
+                                        (unsigned long long)in_dim,
+                                        (unsigned long long)out_dim);
+                            fused_ok = record_simple_shader(
+                                "matmul_q8_0_exec_hc_expand_add_wave64", &pc,
+                                sizeof(pc), buffers, 7,
+                                (uint32_t)((out_dim + 3u) / 4u), 1, 1,
+                                resume_recording);
+                        }
+                    } else {
+                        fused_ok = 0;
+                    }
+                    if (ctx.layer_batch_active) {
+                        ds4_gpu_tensor_free(q);
+                    } else {
+                        if (fused_ok) fused_ok = submit_and_wait();
+                        else if (ctx.recording && ctx.command_count != 0)
+                            (void)submit_and_wait();
+                        ds4_gpu_tensor_free(q);
+                    }
+                    if (fused_ok) return 1;
+                }
+            }
+        }
+
+        auto shader_it = g_vk.shader_map.find(
+            "matmul_q8_0_hc_expand_add_rows2_bfe");
+        decltype(g_vk.aligned_cache)::mapped_type *aligned = nullptr;
+        const uint64_t q_bytes = blocks * 36u;
+        const uint64_t records = out_dim * blocks;
+        const uint64_t scale_bytes = (records * 2u + 3u) & ~3ull;
+        const uint64_t payload_bytes = records * 32u;
+        const bool aligned_ok = !execution_available &&
+            !execution_artifact_required(ExecQ8) &&
+            shader_it != g_vk.shader_map.end() &&
+            ensure_aligned_weight(model_map, model_size, weight_offset,
+                                  in_dim, out_dim, aligned) && aligned &&
+            scale_bytes <= aligned->scale_bytes &&
+            payload_bytes <= aligned->payload_bytes &&
+            (!g_vk.caps.max_storage_buffer_range ||
+             (scale_bytes <= g_vk.caps.max_storage_buffer_range &&
+              payload_bytes <= g_vk.caps.max_storage_buffer_range));
+        if (aligned_ok) {
+            ds4_gpu_tensor *q = ds4_gpu_tensor_alloc_slice_device_scratch(q_bytes);
+            if (q) {
+                auto &ctx = get_cmd_ctx();
+                const bool resume_recording = ctx.recording;
+                int fused_ok = ds4_gpu_quantize_q8_0_tensor(
+                    q, shared_mid, in_dim, 1);
+                VkBuffer xbuf, hbuf, rbuf, sbuf, routed_buf;
+                VkDeviceSize xoff, hoff, roff, soff, routed_off;
+                if (fused_ok && find_tensor_buffer(q, xbuf, xoff) &&
+                    find_tensor_buffer(out_hc, hbuf, hoff) &&
+                    find_tensor_buffer(residual_hc, rbuf, roff) &&
+                    find_tensor_buffer(split, sbuf, soff) &&
+                    find_tensor_buffer(routed_out, routed_buf, routed_off)) {
+                    const VkDeviceSize align =
+                        g_vk.caps.min_storage_buffer_offset_alignment;
+                    if (align && ((xoff | hoff | roff | soff | routed_off) % align) != 0) {
+                        fused_ok = 0;
+                    } else {
+                        VkDescriptorBufferInfo buffers[7] = {
+                            {xbuf, xoff, (VkDeviceSize)q_bytes},
+                            {aligned->gpu.buffer, 0, (VkDeviceSize)scale_bytes},
+                            {aligned->gpu.buffer,
+                             (VkDeviceSize)aligned->payload_offset,
+                             (VkDeviceSize)payload_bytes},
+                            {hbuf, hoff, (VkDeviceSize)hc_values * sizeof(float)},
+                            {rbuf, roff, (VkDeviceSize)hc_values * sizeof(float)},
+                            {sbuf, soff, (VkDeviceSize)mix_hc * sizeof(float)},
+                            {routed_buf, routed_off,
+                             (VkDeviceSize)embd_values * sizeof(float)}};
+                        struct { uint32_t in_dim, out_dim, n_hc, blocks; } pc = {
+                            (uint32_t)in_dim, (uint32_t)out_dim, n_hc,
+                            (uint32_t)blocks};
+                        if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                            fprintf(stderr,
+                                    "ds4: [trace] matmul_q8_0_hc_expand_add_rows2_bfe "
+                                    "shape=%llux%llu\n",
+                                    (unsigned long long)in_dim,
+                                    (unsigned long long)out_dim);
+                        fused_ok = record_simple_shader(
+                            "matmul_q8_0_hc_expand_add_rows2_bfe", &pc,
+                            sizeof(pc), buffers, 7,
+                            (uint32_t)((out_dim + 1u) / 2u), 1, 1,
+                            resume_recording);
+                    }
+                } else {
+                    fused_ok = 0;
+                }
+                if (ctx.layer_batch_active) {
+                    ds4_gpu_tensor_free(q);
+                } else {
+                    if (fused_ok) fused_ok = submit_and_wait();
+                    else if (ctx.recording && ctx.command_count != 0)
+                        (void)submit_and_wait();
+                    ds4_gpu_tensor_free(q);
+                }
+                if (fused_ok) return 1;
+            }
+        }
+    }
 
     if (ds4_gpu_matmul_q8_0_tensor(shared_out, model_map, model_size,
                                    weight_offset, in_dim, out_dim,

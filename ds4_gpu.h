@@ -118,6 +118,11 @@ int ds4_gpu_batch_layer_begin(uint32_t layer);
  * preceding work already recorded in the command stream. */
 int ds4_gpu_batch_prefill_layer_begin(uint32_t layer);
 int ds4_gpu_batch_layer_end(uint32_t layer);
+/* Keep a non-streaming worker layer slice in one logical command/lifetime
+ * epoch. The command-size guard may split submissions, but retirement waits
+ * only at slice_end. */
+int ds4_gpu_batch_slice_begin(uint32_t first_layer, uint32_t last_layer);
+int ds4_gpu_batch_slice_end(uint32_t first_layer, uint32_t last_layer);
 #endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
@@ -131,6 +136,19 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+#ifdef DS4_VULKAN_BUILD
+int ds4_gpu_cache_iq2_expert_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+#endif
+/* Prebuild/register a tile-major Q2_K artifact for a complete expert-major
+ * down table. out_dim is the total row count across all experts. */
+int ds4_gpu_cache_q2_execution_range(const void *model_map, uint64_t model_size,
+                                     uint64_t offset, uint64_t bytes,
+                                     uint64_t in_dim, uint64_t out_dim,
+                                     const char *label);
+#ifdef DS4_VULKAN_BUILD
+/* Emit strict execution-artifact hit/fallback counters after startup caching. */
+void ds4_gpu_execution_artifact_report(void);
+#endif
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
 #ifdef DS4_ROCM_BUILD
@@ -2579,6 +2597,48 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
+        uint32_t                layer_index,
+        bool                    force_resident);
+
+/* Opt-in exact single-GPU decode tail: routed IQ2/Q2 down reduction and
+ * shared Q8 down feed one HC-post dispatch.  The ordinary routed output is
+ * retained for diagnostics/compatibility while HC output is written
+ * directly. */
+int ds4_gpu_routed_moe_shared_down_hc_fused_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *routed_out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint64_t                shared_weight_offset,
+        uint32_t                shared_in_dim,
+        uint32_t                shared_out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
         uint32_t                layer_index,
         bool                    force_resident);
 

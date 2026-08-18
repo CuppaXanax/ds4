@@ -1,0 +1,118 @@
+#version 460 core
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+/*
+ * Wave64 consumer for the tile-major Q8 execution artifact.
+ *
+ * One subgroup owns one 256-element K tile for four output rows. The 64
+ * lanes map to the eight source Q8 blocks and eight payload words in that
+ * tile, so a payload load is lane-contiguous (word 0..63), unlike the
+ * ordinary artifact consumer's one-lane-per-block mapping. Each lane
+ * computes the four int8 products in its word; lane zero reconstructs each
+ * block dot with subgroup shuffles. Integer addition is exact here (the
+ * dot cannot overflow int32), and the FP32 term chain remains in ascending
+ * source-block order.
+ */
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer XBuf       { uint x_q8_buf[]; };
+layout(set = 0, binding = 1) buffer ScaleBuf   { uint scale_buf[]; };
+layout(set = 0, binding = 2) buffer PayloadBuf { uint payload_buf[]; };
+layout(set = 0, binding = 3) buffer OutBuf     { float out_buf[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint artifact_blocks;
+    uint source_blocks_per_tile;
+} pc;
+
+float f16tof32(uint h) {
+    uint s = h & 0x8000u;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0u) return m == 0u ? (s != 0u ? -0.0 : 0.0) :
+        (s != 0u ? -1.0 : 1.0) * (float(m) / 1024.0) * (1.0 / 16384.0);
+    if (e == 31u) return m == 0u ? (s != 0u ? -1.0 / 0.0 : 1.0 / 0.0) : 0.0 / 0.0;
+    return (s != 0u ? -1.0 : 1.0) * (1.0 + float(m) / 1024.0) *
+           exp2(float(int(e) - 15));
+}
+
+int i8_at(uint word, uint byte_index) {
+    return bitfieldExtract(int(word), int(byte_index * 8u), 8);
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint tile = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.z;
+    const uint row_base = tile * 4u;
+    const uint source_block = lane >> 3u;
+    const uint word_slot = lane & 7u;
+    const uint x_base = token * pc.artifact_blocks * 8u * 9u;
+    float sums[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+    if (pc.source_blocks_per_tile != 8u ||
+        pc.artifact_blocks == 0u || token >= pc.n_tok ||
+        row_base >= pc.out_dim)
+        return;
+
+    for (uint artifact_block = 0u;
+         artifact_block < pc.artifact_blocks; ++artifact_block) {
+        const uint x_block = artifact_block * 8u + source_block;
+        const uint x_word = x_base + x_block * 9u + 1u + word_slot;
+        const int x_value0 = i8_at(x_q8_buf[x_word], 0u);
+        const int x_value1 = i8_at(x_q8_buf[x_word], 1u);
+        const int x_value2 = i8_at(x_q8_buf[x_word], 2u);
+        const int x_value3 = i8_at(x_q8_buf[x_word], 3u);
+        const uint x_scale_base = x_base + x_block * 9u;
+
+        for (uint row_in_tile = 0u; row_in_tile < 4u; ++row_in_tile) {
+            const uint row = row_base + row_in_tile;
+            if (row >= pc.out_dim) continue;
+            const uint entry = ((tile * pc.artifact_blocks + artifact_block) * 4u) +
+                               row_in_tile;
+            const uint payload_word = entry * 64u + source_block * 8u + word_slot;
+            const uint weight_word = payload_buf[payload_word];
+            const int partial =
+                i8_at(weight_word, 0u) * x_value0 +
+                i8_at(weight_word, 1u) * x_value1 +
+                i8_at(weight_word, 2u) * x_value2 +
+                i8_at(weight_word, 3u) * x_value3;
+
+            /* First reduce only this lane's source block.  All eight lanes
+             * in the block get the same exact integer dot, so the leader
+             * value can then be broadcast once per block.  The previous
+             * version rebuilt all eight block dots in every lane (64
+             * shuffles here); this preserves the integer/FP32 ordering with
+             * 16 shuffles per row instead of 64. */
+            int own_block_dot = 0;
+            const uint own_base = source_block * 8u;
+            for (uint word = 0u; word < 8u; ++word)
+                own_block_dot += subgroupShuffle(partial, own_base + word);
+
+            for (uint block = 0u; block < 8u; ++block) {
+                const int block_dot = subgroupShuffle(own_block_dot, block * 8u);
+                if (lane == 0u) {
+                    const uint scale_byte = entry * 16u + block * 2u;
+                    const uint scale_word = scale_buf[scale_byte >> 2u];
+                    const uint scale_bits =
+                        (scale_word >> ((scale_byte & 3u) * 8u)) & 0xffffu;
+                    const float scale_product = f16tof32(scale_bits) *
+                        uintBitsToFloat(x_q8_buf[x_scale_base + block * 9u]);
+                    sums[row_in_tile] += scale_product * float(block_dot);
+                }
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        for (uint row_in_tile = 0u; row_in_tile < 4u; ++row_in_tile) {
+            const uint row = row_base + row_in_tile;
+            if (row < pc.out_dim)
+                out_buf[token * pc.out_dim + row] = sums[row_in_tile];
+        }
+    }
+}

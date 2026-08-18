@@ -51,6 +51,45 @@ for mode in range(6):
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {routed.name} mode {mode}: {diagnostics}", file=sys.stderr)
 
+# The common 4096-input Q8 execution artifact has only 128 logical source
+# blocks (eight source blocks per artifact tile). Compile a 128-lane variant
+# so the appliance does not launch 128 permanently idle invocations. Keep the
+# 256-lane binary for larger shapes such as 8192-input projections.
+q8_exec = SRC_DIR / "matmul_q8_0_exec.comp"
+q8_exec_128 = OUT_DIR / "matmul_q8_0_exec_128.spv"
+result = subprocess.run(
+    [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+     "-DDS4_EXEC_Q8_LOCAL128=1", str(q8_exec), "-o", str(q8_exec_128)],
+    capture_output=True, text=True
+)
+if result.returncode == 0:
+    compiled += 1
+else:
+    failed += 1
+    diagnostics = "\n".join(part for part in
+                            (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"FAIL {q8_exec.name} local128: {diagnostics}", file=sys.stderr)
+
+# The tile-major artifact payload is already word-contiguous inside each
+# 256-element tile. On a proven Wave64 device, use one lane per payload word
+# so each load instruction sees consecutive words instead of one lane per
+# whole 32-byte Q8 block. The ordinary artifact variants remain available
+# for non-Wave64 devices.
+q8_exec_wave64 = SRC_DIR / "matmul_q8_0_exec_wave64.comp"
+q8_exec_wave64_spv = OUT_DIR / "matmul_q8_0_exec_wave64.spv"
+result = subprocess.run(
+    [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+     str(q8_exec_wave64), "-o", str(q8_exec_wave64_spv)],
+    capture_output=True, text=True
+)
+if result.returncode == 0:
+    compiled += 1
+else:
+    failed += 1
+    diagnostics = "\n".join(part for part in
+                            (result.stdout.strip(), result.stderr.strip()) if part)
+    print(f"FAIL {q8_exec_wave64.name}: {diagnostics}", file=sys.stderr)
+
 # BC-250's GFX1013 path has Wave64 subgroups.  These variants preserve the
 # scalar arithmetic and reduction order but replace repeated workgroup
 # barriers with subgroup shuffles; the runtime admits them only on a proven
@@ -70,6 +109,28 @@ for source_name in ("routed_moe_fused_mid", "routed_moe_down_reduce_q2"):
         diagnostics = "\n".join(part for part in
                                 (result.stdout.strip(), result.stderr.strip()) if part)
         print(f"FAIL {src.name} Wave64: {diagnostics}", file=sys.stderr)
+
+# The routed IQ2 execution-artifact consumer reuses the exact fused source
+# with a different descriptor ABI and tile-addressing macro.  Keep this as a
+# separately named pipeline without duplicating the shader body.
+src = SRC_DIR / "routed_moe_fused_mid.comp"
+for suffix, defines in (
+    ("_exec", ["-DDS4_EXECUTION_ARTIFACT_IQ2=1"]),
+    ("_exec_wave64", ["-DDS4_EXECUTION_ARTIFACT_IQ2=1", "-DDS4_ROUTED_WAVE64=1"]),
+):
+    spv = OUT_DIR / f"routed_moe_fused_mid{suffix}.spv"
+    result = subprocess.run(
+        [GLSLANG, "-V", "--target-env", "vulkan1.2", f"-I{SRC_DIR}",
+         *defines, str(src), "-o", str(spv)],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        compiled += 1
+    else:
+        failed += 1
+        diagnostics = "\n".join(part for part in
+                                (result.stdout.strip(), result.stderr.strip()) if part)
+        print(f"FAIL {src.name}{suffix}: {diagnostics}", file=sys.stderr)
 
 print(f"Compiled {compiled} shaders{' (with {failed} failures)' if failed else ''} to {OUT_DIR}")
 sys.exit(1 if failed else 0)

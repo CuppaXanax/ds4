@@ -4245,7 +4245,7 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
     decltype(g_vk.execution_artifacts)::mapped_type *execution = nullptr;
     const char *exec_env = getenv("DS4_VULKAN_EXECUTION_ARTIFACT_Q8");
     bool use_execution = g_vk.shader_map.find("matmul_q8_0_exec") != g_vk.shader_map.end() &&
-        n_tok == 1u && in_dim <= 8192u && blocks <= 256u &&
+        in_dim <= 8192u && blocks <= 256u &&
         (in_dim % 256u) == 0u && (out_dim % 4u) == 0u &&
         !(exec_env && strcmp(exec_env, "0") == 0) &&
         !(q8_mode && strcmp(q8_mode, "exact") == 0);
@@ -4266,12 +4266,10 @@ int ds4_gpu_matmul_q8_0_prequant_tensor(
         fprintf(stderr, "ds4: [trace] matmul_q8_0_exec artifact off=%llu shape=%llux%llu\n",
                 (unsigned long long)weight_offset,
                 (unsigned long long)in_dim, (unsigned long long)out_dim);
-    /* The execution artifact consumer is deliberately the decode (n_tok=1)
-     * stream. Prefill still uses its token-batched Q8 path; requiring the
-     * decode artifact must not make that separate path fail closed before a
-     * decode token is reached. Keep counting the prefill fallback so coverage
-     * remains visible, but enforce strictness on the intended decode shape. */
-    if (!use_execution && n_tok == 1u && execution_artifact_required(ExecQ8)) {
+    /* Packed weights are the sole resident owner.  Both decode and batched
+     * prefill must consume that artifact; falling back here would reread raw
+     * pages that were released after artifact commit. */
+    if (!use_execution && execution_artifact_required(ExecQ8)) {
         g_vk.execution_artifact_stats[ExecQ8].failures++;
         execution_artifact_failure(ExecQ8, nullptr, "runtime dispatch");
         return 0;

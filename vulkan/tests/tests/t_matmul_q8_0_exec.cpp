@@ -40,7 +40,7 @@ static float exec_f16_to_f32(uint16_t half) {
 static int test_matmul_q8_0_execution_artifact(void) {
     const uint64_t in_dim = 512;
     const uint64_t out_dim = 8;
-    const uint64_t n_tok = 1;
+    const uint64_t n_tok = 4096;
     const uint64_t blocks = in_dim / 32u;
     const uint64_t row_bytes = blocks * 34u;
     const uint64_t source_offset = 4096;
@@ -56,13 +56,15 @@ static int test_matmul_q8_0_execution_artifact(void) {
         }
     }
     const std::vector<uint8_t> raw_model = model;
-    std::vector<float> input(in_dim);
-    for (uint64_t i = 0; i < in_dim; ++i)
-        input[i] = (float)((int)((i * 19u + 7u) % 101u) - 50) * 0.03125f;
+    std::vector<float> input(n_tok * in_dim);
+    for (uint64_t token = 0; token < n_tok; ++token)
+        for (uint64_t i = 0; i < in_dim; ++i)
+            input[token * in_dim + i] =
+                (float)((int)((i * 19u + token * 13u + 7u) % 101u) - 50) * 0.03125f;
 
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
-    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(blocks * 36u);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(n_tok * blocks * 36u);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(n_tok * out_dim * sizeof(float));
     int result = 1;
     auto cleanup = [&]() {
         ds4_gpu_set_model_map(model.data(), model.size());
@@ -102,36 +104,41 @@ static int test_matmul_q8_0_execution_artifact(void) {
                                              source_offset, in_dim, out_dim, q, n_tok) ||
         !ds4_gpu_end_commands())
         return cleanup();
-    std::vector<float> got(out_dim);
+    std::vector<float> got(n_tok * out_dim);
     if (!ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)))
         return cleanup();
 
-    for (uint64_t row = 0; row < out_dim; ++row) {
-        float expected = 0.0f;
-        for (uint64_t block = 0; block < blocks; ++block) {
-            uint16_t scale_bits;
-            std::memcpy(&scale_bits,
-                        raw_model.data() + source_offset + row * row_bytes + block * 34u,
-                        sizeof(scale_bits));
-            const uint8_t *q_weight = raw_model.data() + source_offset +
-                                      row * row_bytes + block * 34u + 2u;
-            const uint8_t *q_input = packed.data() + block * 36u + 4u;
-            uint32_t activation_bits;
-            std::memcpy(&activation_bits, packed.data() + block * 36u, sizeof(activation_bits));
-            float activation_scale;
-            std::memcpy(&activation_scale, &activation_bits, sizeof(activation_scale));
-            int dot = 0;
-            for (uint32_t i = 0; i < 32u; ++i) {
-                const int8_t w = (int8_t)q_weight[i];
-                const int8_t a = (int8_t)q_input[i];
-                dot += (int)w * (int)a;
+    for (uint64_t token = 0; token < n_tok; ++token) {
+        for (uint64_t row = 0; row < out_dim; ++row) {
+            float expected = 0.0f;
+            for (uint64_t block = 0; block < blocks; ++block) {
+                uint16_t scale_bits;
+                std::memcpy(&scale_bits,
+                            raw_model.data() + source_offset + row * row_bytes + block * 34u,
+                            sizeof(scale_bits));
+                const uint8_t *q_weight = raw_model.data() + source_offset +
+                                          row * row_bytes + block * 34u + 2u;
+                const uint64_t packed_block = token * blocks + block;
+                const uint8_t *q_input = packed.data() + packed_block * 36u + 4u;
+                uint32_t activation_bits;
+                std::memcpy(&activation_bits, packed.data() + packed_block * 36u,
+                            sizeof(activation_bits));
+                float activation_scale;
+                std::memcpy(&activation_scale, &activation_bits, sizeof(activation_scale));
+                int dot = 0;
+                for (uint32_t i = 0; i < 32u; ++i) {
+                    const int8_t w = (int8_t)q_weight[i];
+                    const int8_t a = (int8_t)q_input[i];
+                    dot += (int)w * (int)a;
+                }
+                expected += exec_f16_to_f32(scale_bits) *
+                            activation_scale *
+                            (float)dot;
             }
-            expected += exec_f16_to_f32(scale_bits) *
-                        activation_scale *
-                        (float)dot;
+            const float actual = got[token * out_dim + row];
+            if (!std::isfinite(actual) || std::fabs(actual - expected) > 1e-5f)
+                return cleanup();
         }
-        if (!std::isfinite(got[row]) || std::fabs(got[row] - expected) > 1e-5f)
-            return cleanup();
     }
     result = 0;
     return cleanup();

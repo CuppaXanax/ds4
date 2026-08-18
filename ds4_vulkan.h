@@ -43,8 +43,10 @@ typedef struct ds4_vulkan_caps {
     uint32_t max_compute_work_group_size[3];
     uint64_t max_storage_buffer_range;
     uint32_t max_shared_memory_size;       /* bytes */
-    uint64_t device_memory_total;          /* bytes */
-    uint64_t device_memory_available;      /* bytes at init */
+    uint64_t device_memory_total;          /* device-local capacity bytes */
+    uint64_t device_memory_available;      /* current measured available bytes */
+    uint64_t device_memory_budget;         /* bytes; VK_EXT_memory_budget only */
+    bool     has_memory_budget;            /* budget is reported, not capacity */
     bool     has_float16;                  /* VK_KHR_shader_float16_int8 */
     bool     has_int8;                     /* VK_KHR_shader_int8 */
     bool     has_16bit_storage;            /* VK_KHR_16bit_storage */

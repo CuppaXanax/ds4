@@ -646,7 +646,8 @@ static int select_physical_device(void) {
     vkGetPhysicalDeviceMemoryProperties(best, &mem);
     g_vk.caps.device_memory_total = 0;
     for (uint32_t i = 0; i < mem.memoryHeapCount; i++)
-        g_vk.caps.device_memory_total += mem.memoryHeaps[i].size;
+        if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            g_vk.caps.device_memory_total += mem.memoryHeaps[i].size;
 
     fprintf(stderr, "ds4: VULKAN device: %s driver=%s subgroup=%u max_shmem=%u mem=%lu MB\n",
             props.deviceName, ver, g_vk.caps.subgroup_size, g_vk.caps.max_shared_memory_size,
@@ -700,11 +701,16 @@ static int create_logical_device(void) {
     a64.shaderBufferInt64Atomics = VK_TRUE; a64.shaderSharedInt64Atomics = VK_TRUE;
     f13.pNext = &a64;
 
-    const char *dext[] = { VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME };
+    std::vector<const char *> dext = {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME};
+    const bool has_memory_budget =
+        has_extension(g_vk.phys_device, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (has_memory_budget)
+        dext.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = dext;
+    dci.enabledExtensionCount = (uint32_t)dext.size();
+    dci.ppEnabledExtensionNames = dext.data();
     dci.pEnabledFeatures = &feat; dci.pNext = &f11;
     VK_CHECK_RAW(vkCreateDevice(g_vk.phys_device, &dci, nullptr, &g_vk.device));
     vkGetDeviceQueue(g_vk.device, qf, 0, &g_vk.queue);
@@ -713,8 +719,12 @@ static int create_logical_device(void) {
     vaci.vulkanApiVersion = VK_API_VERSION_1_3;
     vaci.physicalDevice = g_vk.phys_device; vaci.device = g_vk.device;
     vaci.instance = g_vk.instance;
-    vaci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    vaci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+        (has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
     VK_CHECK_RAW(vmaCreateAllocator(&vaci, &g_vk.allocator));
+    g_vk.caps.has_memory_budget = has_memory_budget;
+    if (!has_memory_budget)
+        fprintf(stderr, "ds4: VULKAN VK_EXT_memory_budget unavailable; free heap headroom is unknown\n");
 
     VkDescriptorPoolSize ps[] = {{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 65536 }};
     VkDescriptorPoolCreateInfo dpci{};
@@ -1758,6 +1768,32 @@ static int dispatch_shader(const char *name,
  * PART 2: GPU API Implementations
  * ===================================================================== */
 
+static bool refresh_memory_budget(bool emit_log) {
+    if (!g_vk.caps.has_memory_budget || !g_vk.allocator) {
+        g_vk.caps.device_memory_budget = 0;
+        g_vk.caps.device_memory_available = 0;
+        return false;
+    }
+    VkPhysicalDeviceMemoryProperties mem{};
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys_device, &mem);
+    std::vector<VmaBudget> budgets(mem.memoryHeapCount);
+    vmaGetHeapBudgets(g_vk.allocator, budgets.data());
+    uint64_t budget = 0, usage = 0;
+    for (uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
+        if (!(mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            continue;
+        budget += budgets[i].budget;
+        usage += budgets[i].usage;
+    }
+    g_vk.caps.device_memory_budget = budget;
+    g_vk.caps.device_memory_available = budget > usage ? budget - usage : 0;
+    if (emit_log)
+        fprintf(stderr, "ds4: VULKAN heap budget=%llu MB available=%llu MB\n",
+                (unsigned long long)(budget / (1024 * 1024)),
+                (unsigned long long)(g_vk.caps.device_memory_available / (1024 * 1024)));
+    return true;
+}
+
 /* ---- Initialization ---- */
 int ds4_gpu_init(void) {
     if (g_vk.initialized) return 1;
@@ -1783,6 +1819,7 @@ int ds4_gpu_init(void) {
             g_vk.instance, "vkGetMemoryHostPointerPropertiesEXT");
     if (select_physical_device() != 0) return 0;
     if (create_logical_device() != 0) return 0;
+    refresh_memory_budget(true);
     load_all_shaders();
     const char *bg = getenv("DS4_VULKAN_WEIGHT_BUDGET_GB");
     if (bg && *bg) g_vk.weight_budget = (uint64_t)atoll(bg) * 1024ull * 1024ull * 1024ull;
@@ -1872,7 +1909,11 @@ void ds4_gpu_cleanup(void) {
     memset(&g_vk, 0, sizeof(g_vk));
 }
 
-void ds4_vulkan_get_caps(ds4_vulkan_caps *caps) { if (caps) *caps = g_vk.caps; }
+void ds4_vulkan_get_caps(ds4_vulkan_caps *caps) {
+    if (!caps) return;
+    refresh_memory_budget(false);
+    *caps = g_vk.caps;
+}
 
 /* ---- Tensor Management ---- */
 
@@ -2775,6 +2816,26 @@ int ds4_gpu_cache_model_range(const void *m, uint64_t s, uint64_t off, uint64_t 
  * resident in a GPU buffer, uploading it from the model mmap on first use.
  * Evicts least-recently-used ranges when g_vk.weight_budget is exceeded. */
 static int ensure_weight(uint64_t offset, uint64_t needed_bytes) {
+    /* An execution artifact is the sole owner of its source range. Never
+     * recreate a raw view for a covered range; unsupported artifact consumers
+     * therefore fail closed instead of rematerializing the GGUF bytes. */
+    if (needed_bytes == 0 || offset > UINT64_MAX - needed_bytes)
+        return 0;
+    for (const auto &[source_offset, artifact] : g_vk.execution_artifacts) {
+        if (artifact.source_bytes == 0 ||
+            source_offset > UINT64_MAX - artifact.source_bytes)
+            return 0;
+        if (offset <= UINT64_MAX - needed_bytes &&
+            offset < source_offset + artifact.source_bytes &&
+            source_offset < offset + needed_bytes) {
+            if (getenv("DS4_VULKAN_TRACE_KERNELS"))
+                fprintf(stderr,
+                        "ds4: raw weight denied: execution artifact owns off=%llu bytes=%llu\n",
+                        (unsigned long long)offset,
+                        (unsigned long long)needed_bytes);
+            return 0;
+        }
+    }
     for (auto &[base, e] : g_vk.weight_cache) {
         if (offset >= base && offset - base <= e.size &&
             needed_bytes <= e.size - (offset - base)) {
@@ -3265,6 +3326,9 @@ static void execution_artifact_count_fallback(uint32_t kind, const char *label) 
 }
 
 extern "C" void ds4_gpu_execution_artifact_report(void) {
+    /* Refresh the extension-backed figure at report time; total heap size is
+     * capacity only and must not be presented as free residency headroom. */
+    refresh_memory_budget(true);
     const bool report = getenv("DS4_VULKAN_TRACE_KERNELS") ||
         execution_artifact_required(ExecQ8) ||
         execution_artifact_required(ExecIQ2) ||
@@ -8189,6 +8253,7 @@ static bool ds4gk_routed_mid_only_appliance(
         uint32_t gate_type, uint32_t down_type,
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens) {
+    (void)n_tokens; /* dispatch Y carries the full token count */
     const char *enabled = getenv("DS4_VULKAN_ROUTED_MID_ONLY");
     if (enabled && (*enabled == '0' || *enabled == 'n' || *enabled == 'N'))
         return false;
@@ -8200,9 +8265,9 @@ static bool ds4gk_routed_mid_only_appliance(
         expert_in_dim == 256u && expert_mid_dim == 256u &&
         out_dim == 256u && n_total_expert == 1u && n_expert == 1u)
         return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
-            get_cmd_ctx().layer_batch_active && n_tokens == 1u;
+            get_cmd_ctx().layer_batch_active;
     return g_vk.shader_map.find("routed_moe_fused_mid") != g_vk.shader_map.end() &&
-        get_cmd_ctx().layer_batch_active && n_tokens == 1u &&
+        get_cmd_ctx().layer_batch_active &&
         gate_type == 16u && down_type == 10u &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u &&
         out_dim == 4096u && n_total_expert == 256u && n_expert == 6u;
@@ -8581,9 +8646,16 @@ static bool ds4gk_routed_common(
         if (use_iq2_execution) {
             gate_execution = &gate_found->second;
             up_execution = &up_found->second;
-        } else if (getenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2")) {
-            return false;
         }
+    }
+    /* Required IQ2 mode applies to every routed token shape. In particular,
+     * DISABLE+REQUIRE and missing/unsupported artifacts cannot fall through
+     * to raw gate/up materialization. */
+    if (gate_type == 16u && execution_artifact_required(ExecIQ2) &&
+        !use_iq2_execution) {
+        g_vk.execution_artifact_stats[ExecIQ2].failures++;
+        execution_artifact_failure(ExecIQ2, nullptr, "runtime dispatch");
+        return false;
     }
     if (mid_only && gate_type == 16u) {
         auto &iq2_stats = g_vk.execution_artifact_stats[ExecIQ2];
@@ -10720,7 +10792,8 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
 
 extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if (logical_tier != 0) return 0;
-    return g_vk.caps.device_memory_total;
+    refresh_memory_budget(false);
+    return g_vk.caps.has_memory_budget ? g_vk.caps.device_memory_available : 0;
 }
 
 extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,

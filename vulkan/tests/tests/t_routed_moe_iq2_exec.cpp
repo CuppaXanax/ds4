@@ -33,31 +33,35 @@ static int test_routed_moe_iq2_execution_artifact(void) {
         for (uint32_t i = 0; i < down_row_bytes; ++i)
             down[i] = (uint8_t)(0x21u + (row + i) % 29u);
     }
-    std::vector<float> input(in_dim, 0.25f);
-    std::vector<int32_t> selected(1, 0);
-    std::vector<float> route_weight(1, 1.0f);
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(in_dim * sizeof(float));
-    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_dim * sizeof(float) + 1024u);
-    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_dim * sizeof(float));
-    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(sizeof(int32_t));
-    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(sizeof(float));
+    constexpr uint32_t max_tokens = 4096;
+    std::vector<float> input((uint64_t)max_tokens * in_dim, 0.25f);
+    std::vector<int32_t> selected(max_tokens, 0);
+    std::vector<float> route_weight(max_tokens, 1.0f);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)max_tokens * in_dim * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)max_tokens * mid_dim * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)max_tokens * mid_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)max_tokens * mid_dim * sizeof(float) + 1024u);
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc((uint64_t)max_tokens * out_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)max_tokens * out_dim * sizeof(float));
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((uint64_t)max_tokens * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)max_tokens * sizeof(float));
     int result = 1;
     auto cleanup = [&]() {
         ds4_gpu_set_model_map(model.data(), model.size());
         ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(sel);
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(experts);
-        ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(x);
         unsetenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2");
         unsetenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2");
         unsetenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2_TEST");
+        unsetenv("DS4_VULKAN_ROUTED_MID_ONLY");
         unsetenv("DS4_VULKAN_TRACE_KERNELS");
         return result;
     };
-    if (!x || !mid || !experts || !out || !sel || !weights ||
+    if (!x || !gate || !up || !mid || !experts || !out || !sel || !weights ||
         !ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)) ||
-        !ds4_gpu_tensor_write(sel, 0, selected.data(), sizeof(int32_t)) ||
-        !ds4_gpu_tensor_write(weights, 0, route_weight.data(), sizeof(float)))
+        !ds4_gpu_tensor_write(sel, 0, selected.data(), selected.size() * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(weights, 0, route_weight.data(), route_weight.size() * sizeof(float)))
         return cleanup();
     setenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2_TEST", "1", 1);
     setenv("DS4_VULKAN_TRACE_KERNELS", "1", 1);
@@ -68,7 +72,7 @@ static int test_routed_moe_iq2_execution_artifact(void) {
     unsetenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2");
     if (!ds4_gpu_set_model_map(model.data(), model.size()))
         return cleanup();
-    auto run = [&](std::vector<float> &values) -> bool {
+    auto run_decode = [&](std::vector<float> &values) -> bool {
         std::vector<float> zeros(out_dim, 0.0f);
         if (!ds4_gpu_tensor_write(out, 0, zeros.data(), zeros.size() * sizeof(float)) ||
             !ds4_gpu_batch_layer_begin(0)) return false;
@@ -80,14 +84,56 @@ static int test_routed_moe_iq2_execution_artifact(void) {
             0, false);
         const int ended = ds4_gpu_batch_layer_end(0);
         if (!ok || !ended || values.size() != out_dim) return false;
+        return ds4_gpu_tensor_read(out, 0, values.data(),
+                                   values.size() * sizeof(float)) != 0;
+    };
+    auto run_batch = [&](uint32_t n_tokens, std::vector<float> &values) -> bool {
+        std::vector<float> zeros((uint64_t)n_tokens * out_dim, 0.0f);
+        if (!ds4_gpu_tensor_write(out, 0, zeros.data(), zeros.size() * sizeof(float)) ||
+            !ds4_gpu_batch_layer_begin(0)) return false;
+        bool mid_is_f16 = false;
+        const int ok = ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model.data(), model.size(),
+            gate_offset, up_offset, down_offset, 16, 10,
+            gate_bytes, gate_row_bytes, down_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, sel, weights, 1, 1, 0.0f, x, 0,
+            n_tokens, &mid_is_f16, false);
+        const int ended = ds4_gpu_batch_layer_end(0);
+        if (!ok || !ended || mid_is_f16 || values.size() != (uint64_t)n_tokens * out_dim) return false;
         return ds4_gpu_tensor_read(out, 0, values.data(), values.size() * sizeof(float)) != 0;
     };
-    std::vector<float> reference(out_dim), artifact(out_dim);
-    if (!run(reference)) return cleanup();
+    auto decode_is_rejected = [&]() -> bool {
+        if (!ds4_gpu_batch_layer_begin(0)) return false;
+        const int ok = ds4_gpu_routed_moe_one_tensor(
+            out, nullptr, nullptr, mid, experts, model.data(), model.size(),
+            gate_offset, up_offset, down_offset, 16, 10,
+            gate_bytes, gate_row_bytes, down_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, sel, weights, 1, 1, 0.0f, x, nullptr,
+            0, false);
+        const int ended = ds4_gpu_batch_layer_end(0);
+        return !ok && ended;
+    };
+    auto batch_is_rejected = [&](uint32_t n_tokens) -> bool {
+        if (!ds4_gpu_batch_layer_begin(0)) return false;
+        bool mid_is_f16 = false;
+        const int ok = ds4_gpu_routed_moe_batch_tensor(
+            out, gate, up, mid, experts, model.data(), model.size(),
+            gate_offset, up_offset, down_offset, 16, 10,
+            gate_bytes, gate_row_bytes, down_bytes, down_row_bytes,
+            in_dim, mid_dim, out_dim, sel, weights, 1, 1, 0.0f, x, 0,
+            n_tokens, &mid_is_f16, false);
+        const int ended = ds4_gpu_batch_layer_end(0);
+        return !ok && ended;
+    };
+    std::vector<float> reference_one(out_dim), artifact_one(out_dim);
+    std::vector<float> reference((uint64_t)2 * out_dim), artifact((uint64_t)2 * out_dim);
+    if (!run_decode(reference_one) || !run_batch(2, reference)) return cleanup();
 
     setenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2", "1", 1);
     setenv("DS4_VULKAN_REQUIRE_EXECUTION_ARTIFACT_IQ2", "1", 1);
+    /* Strict mode must reject a missing artifact before any raw upload. */
     if (!ds4_gpu_set_model_map(model.data(), model.size()) ||
+        !decode_is_rejected() ||
         !ds4_gpu_cache_iq2_expert_range(model.data(), model.size(), gate_offset,
                                          gate_bytes, in_dim, mid_dim, "iq2-exec-gate") ||
         !ds4_gpu_cache_iq2_expert_range(model.data(), model.size(), up_offset,
@@ -95,10 +141,32 @@ static int test_routed_moe_iq2_execution_artifact(void) {
         return cleanup();
     std::memset(model.data() + gate_offset, 0, (size_t)gate_bytes);
     std::memset(model.data() + up_offset, 0, (size_t)gate_bytes);
-    if (!run(artifact)) return cleanup();
+    if (!run_decode(artifact_one) || !run_batch(2, artifact)) return cleanup();
+    if (std::memcmp(reference_one.data(), artifact_one.data(),
+                    reference_one.size() * sizeof(float)) != 0)
+        return cleanup();
     if (std::memcmp(reference.data(), artifact.data(),
                     reference.size() * sizeof(float)) != 0)
         return cleanup();
+    /* Required mode wins over both an explicit artifact disable and an
+     * unsupported generic routed path; neither may rematerialize raw bytes. */
+    setenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2", "0", 1);
+    if (!decode_is_rejected()) return cleanup();
+    setenv("DS4_VULKAN_EXECUTION_ARTIFACT_IQ2", "1", 1);
+    setenv("DS4_VULKAN_ROUTED_MID_ONLY", "0", 1);
+    if (!batch_is_rejected(2)) return cleanup();
+    unsetenv("DS4_VULKAN_ROUTED_MID_ONLY");
+    /* Make the 4096-token reachability proof cheap: validation is disabled
+     * inside the layer batch and the routed shader must bounds-check IDs.
+     * A raw fallback still reaches the artifact ownership guard and fails. */
+    std::vector<int32_t> invalid(max_tokens, 99);
+    if (!ds4_gpu_tensor_write(sel, 0, invalid.data(),
+                              invalid.size() * sizeof(int32_t)))
+        return cleanup();
+    std::vector<float> large((uint64_t)max_tokens * out_dim);
+    if (!run_batch(max_tokens, large)) return cleanup();
+    for (float value : large)
+        if (value != 0.0f) return cleanup();
     result = 0;
     return cleanup();
 }

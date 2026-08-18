@@ -7,6 +7,16 @@
     "fleet_binary_sha256": "f0d32af04aade31505ecb698514d703a2569c772fe1c98258e29d525455bb028",
     "runtime_shader_count": 62,
     "runtime_shader_manifest_sha256": "9bf6778944c194ef59fa1c1dbc37c3cad0fc87fe1bcb3ec7dcdc729844c39e10",
+    "runtime_shader_profiles": {
+      "coordinator": {
+        "shader_count": 62,
+        "shader_manifest_sha256": "63f1af4eff6ba608a940ac566bd26f1e22fb4b41b89eda4601d45c506d4b8e3a"
+      },
+      "worker": {
+        "shader_count": 62,
+        "shader_manifest_sha256": "9bf6778944c194ef59fa1c1dbc37c3cad0fc87fe1bcb3ec7dcdc729844c39e10"
+      }
+    },
     "performance_qualification": "restore_point_only_context_regression_open",
     "historical_short_prompt": {
       "commit": "a2fd02c4627028dfc4cc13b141b49c4a887d25a2",

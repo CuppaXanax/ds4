@@ -36,14 +36,25 @@ if [ "${DS4_USER_APPROVED_PROMOTION:-}" != "1" ]; then
 fi
 
 evidence="${DS4_PROMOTION_EVIDENCE:-performance/bc250/evidence/current/verdict.json}"
-python3 - "$evidence" <<'PY'
+staged_runtime_diff_sha256="$(git diff --cached --binary -- $outside_system |
+    sha256sum | awk '{print $1}')"
+python3 - "$evidence" "$staged_runtime_diff_sha256" <<'PY'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
+staged_hash = sys.argv[2]
 if not p.is_file():
     raise SystemExit(f"missing promotion evidence: {p}")
 data = json.loads(p.read_text(encoding="utf-8"))
-if data.get("verdict") != "promote_eligible":
-    raise SystemExit(f"promotion evidence verdict is {data.get('verdict')!r}")
+verdict = data.get("verdict")
+if verdict not in {"promote_eligible", "user_approved_checkpoint"}:
+    raise SystemExit(f"promotion evidence verdict is {verdict!r}")
 if not data.get("exactness", {}).get("match"):
     raise SystemExit("promotion evidence does not prove exactness")
+if verdict == "user_approved_checkpoint":
+    if not data.get("activation", {}).get("proved"):
+        raise SystemExit("checkpoint evidence does not prove production activation")
+    if not str(data.get("checkpoint_reason", "")).strip():
+        raise SystemExit("checkpoint evidence is missing its explicit reason")
+    if data.get("staged_runtime_diff_sha256") != staged_hash:
+        raise SystemExit("checkpoint evidence does not bind the staged runtime diff")
 PY

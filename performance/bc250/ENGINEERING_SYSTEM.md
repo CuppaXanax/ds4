@@ -24,7 +24,15 @@ First, the user captures a read-only identity audit of all 12 blades by running
 `probe_fleet_identity.sh` through their fleet controller. The audit is valid
 for 15 minutes and must show one clean, correctly configured worker per worker
 blade, identical commits/binaries/environments, 128K context, 11 GiB weight
-budget, and the reviewed shader count. The coordinator must be idle.
+budget, and the reviewed role-specific shader profile. The coordinator must be
+idle.
+
+The current BC-250 LKG is intentionally role-heterogeneous. Five legacy SPIR-V
+artifacts on the coordinator differ byte-for-byte from the worker copies even
+though their GLSL sources match. The coordinator and worker manifests in
+`lkg.json` are therefore frozen and validated independently. Never normalize,
+recompile, or overwrite either profile as a side effect of an unrelated shader
+change.
 
 On the coordinator, after the user has deliberately handed it to the benchmark:
 
@@ -61,14 +69,24 @@ python3 performance/bc250/score.py \
 runtime commits to `pr-557-merge` without that approval and reject every push
 without separate explicit human approval.
 
+When the user explicitly directs that a proven causal unit be checkpointed and
+also declines the three-run repetition gate, record the honest verdict
+`user_approved_checkpoint`. The record must bind the staged runtime diff,
+bit-identical end-to-end artifacts, production activation, the retained
+measurement, and the explicit reason the canonical score is deferred. This
+advances the recoverable LKG without mislabeling the checkpoint as a 10/20 TPS
+qualification.
+
 Candidates do not get branches or worktrees. Build each candidate as a clean,
 deterministic commit in a disposable checkout rooted at the exact runtime LKG.
 Record its base commit, patch SHA-256, commit/tree, binaries, and shader
 manifest in the ignored evidence directory. Set `DS4_EXPECTED_COMMIT` to that
 disposable commit when capturing its three canonical runs; if its build adds a
-shader, also set `DS4_EXPECTED_SHADER_COUNT` and
-`DS4_EXPECTED_SHADER_MANIFEST` to the reviewed values. After scoring, delete
-the disposable checkout. A promoted patch is applied once to
+shader, also set `DS4_EXPECTED_COORDINATOR_SHADER_COUNT`,
+`DS4_EXPECTED_COORDINATOR_SHADER_MANIFEST`,
+`DS4_EXPECTED_WORKER_SHADER_COUNT`, and
+`DS4_EXPECTED_WORKER_SHADER_MANIFEST` to the reviewed values. After scoring,
+delete the disposable checkout. A promoted patch is applied once to
 `pr-557-merge`; no candidate ref survives.
 
 ## Current technical lane

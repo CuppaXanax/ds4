@@ -188,16 +188,17 @@ def main(argv: list[str] | None = None) -> int:
         fail(
             f"baseline commit {baseline[0].meta.get('commit')} does not match LKG {lkg_commit}"
         )
-    lkg_shader_count = int(manifest["runtime_lkg"]["runtime_shader_count"])
+    coordinator_profile = manifest["runtime_lkg"]["runtime_shader_profiles"][
+        "coordinator"
+    ]
+    lkg_shader_count = int(coordinator_profile["shader_count"])
     if baseline[0].meta.get("runtime_shader_count") != lkg_shader_count:
         fail(
             "baseline runtime shader count "
             f"{baseline[0].meta.get('runtime_shader_count')!r} does not match LKG "
             f"{lkg_shader_count}"
         )
-    lkg_shader_manifest = str(
-        manifest["runtime_lkg"]["runtime_shader_manifest_sha256"]
-    ).lower()
+    lkg_shader_manifest = str(coordinator_profile["shader_manifest_sha256"]).lower()
     if str(
         baseline[0].meta.get("runtime_shader_manifest_sha256", "")
     ).lower() != lkg_shader_manifest:

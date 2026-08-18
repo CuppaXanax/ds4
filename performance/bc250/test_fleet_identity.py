@@ -21,8 +21,8 @@ class FleetIdentityTests(unittest.TestCase):
         self.manifest = json.loads(Path(__file__).with_name("lkg.json").read_text())
         self.commit = self.manifest["runtime_lkg"]["commit"]
         self.binary = self.manifest["runtime_lkg"]["fleet_binary_sha256"]
-        self.shader_manifest = self.manifest["runtime_lkg"][
-            "runtime_shader_manifest_sha256"
+        self.shader_profiles = self.manifest["runtime_lkg"][
+            "runtime_shader_profiles"
         ]
         self.audit = self.root / "fleet.txt"
         topology = self.manifest["topology"]
@@ -31,14 +31,15 @@ class FleetIdentityTests(unittest.TestCase):
         ] + [(node["host"], "worker", node["layers"]) for node in topology["workers"]]
         lines = []
         for host, role, layers in nodes:
-            shader = str(self.manifest["runtime_lkg"]["runtime_shader_count"])
+            profile_name = "coordinator" if role == "coordinator-ready" else "worker"
+            profile = self.shader_profiles[profile_name]
             env = "coordinator-managed" if role == "coordinator-ready" else "f" * 64
             lines.append(
                 "BC250_IDENTITY|"
                 f"host={host}|commit={self.commit}|binary_sha256={self.binary}|"
                 f"source_clean=1|role={role}|layers={layers}|ctx=128000|"
-                f"weight_budget_gib=11|shader_count={shader}|"
-                f"shader_manifest_sha256={self.shader_manifest}|"
+                f"weight_budget_gib=11|shader_count={profile['shader_count']}|"
+                f"shader_manifest_sha256={profile['shader_manifest_sha256']}|"
                 f"model={self.manifest['model']['default_path']}|env_sha256={env}"
             )
         self.audit.write_text("\n".join(lines) + "\n")
@@ -52,8 +53,10 @@ class FleetIdentityTests(unittest.TestCase):
             self.audit,
             self.commit,
             self.binary,
-            self.manifest["runtime_lkg"]["runtime_shader_count"],
-            self.shader_manifest,
+            self.shader_profiles["coordinator"]["shader_count"],
+            self.shader_profiles["coordinator"]["shader_manifest_sha256"],
+            self.shader_profiles["worker"]["shader_count"],
+            self.shader_profiles["worker"]["shader_manifest_sha256"],
             now=now,
         )
 
@@ -75,7 +78,19 @@ class FleetIdentityTests(unittest.TestCase):
             self.validate(now=time.time())
 
     def test_wrong_shader_manifest_fails_closed(self):
-        text = self.audit.read_text().replace(self.shader_manifest, "0" * 64, 1)
+        coordinator_manifest = self.shader_profiles["coordinator"][
+            "shader_manifest_sha256"
+        ]
+        text = self.audit.read_text().replace(coordinator_manifest, "0" * 64, 1)
+        self.audit.write_text(text)
+        with self.assertRaisesRegex(ValueError, "shader_manifest_sha256"):
+            self.validate()
+
+    def test_wrong_worker_shader_manifest_fails_closed(self):
+        worker_manifest = self.shader_profiles["worker"][
+            "shader_manifest_sha256"
+        ]
+        text = self.audit.read_text().replace(worker_manifest, "0" * 64, 1)
         self.audit.write_text(text)
         with self.assertRaisesRegex(ValueError, "shader_manifest_sha256"):
             self.validate()

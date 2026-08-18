@@ -21,7 +21,8 @@ trying” after a failed gate.
 - Do not create subagents unless the user explicitly requests them.
 - Do not create candidate branches or worktrees. Runtime candidates are clean,
   disposable checkouts under `/tmp`, identified by the LKG base commit, exact
-  patch SHA-256, candidate commit/tree, binaries, and shader manifest. Delete
+  patch SHA-256, candidate commit/tree, binaries, and role-specific shader
+  manifests. Delete
   the checkout after scoring or rejection; retain the ignored evidence record.
 - The only local branches are `main` and the runtime LKG branch declared in
   `performance/bc250/lkg.json`.
@@ -30,6 +31,12 @@ trying” after a failed gate.
   User-requested engineering-system-only commits are permitted. Those paths
   are `AGENTS.md`, `.gitattributes`, `.gitignore`, `.githooks/`, and
   `performance/bc250/`.
+- If the user explicitly orders an exact, production-activated causal unit to
+  be retained while deferring the canonical repetition gate, the hook may
+  accept a `user_approved_checkpoint` evidence record. It must bind the exact
+  staged runtime diff, matching end-to-end artifacts, production activation,
+  and the reason the full score was deferred. This is an LKG checkpoint, not a
+  claim that the 10/20 TPS milestone was met.
 - Never push any ref without explicit user approval in the current turn.
 - Never infer promotion or push approval. An agent may set
   `DS4_USER_APPROVED_PROMOTION=1` only when the user explicitly approved
@@ -83,7 +90,7 @@ scheduler, allocator, and deployment changes in one performance verdict.
 
 A scored runtime candidate must be a clean deterministic commit in a disposable
 checkout rooted at the exact runtime LKG. Its evidence must bind the LKG base,
-patch hash, candidate commit/tree, binaries, shader manifest, exactness
+patch hash, candidate commit/tree, binaries, role-specific shader manifests, exactness
 artifacts, activation proof, and scores. It never gets a persistent branch.
 After a `promote_eligible` verdict and explicit user approval, apply that exact
 patch once to the runtime LKG branch, commit it, update `lkg.json`, and delete

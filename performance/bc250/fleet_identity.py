@@ -22,8 +22,10 @@ def validate(
     audit_path: Path,
     expected_commit: str,
     expected_binary: str,
-    expected_shader_count: int,
-    expected_shader_manifest: str,
+    coordinator_shader_count: int,
+    coordinator_shader_manifest: str,
+    worker_shader_count: int,
+    worker_shader_manifest: str,
     *,
     now: float | None = None,
 ) -> dict[str, Any]:
@@ -65,6 +67,12 @@ def validate(
     worker_envs: set[str] = set()
     for host, (role, layers) in expected.items():
         row = records[host]
+        if role == "coordinator-ready":
+            shader_count = coordinator_shader_count
+            shader_manifest = coordinator_shader_manifest
+        else:
+            shader_count = worker_shader_count
+            shader_manifest = worker_shader_manifest
         checks = {
             "binary_sha256": expected_binary,
             "source_clean": "1",
@@ -72,8 +80,8 @@ def validate(
             "layers": layers,
             "ctx": str(manifest["benchmark"]["ctx_alloc"]),
             "weight_budget_gib": str(manifest["benchmark"]["weight_budget_gib"]),
-            "shader_count": str(expected_shader_count),
-            "shader_manifest_sha256": expected_shader_manifest,
+            "shader_count": str(shader_count),
+            "shader_manifest_sha256": shader_manifest,
             "model": manifest["model"]["default_path"],
         }
         if role == "worker":
@@ -108,8 +116,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-binary", required=True)
-    parser.add_argument("--expected-shader-count", type=int, required=True)
-    parser.add_argument("--expected-shader-manifest", required=True)
+    parser.add_argument("--coordinator-shader-count", type=int, required=True)
+    parser.add_argument("--coordinator-shader-manifest", required=True)
+    parser.add_argument("--worker-shader-count", type=int, required=True)
+    parser.add_argument("--worker-shader-manifest", required=True)
     return parser.parse_args(argv)
 
 
@@ -121,8 +131,10 @@ def main(argv: list[str] | None = None) -> int:
         args.audit,
         args.expected_commit,
         args.expected_binary,
-        args.expected_shader_count,
-        args.expected_shader_manifest,
+        args.coordinator_shader_count,
+        args.coordinator_shader_manifest,
+        args.worker_shader_count,
+        args.worker_shader_manifest,
     )
     print(result["identity_sha256"])
     print(result["topology_sha256"])

@@ -32,6 +32,9 @@ class ScoreTests(unittest.TestCase):
         path = self.root / name
         path.mkdir()
         bench = self.manifest["benchmark"]
+        coordinator_profile = self.manifest["runtime_lkg"][
+            "runtime_shader_profiles"
+        ]["coordinator"]
         meta = {
             "commit": commit,
             "binary_sha256": binary * 64 if len(binary) == 1 else binary,
@@ -42,12 +45,12 @@ class ScoreTests(unittest.TestCase):
             "fleet_env_sha256": "f" * 64,
             "fleet_node_count": self.manifest["topology"]["blades"],
             "runtime_shader_count": (
-                self.manifest["runtime_lkg"]["runtime_shader_count"]
+                coordinator_profile["shader_count"]
                 if shader_count is None
                 else shader_count
             ),
-            "runtime_shader_manifest_sha256": self.manifest["runtime_lkg"][
-                "runtime_shader_manifest_sha256"
+            "runtime_shader_manifest_sha256": coordinator_profile[
+                "shader_manifest_sha256"
             ],
             "model_sha256": "a" * 64,
             "prompt_sha256": bench["prompt_sha256"],
